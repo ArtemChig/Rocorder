@@ -1,0 +1,8 @@
+# Normalize line endings on commit; check out native on each OS.
+* text=auto
+
+# Source files are always LF in the repo
+*.lua  text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
