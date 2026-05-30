@@ -9,6 +9,15 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.1.2-alpha — 2026-05-30
+
+- **Fix**: tab buttons (Record / Settings / Files / Sources) were invisible in
+  1.1.1 because the tab-bar's bottom divider was a full-width child of the
+  tab bar's `UIListLayout` — it claimed 100% of the horizontal layout row,
+  pushing every tab button off the right edge where `ClipsDescendants` hid
+  them. The divider now lives on the window directly, positioned just under
+  the tab bar, so the tab bar's layout only sees actual tab buttons.
+
 ## 1.1.1-alpha — 2026-05-30
 
 UI polish + fixes from the first round of screenshots.

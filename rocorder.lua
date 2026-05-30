@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.1.1-alpha"
+local ROCORDER_VERSION = "1.1.2-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -1428,11 +1428,12 @@ local function buildUI()
         BorderSizePixel = 0, Position = UDim2.new(0, 0, 0, TITLE_H),
         Size = UDim2.new(1, 0, 0, TAB_H) }, window)
     hlist(tabBar, 4); pad(tabBar, 10, 4, 10, 0)
-    -- thin border line at the bottom of the tab bar separates it from content
+    -- 1px divider line UNDER the tab bar — parented to window so the tab bar's
+    -- UIListLayout doesn't try to lay it out (and consume the whole row width).
     mk("Frame", { BackgroundColor3 = THEME.border, BorderSizePixel = 0,
         BackgroundTransparency = 0.5,
-        Position = UDim2.new(0, 0, 1, -1),
-        Size = UDim2.new(1, 0, 0, 1) }, tabBar)
+        Position = UDim2.new(0, 0, 0, TITLE_H + TAB_H - 1),
+        Size = UDim2.new(1, 0, 0, 1) }, window)
 
     local content = mk("Frame", { BackgroundColor3 = THEME.bg,
         BorderSizePixel = 0,
