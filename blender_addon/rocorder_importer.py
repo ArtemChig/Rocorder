@@ -1,12 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (6, 2, 0),
+    "version": (1, 0, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
+    "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
+ROCORDER_VERSION = "1.0.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -564,7 +566,8 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
                 print("[ROCORDER] could not write import log:", e)
 
     log("=" * 76)
-    log("ROCORDER import @ {}".format(time.strftime("%Y-%m-%d %H:%M:%S")))
+    log("ROCORDER import @ {} — importer v{}".format(
+        time.strftime("%Y-%m-%d %H:%M:%S"), ROCORDER_VERSION))
     log("file:  {}".format(filepath))
     log("scale: {}  set_fps: {}  build_armature: {}  force_standard_r6: {}".format(
         scale, set_fps, build_armature, force_standard_r6))
