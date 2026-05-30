@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (4, 1, 0),
+    "version": (4, 2, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replay files as animated spheres",
@@ -264,11 +264,20 @@ def _topological_order(bone_names, parent_of):
 def build_player_armature(arm_name, player_rig, scale, collection):
     """Build an Armature object whose bones mirror the Roblox Motor6D hierarchy.
 
-    Returns (arm_obj, parent_of, rest_world, head_world_rob) where:
-        parent_of[bone_name]   = parent bone name (or None)
-        rest_world[bone_name]  = bone.matrix_local at rest (in armature space)
-        head_world_rob[bone]   = (x, y, z) head position in Roblox coords (used
-                                 by the caller to position meshes)
+    Bones are placed JOINT-TO-JOINT (head at parent joint pivot, tail at the
+    farthest child joint pivot) so the rig visually looks like a Roblox
+    skeleton. Because that makes bone.matrix_local (B) differ from the part's
+    rest CFrame (Q), the caller must compensate when computing pose bone
+    matrices: target the bone at `P @ Q⁻¹ @ B` instead of `P` directly. With
+    that compensation and `Child Of(inverse=B⁻¹, mesh.matrix_world=Q)` the
+    mesh evaluates to exactly P.
+
+    Returns (arm_obj, parent_of, rest_world, head_world_rob, part_rest_world):
+        parent_of[bone]        = parent bone name (or absent if root)
+        rest_world[bone]       = B = bone.matrix_local in armature space
+        head_world_rob[bone]   = (x, y, z) bone head position in Roblox coords
+        part_rest_world[bone]  = Q = part's rest CFrame in Blender (or absent
+                                 when the recording has no restCFrame for it)
     """
     parts = [p for p in player_rig.get("parts", []) if p.get("name")]
     joints = player_rig.get("joints", [])
@@ -319,61 +328,55 @@ def build_player_armature(arm_name, player_rig, scale, collection):
 
     edit_bones = arm_data.edit_bones
     head_world_rob = {}
+    part_rest_world = {}
     try:
         for p in parts:
             bone_name = p["name"]
             rest_cf = p.get("restCFrame")
             size    = p.get("size", [1.0, 1.0, 1.0])
 
-            eb = edit_bones.new(bone_name)
-
+            # Q = part rest CFrame in Blender — needed by the animation
+            # compensation. Stored here so we don't recompute later.
+            Q = None
             if rest_cf and len(rest_cf) >= 12:
-                # ---- IMPORTANT: align bone.matrix_local to the part's rest
-                # CFrame. The Child Of constraint we put on the mesh later
-                # needs `bone_rest_world == part_rest_world` to make the
-                # mesh sit at the recorded pose every frame; if it doesn't,
-                # the mesh ends up offset by a per-bone constant and any
-                # rotation looks like it's pivoting around the wrong axis.
-                rest_mat = roblox_components_to_blender_matrix(rest_cf, scale)
-                head = rest_mat.translation.copy()
-                # columns 1 and 2 of the 3x3 are the part's local Y and Z
-                local_y = Vector((rest_mat[0][1], rest_mat[1][1], rest_mat[2][1]))
-                local_z = Vector((rest_mat[0][2], rest_mat[1][2], rest_mat[2][2]))
+                Q = roblox_components_to_blender_matrix(rest_cf, scale)
+                part_rest_world[bone_name] = Q
+
+            # ---- joint-to-joint bone placement (visually skeletal) ----
+            # head: joint with parent (or part center / origin as fallbacks)
+            if bone_name in head_pivot:
+                head = roblox_position_to_blender(head_pivot[bone_name], scale)
+                head_rob = head_pivot[bone_name]
+            elif Q is not None:
+                head = Q.translation.copy()
+                head_rob = (rest_cf[0], rest_cf[1], rest_cf[2])
+            else:
+                head = Vector((0.0, 0.0, 0.0))
+                head_rob = (0.0, 0.0, 0.0)
+            head_world_rob[bone_name] = head_rob
+
+            # tail: pick the child-joint pivot farthest from head, so multi-
+            # child parts (UpperTorso has Neck + both Shoulders) still get a
+            # sensible bone direction. Leaves extend along part local Y.
+            if bone_name in tail_pivots and tail_pivots[bone_name]:
+                candidates = [roblox_position_to_blender(pv, scale)
+                              for pv in tail_pivots[bone_name]]
+                tail = max(candidates, key=lambda v: (v - head).length_squared)
+            elif Q is not None:
+                local_y = Vector((Q[0][1], Q[1][1], Q[2][1]))
                 if local_y.length < 1e-6:
                     local_y = Vector((0.0, 0.0, 1.0))
-                if local_z.length < 1e-6:
-                    local_z = Vector((1.0, 0.0, 0.0))
                 local_y.normalize()
-                local_z.normalize()
-
                 length = max(abs(size[1]) * scale, 0.1)
-                eb.head = head
-                eb.tail = head + local_y * length
-                if (eb.tail - eb.head).length < 1e-4:
-                    eb.tail = head + Vector((0.0, 0.0, 0.1))
-                eb.align_roll(local_z)
-                head_world_rob[bone_name] = (rest_cf[0], rest_cf[1], rest_cf[2])
+                tail = head + local_y * length
             else:
-                # Backward-compat fallback for recordings without restCFrame:
-                # use joint pivots. Animation will be offset by a constant
-                # per-bone transform; only fixed by re-recording.
-                if bone_name in head_pivot:
-                    head_rob = head_pivot[bone_name]
-                else:
-                    head_rob = (0.0, 0.0, 0.0)
-                if bone_name in tail_pivots and tail_pivots[bone_name]:
-                    hx, hy, hz = head_rob
-                    tail_rob = max(
-                        tail_pivots[bone_name],
-                        key=lambda pv: (pv[0]-hx)**2 + (pv[1]-hy)**2 + (pv[2]-hz)**2,
-                    )
-                else:
-                    tail_rob = (head_rob[0], head_rob[1] + 1.0, head_rob[2])
-                eb.head = roblox_position_to_blender(head_rob, scale)
-                eb.tail = roblox_position_to_blender(tail_rob, scale)
-                if (eb.tail - eb.head).length < 1e-4:
-                    eb.tail = eb.head + Vector((0.0, 0.0, 0.1))
-                head_world_rob[bone_name] = head_rob
+                tail = head + Vector((0.0, 0.0, 1.0))
+
+            eb = edit_bones.new(bone_name)
+            eb.head = head
+            eb.tail = tail
+            if (eb.tail - eb.head).length < 1e-4:
+                eb.tail = eb.head + Vector((0.0, 0.0, 0.1))
 
         # parenting must happen AFTER all bones exist
         for child_name, parent_name in parent_of.items():
@@ -390,7 +393,7 @@ def build_player_armature(arm_name, player_rig, scale, collection):
     for pb in arm_obj.pose.bones:
         pb.rotation_mode = "QUATERNION"
 
-    return arm_obj, parent_of, rest_world, head_world_rob
+    return arm_obj, parent_of, rest_world, head_world_rob, part_rest_world
 
 
 def bind_mesh_to_bone(mesh_obj, arm_obj, bone_name, rest_world_mesh):
@@ -482,10 +485,11 @@ def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, bui
     # Per-player armature state (only populated when build_armature is on AND
     # the rig file has that player). Mid-game joiners with no rig data fall
     # back to per-bone objects in the same sub-collection.
-    armatures      = {}  # uid -> arm_obj
-    arm_parent_of  = {}  # uid -> { bone_name: parent_bone_name }
-    arm_rest_world = {}  # uid -> { bone_name: Matrix }
-    arm_last_quat  = {}  # uid -> { bone_name: Quaternion } for sign continuity
+    armatures        = {}  # uid -> arm_obj
+    arm_parent_of    = {}  # uid -> { bone_name: parent_bone_name }
+    arm_rest_world   = {}  # uid -> { bone_name: B = bone.matrix_local }
+    arm_part_rest    = {}  # uid -> { bone_name: Q = part rest CFrame (Blender) }
+    arm_last_quat    = {}  # uid -> { bone_name: Quaternion } for sign continuity
 
     last_frame = 1
     keyframes_written = 0
@@ -508,7 +512,7 @@ def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, bui
         player_rig = rig_data["players"][str(uid)]
         sub = get_or_make_player_coll(uid)
         arm_name = "{}_{}_rig".format(_player_label(roster, uid), uid)
-        arm_obj, parent_of, rest_world, _heads_rob = build_player_armature(
+        arm_obj, parent_of, rest_world, _heads_rob, part_rest_world = build_player_armature(
             arm_name, player_rig, scale, sub)
         if arm_obj is None:
             return None
@@ -535,6 +539,7 @@ def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, bui
         armatures[uid] = arm_obj
         arm_parent_of[uid] = parent_of
         arm_rest_world[uid] = rest_world
+        arm_part_rest[uid] = part_rest_world
         arm_last_quat[uid] = {}
         return arm_obj
 
@@ -608,6 +613,7 @@ def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, bui
 
                 rest_world = arm_rest_world[uid]
                 parent_of  = arm_parent_of[uid]
+                part_rest  = arm_part_rest[uid]
                 last_q_map = arm_last_quat[uid]
 
                 # process bones parents-first so each child can read its
@@ -618,19 +624,32 @@ def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, bui
                 pose_world_this_frame = {}
 
                 for bone_name in order:
-                    desired_world = bone_to_mat[bone_name]
-                    pose_world_this_frame[bone_name] = desired_world
-                    rest = rest_world[bone_name]
+                    recorded_P = bone_to_mat[bone_name]
+                    B = rest_world[bone_name]
+                    Q = part_rest.get(bone_name)
+
+                    # ---- compensation: target the bone at `effective` so the
+                    # Child Of constraint (mesh.matrix_world=Q, inverse=B^-1)
+                    # produces mesh_world == recorded_P. When Q is missing
+                    # (old recording without restCFrame), fall back to no
+                    # compensation; mesh will be offset by a constant per
+                    # bone but the bone pose still tracks the recorded data.
+                    if Q is not None:
+                        effective = recorded_P @ Q.inverted() @ B
+                    else:
+                        effective = recorded_P
+                    pose_world_this_frame[bone_name] = effective
+
                     parent_name = parent_of.get(bone_name)
                     if (parent_name and parent_name in pose_world_this_frame
                             and parent_name in rest_world):
                         parent_pose = pose_world_this_frame[parent_name]
                         parent_rest = rest_world[parent_name]
-                        rest_local  = parent_rest.inverted() @ rest
-                        pose_local  = parent_pose.inverted() @ desired_world
+                        rest_local  = parent_rest.inverted() @ B
+                        pose_local  = parent_pose.inverted() @ effective
                         matrix_basis = rest_local.inverted() @ pose_local
                     else:
-                        matrix_basis = rest.inverted() @ desired_world
+                        matrix_basis = B.inverted() @ effective
 
                     loc, rot, _ = matrix_basis.decompose()
                     prev = last_q_map.get(bone_name)
