@@ -12,6 +12,8 @@
 -- Requires the repo to be PUBLIC (raw.githubusercontent.com refuses anonymous
 -- requests for private repos).
 
+local ROCORDER_LOADER_VERSION = "1.0.0-alpha"
+
 local REPO_USER   = "ArtemChig"
 local REPO_NAME   = "Rocorder"
 local BRANCH      = "main"
@@ -45,8 +47,8 @@ if not fn then
     return
 end
 
-print(string.format("[ROCORDER loader] Fetched %d bytes from %s@%s, running...",
-    #body, REPO_NAME, BRANCH))
+print(string.format("[ROCORDER loader v%s] Fetched %d bytes from %s@%s, running...",
+    ROCORDER_LOADER_VERSION, #body, REPO_NAME, BRANCH))
 
 local runOk, runErr = pcall(fn)
 if not runOk then

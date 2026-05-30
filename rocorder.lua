@@ -6,6 +6,10 @@
 -- to rebuild a proper armature. Toggle with F8.
 --
 -- ============================================================================
+
+local ROCORDER_VERSION = "1.0.0-alpha"
+
+-- ============================================================================
 -- FILE FORMAT  (ROCORDER/3)
 -- ----------------------------------------------------------------------------
 -- .rec       line 1 : JSON header
@@ -308,6 +312,7 @@ function Recorder:_writeHeader()
 
     local header = {
         format       = "ROCORDER/3",
+        recorder     = ROCORDER_VERSION,
         placeId      = game.PlaceId,
         jobId        = game.JobId,
         startedAt    = os.time(),
@@ -471,7 +476,8 @@ function Recorder:Start()
     if CONFIG.DEBUG then
         pcall(function()
             writefile(CONFIG.FOLDER .. "/" .. self.debugFilename,
-                fmt("ROCORDER debug log for %s\n", self.filename))
+                fmt("ROCORDER %s debug log for %s\n",
+                    ROCORDER_VERSION, self.filename))
         end)
         self:_debugLog(fmt(
             "START tickRate=%d posPrec=%d rotPrec=%d maxCatchup=%.1fs maxDistance=%d posPrec=%d",
@@ -595,5 +601,7 @@ game:BindToClose(function()
     if rec.active then rec:Stop() end
 end)
 
-notify("ROCORDER", "Loaded. Press F8 to start/stop recording.", 4)
-print("[ROCORDER] Ready. Hotkey:", CONFIG.HOTKEY.Name)
+notify("ROCORDER", fmt("v%s loaded. Press F8 to start/stop recording.",
+    ROCORDER_VERSION), 4)
+print(fmt("[ROCORDER] v%s ready. Hotkey: %s",
+    ROCORDER_VERSION, CONFIG.HOTKEY.Name))
