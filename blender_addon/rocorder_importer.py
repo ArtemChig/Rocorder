@@ -1,25 +1,53 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (5, 0, 0),
+    "version": (6, 0, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
-    "description": "Import ROCORDER .rec replay files as animated spheres",
+    "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "category": "Import-Export",
 }
+
+# ============================================================================
+# How this works (the math that makes it robust)
+# ----------------------------------------------------------------------------
+# The recorder stores, per part per frame, the part's WORLD transform T (as
+# position + quaternion in Roblox coordinates). The companion .rig.json gives,
+# per part, the Motor6D C0/C1 offsets we use to derive the rig's canonical rest
+# pose D (a clean T-pose), plus sizes/colors/shapes for geometry.
+#
+# We build a real armature whose bones are drawn joint-to-joint (so it looks
+# like a Roblox skeleton) and bind ONE combined mesh to it with the standard
+# rigid-skinning method: every vertex of a part is weighted 1.0 to that part's
+# bone, deformed by a single Armature modifier. No Child Of constraints.
+#
+# A vertex bound 100% to bone B is deformed to:
+#       world_vert = pose.matrix[B] @ rest.matrix[B]^-1 @ vert_rest
+# We place the part's verts at the canonical rest D (vert_rest = D @ v_local),
+# rest.matrix[B] = R (the bone's rest matrix, R = bone.matrix_local). So:
+#       world_vert = pose[B] @ R^-1 @ D @ v_local
+# To force this to equal the recorded world pose (T @ v_local) we just need:
+#       pose.matrix[B] = T @ D^-1 @ R
+# This holds for ANY bone rest geometry R, which is the whole point: the bones
+# can look however we like (joint-to-joint) without affecting accuracy. Each
+# part lands exactly where it was recorded, every frame.
+#
+# We keyframe pose-bone basis matrices (location + quaternion) computed from
+# that target pose, parents accounted for explicitly so we never depend on
+# Blender's live pose-evaluation order.
+# ============================================================================
 
 import json
 import os
 import bpy
 import bmesh
-from bpy.props import StringProperty, FloatProperty, BoolProperty, IntProperty
+from bpy.props import StringProperty, FloatProperty, BoolProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ImportHelper
-from mathutils import Matrix, Vector, Euler, Quaternion
+from mathutils import Matrix, Vector, Quaternion
 
 
-# Roblox (Y-up, right-handed) -> Blender (Z-up, right-handed)
-# (x, y, z) -> (x, -z, y)
+# Roblox (Y-up, right-handed) -> Blender (Z-up, right-handed): (x, y, z) -> (x, -z, y)
 ROBLOX_TO_BLENDER = Matrix((
     (1, 0,  0, 0),
     (0, 0, -1, 0),
@@ -29,114 +57,89 @@ ROBLOX_TO_BLENDER = Matrix((
 ROBLOX_TO_BLENDER_INV = ROBLOX_TO_BLENDER.inverted()
 
 
-def parse_frame_line_v1(line):
-    """'t=1.23;uid:x,y,z,rx,ry,rz;...' -> (t, [(uid, x,y,z,rx,ry,rz), ...])"""
-    line = line.strip()
-    if not line:
-        return None, None
-    parts = line.split(";")
-    if not parts[0].startswith("t="):
-        return None, None
-    try:
-        t = float(parts[0][2:])
-    except ValueError:
-        return None, None
-    out = []
-    for chunk in parts[1:]:
-        if ":" not in chunk:
-            continue
-        uid_str, vals_str = chunk.split(":", 1)
-        vals = vals_str.split(",")
-        if len(vals) != 6:
-            continue
-        try:
-            uid = int(uid_str)
-            x, y, z, rx, ry, rz = (float(v) for v in vals)
-        except ValueError:
-            continue
-        out.append((uid, x, y, z, rx, ry, rz))
-    return t, out
+# ----------------------------------------------------------------------------
+# Coordinate conversion
+# ----------------------------------------------------------------------------
+def _conjugate(rob_mat, scale):
+    """Conjugate a Roblox-space 4x4 into Blender space and scale translation.
 
-
-def parse_frame_line_v2(line):
-    """'t=1.23;uid:bone=x,y,z,rx,ry,rz;...' -> (t, [(uid, bone, x,y,z,rx,ry,rz), ...])"""
-    line = line.strip()
-    if not line:
-        return None, None
-    parts = line.split(";")
-    if not parts[0].startswith("t="):
-        return None, None
-    try:
-        t = float(parts[0][2:])
-    except ValueError:
-        return None, None
-    out = []
-    for chunk in parts[1:]:
-        if ":" not in chunk or "=" not in chunk:
-            continue
-        uid_str, rest = chunk.split(":", 1)
-        bone, vals_str = rest.split("=", 1)
-        vals = vals_str.split(",")
-        if len(vals) != 6:
-            continue
-        try:
-            uid = int(uid_str)
-            x, y, z, rx, ry, rz = (float(v) for v in vals)
-        except ValueError:
-            continue
-        out.append((uid, bone, x, y, z, rx, ry, rz))
-    return t, out
-
-
-def roblox_pose_to_blender(x, y, z, rx, ry, rz, scale):
-    rob_rot = Euler((rx, ry, rz), "YXZ").to_matrix().to_4x4()
-    rob_loc = Matrix.Translation((x, y, z))
-    mat = ROBLOX_TO_BLENDER @ (rob_loc @ rob_rot) @ ROBLOX_TO_BLENDER_INV
-    mat.translation *= scale
+    Because conjugation by (Scale_s @ R) is a group homomorphism, converting
+    each factor of a product and multiplying gives the same result as
+    converting the product — so C0/C1 chains compose correctly."""
+    mat = ROBLOX_TO_BLENDER @ rob_mat @ ROBLOX_TO_BLENDER_INV
+    mat.translation = mat.translation * scale
     return mat
 
 
 def roblox_components_to_blender_matrix(comp, scale):
-    """Roblox CFrame:GetComponents() -> (x, y, z, R00, R01, R02, R10, R11, R12, R20, R21, R22)
-    Build the 4x4 in Roblox space, then conjugate by the axis-swap so the
-    result lives in Blender space and scale the translation."""
+    """CFrame:GetComponents() (x,y,z, R00..R22 row-major) -> Blender 4x4."""
     px, py, pz = comp[0], comp[1], comp[2]
-    r00, r01, r02 = comp[3], comp[4], comp[5]
-    r10, r11, r12 = comp[6], comp[7], comp[8]
-    r20, r21, r22 = comp[9], comp[10], comp[11]
     rob = Matrix((
-        (r00, r01, r02, px),
-        (r10, r11, r12, py),
-        (r20, r21, r22, pz),
-        (0.0, 0.0, 0.0, 1.0),
+        (comp[3], comp[4],  comp[5],  px),
+        (comp[6], comp[7],  comp[8],  py),
+        (comp[9], comp[10], comp[11], pz),
+        (0.0,     0.0,      0.0,      1.0),
     ))
-    mat = ROBLOX_TO_BLENDER @ rob @ ROBLOX_TO_BLENDER_INV
-    mat.translation *= scale
-    return mat
+    return _conjugate(rob, scale)
 
 
-def roblox_position_to_blender(pos, scale):
-    """(x, y, z)_roblox -> Vector(x, -z, y) * scale"""
-    return Vector((pos[0] * scale, -pos[2] * scale, pos[1] * scale))
+def roblox_posquat_to_blender(px, py, pz, qx, qy, qz, qw, scale):
+    """Recorded world position + quaternion -> Blender 4x4 world matrix."""
+    rot = Quaternion((qw, qx, qy, qz))
+    n = rot.magnitude
+    if n > 1e-12:
+        rot = rot * (1.0 / n)
+    else:
+        rot = Quaternion((1.0, 0.0, 0.0, 0.0))
+    rob = rot.to_matrix().to_4x4()
+    rob.translation = Vector((px, py, pz))
+    return _conjugate(rob, scale)
 
 
-def make_sphere(name, radius, collection):
-    mesh = bpy.data.meshes.new(name + "_mesh")
-    obj = bpy.data.objects.new(name, mesh)
-    collection.objects.link(obj)
+# ----------------------------------------------------------------------------
+# Frame parsing  (ROCORDER/3 only)
+# ----------------------------------------------------------------------------
+def parse_frame_line_v3(line):
+    """'t=1.23;uid:p0|p1|...;uid:...'  where each part = px,py,pz,qx,qy,qz,qw
+    -> (t, { uid: [ (px,py,pz,qx,qy,qz,qw), ... ] })  parts positional."""
+    line = line.strip()
+    if not line:
+        return None, None
+    parts = line.split(";")
+    if not parts[0].startswith("t="):
+        return None, None
+    try:
+        t = float(parts[0][2:])
+    except ValueError:
+        return None, None
 
-    bm = bmesh.new()
-    bmesh.ops.create_uvsphere(bm, u_segments=16, v_segments=8, radius=radius)
-    bm.to_mesh(mesh)
-    bm.free()
+    out = {}
+    for chunk in parts[1:]:
+        if ":" not in chunk:
+            continue
+        uid_str, blob = chunk.split(":", 1)
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            continue
+        part_vals = []
+        for part_str in blob.split("|"):
+            vals = part_str.split(",")
+            if len(vals) != 7:
+                continue
+            try:
+                part_vals.append(tuple(float(v) for v in vals))
+            except ValueError:
+                continue
+        if part_vals:
+            out[uid] = part_vals
+    return t, out
 
-    obj.rotation_mode = "QUATERNION"
-    return obj
 
-
+# ----------------------------------------------------------------------------
+# Materials / geometry
+# ----------------------------------------------------------------------------
 def _color_material(color, transparency):
-    """Return a Principled-BSDF material keyed by color so we share materials
-    across identical parts."""
     r, g, b = (float(c) for c in color)
     a = max(0.0, 1.0 - float(transparency))
     key = "ROCORDER_M_{:.3f}_{:.3f}_{:.3f}_{:.3f}".format(r, g, b, a)
@@ -150,65 +153,46 @@ def _color_material(color, transparency):
         bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
         if a < 1.0:
             mat.blend_method = "BLEND"
-            # 'Alpha' input was renamed in newer Blender versions; try both
             alpha_input = bsdf.inputs.get("Alpha")
             if alpha_input is not None:
                 alpha_input.default_value = a
     return mat
 
 
-def make_part_object(name, part_info, collection):
-    """Build a Blender mesh sized to match a Roblox BasePart. Roblox's local
-    axes map to Blender's local axes via the same (x, y, z) -> (x, -z, y) swap
-    we apply to world-space matrices, so the *mesh* dimensions get Y and Z
-    swapped here: a Roblox part of size (sx, sy, sz) becomes a Blender mesh
-    of size (sx, sz, sy)."""
-    sx, sy, sz = part_info.get("size", [1.0, 1.0, 1.0])
-    shape = (part_info.get("shape") or "Block")
+def _add_part_geometry(bm, part, place_mat, scale):
+    """Add one part's geometry to the shared bmesh, transformed into place at
+    `place_mat` (the part's canonical rest, Blender space). Returns the list of
+    newly created BMVerts (so the caller can build a vertex group).
 
-    mesh = bpy.data.meshes.new(name + "_mesh")
-    bm = bmesh.new()
+    Roblox local axes map to Blender local axes by the same (x,y,z)->(x,-z,y)
+    swap, so a Roblox size (sx,sy,sz) becomes a Blender-local box (sx,sz,sy)."""
+    shape = part.get("shape") or "Block"
+    size = part.get("size", [1.0, 1.0, 1.0])
+    sx, sy, sz = (float(s) for s in size)
 
     if shape == "Ball":
-        # Roblox Ball is uniform; use smallest axis as diameter to stay inside
-        # the bounding box even for asymmetric sizes.
         diam = min(sx, sy, sz)
-        bmesh.ops.create_uvsphere(bm, u_segments=20, v_segments=10,
-                                  radius=diam / 2.0)
+        ret = bmesh.ops.create_uvsphere(
+            bm, u_segments=16, v_segments=8, radius=max(diam * 0.5 * scale, 1e-4))
+        new_verts = ret["verts"]
     else:
-        # Block, MeshPart, Wedge, Cylinder, etc. — all approximated by an
-        # axis-aligned bounding box of the correct size. Mesh content for
-        # MeshParts could be fetched later via the saved meshId.
-        bmesh.ops.create_cube(bm, size=1.0)
-        bmesh.ops.scale(bm, vec=(sx, sz, sy), verts=bm.verts)
+        ret = bmesh.ops.create_cube(bm, size=1.0)
+        new_verts = ret["verts"]
+        bmesh.ops.scale(
+            bm,
+            vec=(max(sx * scale, 1e-4), max(sz * scale, 1e-4), max(sy * scale, 1e-4)),
+            verts=new_verts,
+        )
 
-    bm.to_mesh(mesh)
-    bm.free()
-
-    color = part_info.get("color", [0.7, 0.7, 0.7])
-    transparency = float(part_info.get("transparency", 0.0))
-    mesh.materials.append(_color_material(color, transparency))
-
-    obj = bpy.data.objects.new(name, mesh)
-    collection.objects.link(obj)
-    obj.rotation_mode = "QUATERNION"
-
-    if transparency >= 0.99:
-        obj.hide_viewport = True
-        obj.hide_render = True
-
-    # surface mesh metadata for future "fetch real meshes" passes
-    if part_info.get("meshId"):
-        obj["rocorder_mesh_id"] = part_info["meshId"]
-    if part_info.get("textureId"):
-        obj["rocorder_texture_id"] = part_info["textureId"]
-    obj["rocorder_shape"] = shape
-
-    return obj
+    # move the fresh geometry into world place
+    bmesh.ops.transform(bm, matrix=place_mat, verts=new_verts)
+    return new_verts
 
 
+# ----------------------------------------------------------------------------
+# Rig file
+# ----------------------------------------------------------------------------
 def load_rig_file(rec_filepath, header, report):
-    """Find and parse the companion .rig.json. Returns the parsed dict or None."""
     candidates = []
     rig_field = header.get("rigFile")
     rec_dir = os.path.dirname(rec_filepath)
@@ -234,175 +218,116 @@ def load_rig_file(rec_filepath, header, report):
     for p in candidates:
         print("    ", p)
     report({"WARNING"},
-           "No companion .rig.json next to the .rec — falling back to spheres. "
-           "If this recording was made before rig support was added, re-record it.")
+           "No companion .rig.json next to the .rec — falling back to spheres.")
     return None
 
 
 # ----------------------------------------------------------------------------
-# Armature building / animation
+# Canonical rest pose (the T-pose), from Motor6D C0/C1
 # ----------------------------------------------------------------------------
-
-def _topological_order(bone_names, parent_of):
-    """Return bone_names sorted so every parent appears before its children."""
-    seen = set()
-    out = []
-    bones = set(bone_names)
-    def visit(name):
-        if name in seen or name not in bones:
-            return
-        seen.add(name)
-        p = parent_of.get(name)
-        if p is not None:
-            visit(p)
-        out.append(name)
-    for n in bone_names:
-        visit(n)
-    return out
-
-
 def compute_canonical_rest_poses(player_rig, scale):
-    """Build the canonical (T-pose) world CFrame of each part in armature
-    space by walking the Motor6D C0/C1 chain. Roots get Identity; each child's
-    canonical CFrame = parent_canonical @ C0 @ C1.inverted(). This is the
-    rig's STRUCTURAL rest pose — independent of whatever the player happened
-    to be doing at the moment recording started.
-
-    Falls back to the recorded restCFrame for any part the chain can't reach
-    (missing C0/C1 in older recordings, orphan parts, etc.).
-    """
+    """Per-part canonical world CFrame D in armature space, walking the C0/C1
+    chain: roots at Identity, child = parent @ C0 @ C1^-1. This is the rig's
+    structural rest pose, independent of what the player was doing when the
+    recording started. Falls back to the recorded restCFrame for unreachable
+    parts."""
     parts = [p for p in player_rig.get("parts", []) if p.get("name")]
     joints = player_rig.get("joints", [])
 
     parent_of = {}
     children_of = {}
-    c0c1_by_pair = {}
+    c0c1 = {}
     for j in joints:
-        p0 = j.get("part0")
-        p1 = j.get("part1")
+        p0, p1 = j.get("part0"), j.get("part1")
         if not p0 or not p1:
             continue
         parent_of[p1] = p0
         children_of.setdefault(p0, []).append(p1)
-        c0 = j.get("c0")
-        c1 = j.get("c1")
+        c0, c1 = j.get("c0"), j.get("c1")
         if c0 and len(c0) >= 12 and c1 and len(c1) >= 12:
-            c0c1_by_pair[(p0, p1)] = (c0, c1)
+            c0c1[(p0, p1)] = (c0, c1)
 
-    part_names = [p["name"] for p in parts]
-    rest_cf_by_name = {p["name"]: p.get("restCFrame") for p in parts}
+    names = [p["name"] for p in parts]
+    rest_cf = {p["name"]: p.get("restCFrame") for p in parts}
 
-    canonical_Q = {}
-    roots = [n for n in part_names if n not in parent_of]
-    queue = []
+    D = {}
+    roots = [n for n in names if n not in parent_of]
+    queue = list(roots)
     for r in roots:
-        canonical_Q[r] = Matrix.Identity(4)
-        queue.append(r)
+        D[r] = Matrix.Identity(4)
 
     while queue:
         parent = queue.pop(0)
         for child in children_of.get(parent, []):
-            if child in canonical_Q:
+            if child in D:
                 continue
-            c0c1 = c0c1_by_pair.get((parent, child))
-            if c0c1 and parent in canonical_Q:
-                c0, c1 = c0c1
-                c0_mat = roblox_components_to_blender_matrix(c0, scale)
-                c1_mat = roblox_components_to_blender_matrix(c1, scale)
-                canonical_Q[child] = canonical_Q[parent] @ c0_mat @ c1_mat.inverted()
+            pair = c0c1.get((parent, child))
+            if pair and parent in D:
+                c0, c1 = pair
+                c0m = roblox_components_to_blender_matrix(c0, scale)
+                c1m = roblox_components_to_blender_matrix(c1, scale)
+                D[child] = D[parent] @ c0m @ c1m.inverted()
             else:
-                rcf = rest_cf_by_name.get(child)
-                if rcf and len(rcf) >= 12:
-                    canonical_Q[child] = roblox_components_to_blender_matrix(rcf, scale)
-                else:
-                    canonical_Q[child] = canonical_Q.get(parent, Matrix.Identity(4)).copy()
+                rcf = rest_cf.get(child)
+                D[child] = (roblox_components_to_blender_matrix(rcf, scale)
+                            if rcf and len(rcf) >= 12
+                            else D.get(parent, Matrix.Identity(4)).copy())
             queue.append(child)
 
-    for name in part_names:
-        if name in canonical_Q:
+    for name in names:
+        if name in D:
             continue
-        rcf = rest_cf_by_name.get(name)
-        if rcf and len(rcf) >= 12:
-            canonical_Q[name] = roblox_components_to_blender_matrix(rcf, scale)
-        else:
-            canonical_Q[name] = Matrix.Identity(4)
+        rcf = rest_cf.get(name)
+        D[name] = (roblox_components_to_blender_matrix(rcf, scale)
+                   if rcf and len(rcf) >= 12 else Matrix.Identity(4))
 
-    return canonical_Q
+    return D, parent_of, children_of, c0c1
 
 
-def compute_canonical_joint_pivots(player_rig, canonical_Q, scale):
-    """Joint pivots in armature space at canonical T-pose. The pivot for a
-    Motor6D(Part0=A, Part1=B) at rest is `canonical_Q[A] @ C0` — A's canonical
-    CFrame composed with the C0 offset (which points from A's center to the
-    joint in A's local frame).
-
-    Returns (head_pivot, tail_pivots):
-        head_pivot[child]   = Vector — the joint connecting `child` to its parent
-        tail_pivots[parent] = list[Vector] — joints where children attach
-    """
+def compute_joint_pivots(player_rig, D, c0c1, scale):
+    """Joint pivots at the canonical T-pose, in armature space. The pivot of
+    Motor6D(Part0=A, Part1=B) is D[A] @ C0. Returns:
+        head_pivot[child]   = Vector (where `child` attaches to its parent)
+        tail_pivots[parent] = [Vector, ...] (where children attach to it)"""
     head_pivot = {}
     tail_pivots = {}
-    for j in player_rig.get("joints", []):
-        p0 = j.get("part0")
-        p1 = j.get("part1")
-        if not p0 or not p1:
+    for (p0, p1), (c0, _c1) in c0c1.items():
+        if p0 not in D:
             continue
-        c0 = j.get("c0")
-        if c0 and len(c0) >= 12 and p0 in canonical_Q:
-            c0_mat = roblox_components_to_blender_matrix(c0, scale)
-            pivot = (canonical_Q[p0] @ c0_mat).translation.copy()
-        else:
-            # fallback: the snapshot pivot, axis-swapped. Less ideal since
-            # it's expressed in the recording's world coords, not canonical.
-            raw = j.get("pivot")
-            if not raw:
-                continue
-            pivot = roblox_position_to_blender(raw, scale)
+        c0m = roblox_components_to_blender_matrix(c0, scale)
+        pivot = (D[p0] @ c0m).translation.copy()
         head_pivot[p1] = pivot
         tail_pivots.setdefault(p0, []).append(pivot)
     return head_pivot, tail_pivots
 
 
-def build_player_armature(arm_name, player_rig, scale, collection):
-    """Build an Armature object whose bones mirror the Roblox Motor6D hierarchy.
+# ----------------------------------------------------------------------------
+# Armature + skinned mesh
+# ----------------------------------------------------------------------------
+def build_player(player_rig, label, scale, collection):
+    """Build the armature + a single skinned mesh for one player.
 
-    Bones are placed JOINT-TO-JOINT (head at parent joint pivot, tail at the
-    farthest child joint pivot) so the rig visually looks like a Roblox
-    skeleton. Because that makes bone.matrix_local (B) differ from the part's
-    rest CFrame (Q), the caller must compensate when computing pose bone
-    matrices: target the bone at `P @ Q⁻¹ @ B` instead of `P` directly. With
-    that compensation and `Child Of(inverse=B⁻¹, mesh.matrix_world=Q)` the
-    mesh evaluates to exactly P.
-
-    Returns (arm_obj, parent_of, rest_world, head_world_rob, part_rest_world):
-        parent_of[bone]        = parent bone name (or absent if root)
-        rest_world[bone]       = B = bone.matrix_local in armature space
-        head_world_rob[bone]   = (x, y, z) bone head position in Roblox coords
-        part_rest_world[bone]  = Q = part's rest CFrame in Blender (or absent
-                                 when the recording has no restCFrame for it)
+    Returns a dict with:
+        arm        : armature object
+        parent_of  : { bone: parent_bone }
+        D          : { bone: canonical rest matrix (Blender) }
+        R          : { bone: bone.matrix_local }
+        order      : [ bone_name, ... ]  (positional, matches .rec part order)
+    or None if the rig had no usable parts.
     """
     parts = [p for p in player_rig.get("parts", []) if p.get("name")]
-    joints = player_rig.get("joints", [])
     if not parts:
-        return None, {}, {}, {}, {}
+        return None
 
-    parent_of = {}
-    for j in joints:
-        p0, p1 = j.get("part0"), j.get("part1")
-        if p0 and p1:
-            parent_of[p1] = p0
+    D, parent_of, _children_of, c0c1 = compute_canonical_rest_poses(player_rig, scale)
+    head_pivot, tail_pivots = compute_joint_pivots(player_rig, D, c0c1, scale)
+    order = [p["name"] for p in parts]
 
-    # canonical T-pose: derived purely from rig structure (C0/C1), not from
-    # whatever the player was doing at recording start.
-    canonical_Q = compute_canonical_rest_poses(player_rig, scale)
-    head_pivot, tail_pivots = compute_canonical_joint_pivots(
-        player_rig, canonical_Q, scale)
-
-    arm_data = bpy.data.armatures.new(arm_name + "_data")
-    arm_obj = bpy.data.objects.new(arm_name, arm_data)
+    # ---- armature with joint-to-joint bones (purely visual) ----
+    arm_data = bpy.data.armatures.new(label + "_arm")
+    arm_obj = bpy.data.objects.new(label + "_rig", arm_data)
     collection.objects.link(arm_obj)
 
-    # entering edit mode requires the armature to be the active object
     prev_active = bpy.context.view_layer.objects.active
     prev_mode = bpy.context.mode if bpy.context.mode else "OBJECT"
     bpy.context.view_layer.objects.active = arm_obj
@@ -410,86 +335,119 @@ def build_player_armature(arm_name, player_rig, scale, collection):
     if prev_mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
     bpy.ops.object.mode_set(mode="EDIT")
-
-    edit_bones = arm_data.edit_bones
-    head_world_rob = {}
-    part_rest_world = canonical_Q  # alias: this is what gets returned for animation compensation
     try:
+        ebs = arm_data.edit_bones
         for p in parts:
-            bone_name = p["name"]
+            name = p["name"]
+            Qd = D.get(name, Matrix.Identity(4))
             size = p.get("size", [1.0, 1.0, 1.0])
-            Q = canonical_Q.get(bone_name)
 
-            # ---- joint-to-joint bone placement in CANONICAL space ----
-            # head: parent joint pivot at canonical T-pose
-            if bone_name in head_pivot:
-                head = head_pivot[bone_name].copy()
-            elif Q is not None:
-                head = Q.translation.copy()
-            else:
-                head = Vector((0.0, 0.0, 0.0))
-            head_world_rob[bone_name] = (head.x, head.y, head.z)
+            head = (head_pivot[name].copy() if name in head_pivot
+                    else Qd.translation.copy())
 
-            # tail: farthest child joint pivot, or extend along the part's
-            # canonical local Y for leaves
-            if bone_name in tail_pivots and tail_pivots[bone_name]:
-                tail = max(tail_pivots[bone_name],
+            if tail_pivots.get(name):
+                tail = max(tail_pivots[name],
                            key=lambda v: (v - head).length_squared).copy()
-            elif Q is not None:
-                local_y = Vector((Q[0][1], Q[1][1], Q[2][1]))
+            else:
+                # leaf: extend along the part's canonical local Y
+                local_y = Vector((Qd[0][1], Qd[1][1], Qd[2][1]))
                 if local_y.length < 1e-6:
                     local_y = Vector((0.0, 0.0, 1.0))
                 local_y.normalize()
-                length = max(abs(size[1]) * scale, 0.1)
-                tail = head + local_y * length
-            else:
-                tail = head + Vector((0.0, 0.0, 1.0))
+                tail = head + local_y * max(abs(float(size[1])) * scale, 0.1)
 
-            eb = edit_bones.new(bone_name)
+            eb = ebs.new(name)
             eb.head = head
             eb.tail = tail
             if (eb.tail - eb.head).length < 1e-4:
                 eb.tail = eb.head + Vector((0.0, 0.0, 0.1))
 
-        # parenting must happen AFTER all bones exist
-        for child_name, parent_name in parent_of.items():
-            if child_name in edit_bones and parent_name in edit_bones:
-                edit_bones[child_name].parent = edit_bones[parent_name]
-                edit_bones[child_name].use_connect = False
+        for child, parent in parent_of.items():
+            if child in ebs and parent in ebs:
+                ebs[child].parent = ebs[parent]
+                ebs[child].use_connect = False
     finally:
         bpy.ops.object.mode_set(mode="OBJECT")
         bpy.context.view_layer.objects.active = prev_active
 
-    rest_world = {b.name: b.matrix_local.copy() for b in arm_data.bones}
-
-    # rotation_mode for all pose bones to QUATERNION for clean keyframes
+    R = {b.name: b.matrix_local.copy() for b in arm_data.bones}
     for pb in arm_obj.pose.bones:
         pb.rotation_mode = "QUATERNION"
 
-    return arm_obj, parent_of, rest_world, head_world_rob, part_rest_world
+    # ---- one combined skinned mesh ----
+    mesh = bpy.data.meshes.new(label + "_mesh")
+    bm = bmesh.new()
+    groups = []        # (bone_name, [BMVert])
+    mat_index = {}     # color/alpha key -> material slot index
+    materials = []     # ordered list of materials for the mesh
+
+    for p in parts:
+        name = p["name"]
+        if name not in R:
+            continue
+        # skip geometry for invisible parts (e.g. HumanoidRootPart) but KEEP the
+        # bone — it still carries its children.
+        if float(p.get("transparency", 0.0)) >= 0.999:
+            continue
+        place = D.get(name, Matrix.Identity(4))
+        verts = _add_part_geometry(bm, p, place, scale)
+        if not verts:
+            continue
+        groups.append((name, verts))
+
+        key = "{}|{}".format(p.get("color", [0.7, 0.7, 0.7]),
+                             p.get("transparency", 0.0))
+        if key not in mat_index:
+            mat_index[key] = len(materials)
+            materials.append(_color_material(p.get("color", [0.7, 0.7, 0.7]),
+                                             float(p.get("transparency", 0.0))))
+        idx = mat_index[key]
+        faces = set()
+        for v in verts:
+            faces.update(v.link_faces)
+        for fc in faces:
+            fc.material_index = idx
+
+    bm.verts.index_update()
+    group_indices = [(name, [v.index for v in verts]) for name, verts in groups]
+    bm.to_mesh(mesh)
+    bm.free()
+
+    for m in materials:
+        mesh.materials.append(m)
+
+    mesh_obj = bpy.data.objects.new(label + "_skin", mesh)
+    collection.objects.link(mesh_obj)
+    for name, idxs in group_indices:
+        vg = mesh_obj.vertex_groups.new(name=name)
+        vg.add(idxs, 1.0, "REPLACE")
+
+    mesh_obj.parent = arm_obj
+    mesh_obj.matrix_parent_inverse = arm_obj.matrix_world.inverted()
+    mod = mesh_obj.modifiers.new("Armature", "ARMATURE")
+    mod.object = arm_obj
+    mod.use_vertex_groups = True
+
+    return {
+        "arm": arm_obj,
+        "mesh": mesh_obj,
+        "parent_of": parent_of,
+        "D": D,
+        "R": R,
+        "order": order,
+    }
 
 
-def bind_mesh_to_bone(mesh_obj, arm_obj, bone_name, rest_world_mesh):
-    """Place the mesh at rest_world_mesh and attach a Child Of constraint so
-    it follows the bone's pose deviations from rest. The constraint's
-    inverse_matrix equals the bone's world rest matrix inverted, which makes
-    `bone_world_pose @ inverse_matrix @ mesh_rest_world` cancel cleanly to
-    `mesh_rest_world` when the bone is at rest, and apply the bone's relative
-    motion otherwise."""
-    mesh_obj.matrix_world = rest_world_mesh
-    con = mesh_obj.constraints.new("CHILD_OF")
-    con.target = arm_obj
-    con.subtarget = bone_name
-    bone_world_rest = arm_obj.matrix_world @ arm_obj.data.bones[bone_name].matrix_local
-    con.inverse_matrix = bone_world_rest.inverted()
-
-
+# ----------------------------------------------------------------------------
+# Import
+# ----------------------------------------------------------------------------
 def _player_label(roster, uid):
     info = roster.get(uid, {})
-    return info.get("displayName") or info.get("name") or "Player"
+    name = info.get("displayName") or info.get("name") or "Player"
+    return "{}_{}".format(name, uid)
 
 
-def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, build_armature, report):
+def import_replay(context, filepath, scale, set_fps, build_armature, report):
     try:
         fh = open(filepath, "r", encoding="utf-8")
     except OSError as e:
@@ -505,41 +463,28 @@ def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, bui
             return {"CANCELLED"}
 
         fmt_name = header.get("format")
-        if fmt_name == "ROCORDER/1":
-            version = 1
-        elif fmt_name == "ROCORDER/2":
-            version = 2
-        else:
-            report({"WARNING"},
-                   "Unknown format '{}', assuming ROCORDER/2.".format(fmt_name))
-            version = 2
+        if fmt_name != "ROCORDER/3":
+            report({"ERROR"},
+                   "This importer needs ROCORDER/3 recordings (got '{}'). "
+                   "Please re-record with the current rocorder.lua.".format(fmt_name))
+            return {"CANCELLED"}
 
         tick_rate = float(header.get("tickRate", 30))
         roster = {p["userId"]: p for p in header.get("roster", []) if "userId" in p}
 
-        parser = parse_frame_line_v2 if version == 2 else parse_frame_line_v1
         frames = []
         for raw in fh:
-            t, entries = parser(raw)
+            t, data = parse_frame_line_v3(raw)
             if t is None:
                 continue
-            frames.append((t, entries))
+            frames.append((t, data))
 
     if not frames:
         report({"ERROR"}, "No frames found in recording.")
         return {"CANCELLED"}
 
-    # rig is only meaningful for v2 (per-bone) recordings
-    rig_data = None
-    rig_lookup = {}  # str(uid) -> { bone_name: part_info }
-    if version == 2 and use_rig:
-        rig_data = load_rig_file(filepath, header, report)
-        if rig_data is not None:
-            for uid_key, player_rig in rig_data.get("players", {}).items():
-                rig_lookup[str(uid_key)] = {
-                    p["name"]: p for p in player_rig.get("parts", [])
-                    if "name" in p
-                }
+    rig_data = load_rig_file(filepath, header, report)
+    rig_players = (rig_data or {}).get("players", {})
 
     scene = context.scene
     if set_fps:
@@ -551,262 +496,158 @@ def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, bui
     root_coll = bpy.data.collections.new("ROCORDER_" + base_name)
     scene.collection.children.link(root_coll)
 
-    objects = {}       # v1 key = uid; v2-object-mode key = (uid, bone)
-    last_quat = {}     # same keying as objects
-    player_colls = {}  # uid -> sub-collection (v2)
+    players = {}        # uid -> build_player() dict (armature path)
+    fallback_objs = {}  # (uid, part_index) -> object (no-rig sphere path)
+    fallback_quat = {}  # (uid, part_index) -> last Quaternion
+    player_colls = {}
 
-    # Per-player armature state (only populated when build_armature is on AND
-    # the rig file has that player). Mid-game joiners with no rig data fall
-    # back to per-bone objects in the same sub-collection.
-    armatures        = {}  # uid -> arm_obj
-    arm_parent_of    = {}  # uid -> { bone_name: parent_bone_name }
-    arm_rest_world   = {}  # uid -> { bone_name: B = bone.matrix_local }
-    arm_part_rest    = {}  # uid -> { bone_name: Q = part rest CFrame (Blender) }
-    arm_last_quat    = {}  # uid -> { bone_name: Quaternion } for sign continuity
-
-    last_frame = 1
-    keyframes_written = 0
-    bones_animated = 0
-
-    def get_or_make_player_coll(uid):
+    def player_coll(uid):
         sub = player_colls.get(uid)
         if sub is None:
-            sub = bpy.data.collections.new(
-                "{}_{}".format(_player_label(roster, uid), uid))
+            sub = bpy.data.collections.new(_player_label(roster, uid))
             root_coll.children.link(sub)
             player_colls[uid] = sub
         return sub
 
-    def ensure_player_armature(uid):
-        """Lazily create the armature + per-bone meshes for one player. Only
-        called when build_armature is enabled and rig data is available."""
-        if uid in armatures or str(uid) not in rig_lookup:
-            return armatures.get(uid)
-        player_rig = rig_data["players"][str(uid)]
-        sub = get_or_make_player_coll(uid)
-        arm_name = "{}_{}_rig".format(_player_label(roster, uid), uid)
-        arm_obj, parent_of, rest_world, _heads_rob, part_rest_world = build_player_armature(
-            arm_name, player_rig, scale, sub)
-        if arm_obj is None:
+    def ensure_player(uid):
+        if uid in players:
+            return players[uid]
+        rig = rig_players.get(str(uid))
+        if not rig:
             return None
-        arm_obj["rocorder_user_id"] = str(uid)
+        built = build_player(rig, _player_label(roster, uid), scale, player_coll(uid))
+        if built is None:
+            return None
+        built["last_quat"] = {}
+        built["arm"]["rocorder_user_id"] = str(uid)
+        players[uid] = built
+        return built
 
-        # build meshes for every part and bind each to its bone
-        for p in player_rig.get("parts", []):
-            bone_name = p.get("name")
-            if not bone_name or bone_name not in rest_world:
-                continue
-            mesh_name = "{}_{}_{}".format(
-                _player_label(roster, uid), uid, bone_name)
-            mesh = make_part_object(mesh_name, p, sub)
-            mesh["rocorder_user_id"] = str(uid)
-            mesh["rocorder_bone"] = bone_name
-            # mesh starts at the part's CANONICAL T-pose position (not the
-            # recorded first frame) so the rig's rest pose is a clean T.
-            rest_world_mesh = part_rest_world.get(bone_name, rest_world[bone_name])
-            bind_mesh_to_bone(mesh, arm_obj, bone_name, rest_world_mesh)
-
-        armatures[uid] = arm_obj
-        arm_parent_of[uid] = parent_of
-        arm_rest_world[uid] = rest_world
-        arm_part_rest[uid] = part_rest_world
-        arm_last_quat[uid] = {}
-        return arm_obj
-
-    # Decide which players go through the armature path. v2 only. Requires
-    # build_armature flag, a successfully loaded rig, AND non-empty rig data
-    # for that player.
-    armature_uids = set()
-    if version == 2 and build_armature and rig_data is not None:
-        for uid_key in rig_lookup.keys():
+    use_armatures = build_armature and bool(rig_players)
+    if use_armatures:
+        for uid_key in rig_players:
             try:
-                armature_uids.add(int(uid_key))
+                ensure_player(int(uid_key))
             except ValueError:
                 pass
 
-    # Pre-create everything that's known up-front: v1 spheres, and v2 armatures
-    # for players present in the rig.
-    if version == 1:
-        all_uids = set(roster.keys())
-        for _t, entries in frames:
-            for uid, *_ in entries:
-                all_uids.add(uid)
-        for uid in sorted(all_uids):
-            obj = make_sphere(
-                "{}_{}".format(_player_label(roster, uid), uid),
-                sphere_radius, root_coll)
-            obj["rocorder_user_id"] = str(uid)
-            objects[uid] = obj
-    elif version == 2:
-        for uid in sorted(armature_uids):
-            ensure_player_armature(uid)
+    last_frame = 1
+    keyframes = 0
+    bone_keys = 0
 
-    for t, entries in frames:
+    for t, data in frames:
         frame_num = int(round(t * fps)) + 1
-        if frame_num > last_frame:
-            last_frame = frame_num
+        last_frame = max(last_frame, frame_num)
 
-        if version == 1:
-            for entry in entries:
-                uid, x, y, z, rx, ry, rz = entry
-                obj = objects.get(uid)
-                if obj is None:
-                    continue
-                mat = roblox_pose_to_blender(x, y, z, rx, ry, rz, scale)
-                loc, rot, _ = mat.decompose()
-                prev = last_quat.get(uid)
-                if prev is not None and prev.dot(rot) < 0.0:
-                    rot = Quaternion((-rot.w, -rot.x, -rot.y, -rot.z))
-                last_quat[uid] = rot
-                obj.location = loc
-                obj.rotation_quaternion = rot
-                obj.keyframe_insert(data_path="location", frame=frame_num)
-                obj.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
-                keyframes_written += 2
-            continue
+        for uid, part_list in data.items():
+            built = ensure_player(uid) if use_armatures else None
 
-        # ---- v2: split entries by player so armature math can run on a
-        # complete per-player snapshot for this frame (parents-before-children).
-        per_player = {}  # uid -> { bone_name: world_matrix_blender }
-        for entry in entries:
-            uid, bone, x, y, z, rx, ry, rz = entry
-            mat = roblox_pose_to_blender(x, y, z, rx, ry, rz, scale)
-            per_player.setdefault(uid, {})[bone] = mat
+            if built is not None:
+                order = built["order"]
+                R = built["R"]
+                D = built["D"]
+                parent_of = built["parent_of"]
+                last_q = built["last_quat"]
+                arm = built["arm"]
 
-        for uid, bone_to_mat in per_player.items():
-            if uid in armature_uids:
-                arm_obj = armatures.get(uid)
-                if arm_obj is None:
-                    arm_obj = ensure_player_armature(uid)
-                    if arm_obj is None:
+                # 1) target pose.matrix per bone: pose = T @ D^-1 @ R
+                pose = {}
+                for i, vals in enumerate(part_list):
+                    if i >= len(order):
+                        break
+                    name = order[i]
+                    if name not in R:
                         continue
+                    T = roblox_posquat_to_blender(*vals, scale)
+                    pose[name] = T @ D[name].inverted() @ R[name]
 
-                rest_world = arm_rest_world[uid]
-                parent_of  = arm_parent_of[uid]
-                part_rest  = arm_part_rest[uid]
-                last_q_map = arm_last_quat[uid]
-
-                # process bones parents-first so each child can read its
-                # parent's already-computed pose for this frame
-                order = _topological_order(
-                    [b for b in bone_to_mat.keys() if b in rest_world],
-                    parent_of)
-                pose_world_this_frame = {}
-
-                for bone_name in order:
-                    recorded_P = bone_to_mat[bone_name]
-                    B = rest_world[bone_name]
-                    Q = part_rest.get(bone_name)
-
-                    # ---- compensation: target the bone at `effective` so the
-                    # Child Of constraint (mesh.matrix_world=Q, inverse=B^-1)
-                    # produces mesh_world == recorded_P. When Q is missing
-                    # (old recording without restCFrame), fall back to no
-                    # compensation; mesh will be offset by a constant per
-                    # bone but the bone pose still tracks the recorded data.
-                    if Q is not None:
-                        effective = recorded_P @ Q.inverted() @ B
+                # 2) basis (parents handled explicitly) -> keyframe loc + quat
+                for name, pmat in pose.items():
+                    parent = parent_of.get(name)
+                    if parent in pose:
+                        basis = (R[name].inverted() @ R[parent]
+                                 @ pose[parent].inverted() @ pmat)
                     else:
-                        effective = recorded_P
-                    pose_world_this_frame[bone_name] = effective
+                        basis = R[name].inverted() @ pmat
 
-                    parent_name = parent_of.get(bone_name)
-                    if (parent_name and parent_name in pose_world_this_frame
-                            and parent_name in rest_world):
-                        parent_pose = pose_world_this_frame[parent_name]
-                        parent_rest = rest_world[parent_name]
-                        rest_local  = parent_rest.inverted() @ B
-                        pose_local  = parent_pose.inverted() @ effective
-                        matrix_basis = rest_local.inverted() @ pose_local
-                    else:
-                        matrix_basis = B.inverted() @ effective
-
-                    loc, rot, _ = matrix_basis.decompose()
-                    prev = last_q_map.get(bone_name)
+                    loc, rot, _ = basis.decompose()
+                    prev = last_q.get(name)
                     if prev is not None and prev.dot(rot) < 0.0:
                         rot = Quaternion((-rot.w, -rot.x, -rot.y, -rot.z))
-                    last_q_map[bone_name] = rot
+                    last_q[name] = rot
 
-                    pb = arm_obj.pose.bones.get(bone_name)
+                    pb = arm.pose.bones.get(name)
                     if pb is None:
                         continue
                     pb.location = loc
                     pb.rotation_quaternion = rot
                     pb.keyframe_insert(data_path="location", frame=frame_num)
-                    pb.keyframe_insert(data_path="rotation_quaternion",
-                                       frame=frame_num)
-                    keyframes_written += 2
-                    bones_animated += 1
+                    pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
+                    keyframes += 2
+                    bone_keys += 1
                 continue
 
-            # ---- v2 object mode for this player (no rig, or build_armature off,
-            # or mid-game joiner). One object per (uid, bone), lazily created.
-            for bone, desired in bone_to_mat.items():
-                key = (uid, bone)
-                obj = objects.get(key)
+            # ---- fallback: no rig (or armature disabled) -> a sphere per part ----
+            sub = player_coll(uid)
+            for i, vals in enumerate(part_list):
+                key = (uid, i)
+                obj = fallback_objs.get(key)
                 if obj is None:
-                    sub = get_or_make_player_coll(uid)
-                    obj_name = "{}_{}_{}".format(
-                        _player_label(roster, uid), uid, bone)
-                    part_info = rig_lookup.get(str(uid), {}).get(bone)
-                    if part_info is not None:
-                        obj = make_part_object(obj_name, part_info, sub)
-                    else:
-                        obj = make_sphere(obj_name, sphere_radius, sub)
-                    obj["rocorder_user_id"] = str(uid)
-                    obj["rocorder_bone"] = bone
-                    objects[key] = obj
+                    m = bpy.data.meshes.new("{}_p{}_mesh".format(_player_label(roster, uid), i))
+                    bm = bmesh.new()
+                    bmesh.ops.create_uvsphere(bm, u_segments=12, v_segments=6,
+                                              radius=0.5 * scale)
+                    bm.to_mesh(m)
+                    bm.free()
+                    obj = bpy.data.objects.new("{}_p{}".format(_player_label(roster, uid), i), m)
+                    obj.rotation_mode = "QUATERNION"
+                    sub.objects.link(obj)
+                    fallback_objs[key] = obj
 
-                loc, rot, _ = desired.decompose()
-                prev = last_quat.get(key)
+                T = roblox_posquat_to_blender(*vals, scale)
+                loc, rot, _ = T.decompose()
+                prev = fallback_quat.get(key)
                 if prev is not None and prev.dot(rot) < 0.0:
                     rot = Quaternion((-rot.w, -rot.x, -rot.y, -rot.z))
-                last_quat[key] = rot
+                fallback_quat[key] = rot
                 obj.location = loc
                 obj.rotation_quaternion = rot
                 obj.keyframe_insert(data_path="location", frame=frame_num)
-                obj.keyframe_insert(data_path="rotation_quaternion",
-                                    frame=frame_num)
-                keyframes_written += 2
+                obj.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
+                keyframes += 2
 
-    # linear interpolation across the board, both for mesh objects and
-    # pose-bone actions.
+    # linear interpolation everywhere
     def set_linear(obj):
         ad = obj.animation_data
         if not ad or not ad.action:
             return
-        for fcurve in ad.action.fcurves:
-            for kp in fcurve.keyframe_points:
+        for fc in ad.action.fcurves:
+            for kp in fc.keyframe_points:
                 kp.interpolation = "LINEAR"
-    for obj in objects.values():
+
+    for built in players.values():
+        set_linear(built["arm"])
+    for obj in fallback_objs.values():
         set_linear(obj)
-    for arm_obj in armatures.values():
-        set_linear(arm_obj)
 
     scene.frame_start = 1
     scene.frame_end = last_frame
     scene.frame_current = 1
 
-    if version == 2:
-        mode_desc = []
-        if armatures: mode_desc.append("{} armatures".format(len(armatures)))
-        if objects:   mode_desc.append("{} loose meshes".format(len(objects)))
-        if not mode_desc: mode_desc.append("nothing imported")
-        report({"INFO"},
-               "ROCORDER v2: {}, {} frames, {} keyframes ({} bone-keys).".format(
-                   ", ".join(mode_desc), len(frames),
-                   keyframes_written, bones_animated))
-    else:
-        report({"INFO"},
-               "ROCORDER v1: {} players, {} frames, {} keyframes.".format(
-                   len(objects), len(frames), keyframes_written))
+    report({"INFO"},
+           "ROCORDER v3: {} armatures, {} fallback objs, {} frames, "
+           "{} keyframes ({} bone-keys).".format(
+               len(players), len(fallback_objs), len(frames), keyframes, bone_keys))
     return {"FINISHED"}
 
 
+# ----------------------------------------------------------------------------
+# Operator / UI
+# ----------------------------------------------------------------------------
 class IMPORT_OT_rocorder(Operator, ImportHelper):
     bl_idname = "import_scene.rocorder"
     bl_label = "Import Roblox Replay"
-    bl_description = "Import a ROCORDER .rec file as animated spheres"
+    bl_description = "Import a ROCORDER .rec file as a skinned, animated armature"
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".rec"
@@ -815,47 +656,25 @@ class IMPORT_OT_rocorder(Operator, ImportHelper):
     scale: FloatProperty(
         name="Scale",
         description="World scale. 1.0 = 1 Roblox stud per Blender unit",
-        default=1.0,
-        min=0.0001,
-        soft_max=10.0,
-    )
-    sphere_radius: FloatProperty(
-        name="Sphere Radius",
-        description="Radius of each player sphere, in Blender units (after scale)",
-        default=2.0,
-        min=0.001,
-        soft_max=20.0,
+        default=1.0, min=0.0001, soft_max=10.0,
     )
     set_scene_fps: BoolProperty(
         name="Match scene FPS to recording",
         description="Set scene FPS to the recording's tick rate so 1 frame == 1 sample",
         default=True,
     )
-    use_rig: BoolProperty(
-        name="Use companion rig file",
-        description="If a .rig.json sits next to the .rec, build properly-sized "
-                    "colored boxes per body part instead of plain spheres",
-        default=True,
-    )
     build_armature: BoolProperty(
         name="Build armature per player",
-        description="When the rig file is available, build a Blender armature "
-                    "whose bones mirror Roblox's Motor6D hierarchy and drive "
-                    "the animation through pose bones. Each part mesh is bound "
-                    "to its bone via a Child Of constraint",
+        description="Build a real armature (bones mirror Roblox's Motor6D rig) "
+                    "with a skinned mesh bound via an Armature modifier. Turn "
+                    "off to import plain animated spheres instead",
         default=True,
     )
 
     def execute(self, context):
         return import_replay(
-            context,
-            self.filepath,
-            self.scale,
-            self.sphere_radius,
-            self.set_scene_fps,
-            self.use_rig,
-            self.build_armature,
-            self.report,
+            context, self.filepath, self.scale,
+            self.set_scene_fps, self.build_armature, self.report,
         )
 
 
