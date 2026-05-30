@@ -141,14 +141,21 @@ local function captureRig(player)
         if desc:IsA("Motor6D") then
             local p0, p1 = desc.Part0, desc.Part1
             if p0 and p1 then
-                -- world position of the joint at record start; used by the
-                -- importer to place bone heads/tails at real joint locations
+                -- world position of the joint at record start (snapshot pose)
                 local pivot = (p0.CFrame * desc.C0).Position
+                -- C0/C1 are STRUCTURAL: offsets in Part0/Part1's local frames,
+                -- unchanged by animation. The importer walks these to build
+                -- the canonical T-pose, independent of whatever the character
+                -- happened to be doing when recording started.
+                local c0Comp = { desc.C0:GetComponents() }
+                local c1Comp = { desc.C1:GetComponents() }
                 table.insert(rig.joints, {
                     name  = desc.Name,
                     part0 = sanitizeName(p0.Name),
                     part1 = sanitizeName(p1.Name),
                     pivot = { pivot.X, pivot.Y, pivot.Z },
+                    c0    = c0Comp,
+                    c1    = c1Comp,
                 })
             end
         end

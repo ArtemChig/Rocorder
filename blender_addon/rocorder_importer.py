@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (4, 2, 0),
+    "version": (5, 0, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replay files as animated spheres",
@@ -261,6 +261,108 @@ def _topological_order(bone_names, parent_of):
     return out
 
 
+def compute_canonical_rest_poses(player_rig, scale):
+    """Build the canonical (T-pose) world CFrame of each part in armature
+    space by walking the Motor6D C0/C1 chain. Roots get Identity; each child's
+    canonical CFrame = parent_canonical @ C0 @ C1.inverted(). This is the
+    rig's STRUCTURAL rest pose — independent of whatever the player happened
+    to be doing at the moment recording started.
+
+    Falls back to the recorded restCFrame for any part the chain can't reach
+    (missing C0/C1 in older recordings, orphan parts, etc.).
+    """
+    parts = [p for p in player_rig.get("parts", []) if p.get("name")]
+    joints = player_rig.get("joints", [])
+
+    parent_of = {}
+    children_of = {}
+    c0c1_by_pair = {}
+    for j in joints:
+        p0 = j.get("part0")
+        p1 = j.get("part1")
+        if not p0 or not p1:
+            continue
+        parent_of[p1] = p0
+        children_of.setdefault(p0, []).append(p1)
+        c0 = j.get("c0")
+        c1 = j.get("c1")
+        if c0 and len(c0) >= 12 and c1 and len(c1) >= 12:
+            c0c1_by_pair[(p0, p1)] = (c0, c1)
+
+    part_names = [p["name"] for p in parts]
+    rest_cf_by_name = {p["name"]: p.get("restCFrame") for p in parts}
+
+    canonical_Q = {}
+    roots = [n for n in part_names if n not in parent_of]
+    queue = []
+    for r in roots:
+        canonical_Q[r] = Matrix.Identity(4)
+        queue.append(r)
+
+    while queue:
+        parent = queue.pop(0)
+        for child in children_of.get(parent, []):
+            if child in canonical_Q:
+                continue
+            c0c1 = c0c1_by_pair.get((parent, child))
+            if c0c1 and parent in canonical_Q:
+                c0, c1 = c0c1
+                c0_mat = roblox_components_to_blender_matrix(c0, scale)
+                c1_mat = roblox_components_to_blender_matrix(c1, scale)
+                canonical_Q[child] = canonical_Q[parent] @ c0_mat @ c1_mat.inverted()
+            else:
+                rcf = rest_cf_by_name.get(child)
+                if rcf and len(rcf) >= 12:
+                    canonical_Q[child] = roblox_components_to_blender_matrix(rcf, scale)
+                else:
+                    canonical_Q[child] = canonical_Q.get(parent, Matrix.Identity(4)).copy()
+            queue.append(child)
+
+    for name in part_names:
+        if name in canonical_Q:
+            continue
+        rcf = rest_cf_by_name.get(name)
+        if rcf and len(rcf) >= 12:
+            canonical_Q[name] = roblox_components_to_blender_matrix(rcf, scale)
+        else:
+            canonical_Q[name] = Matrix.Identity(4)
+
+    return canonical_Q
+
+
+def compute_canonical_joint_pivots(player_rig, canonical_Q, scale):
+    """Joint pivots in armature space at canonical T-pose. The pivot for a
+    Motor6D(Part0=A, Part1=B) at rest is `canonical_Q[A] @ C0` — A's canonical
+    CFrame composed with the C0 offset (which points from A's center to the
+    joint in A's local frame).
+
+    Returns (head_pivot, tail_pivots):
+        head_pivot[child]   = Vector — the joint connecting `child` to its parent
+        tail_pivots[parent] = list[Vector] — joints where children attach
+    """
+    head_pivot = {}
+    tail_pivots = {}
+    for j in player_rig.get("joints", []):
+        p0 = j.get("part0")
+        p1 = j.get("part1")
+        if not p0 or not p1:
+            continue
+        c0 = j.get("c0")
+        if c0 and len(c0) >= 12 and p0 in canonical_Q:
+            c0_mat = roblox_components_to_blender_matrix(c0, scale)
+            pivot = (canonical_Q[p0] @ c0_mat).translation.copy()
+        else:
+            # fallback: the snapshot pivot, axis-swapped. Less ideal since
+            # it's expressed in the recording's world coords, not canonical.
+            raw = j.get("pivot")
+            if not raw:
+                continue
+            pivot = roblox_position_to_blender(raw, scale)
+        head_pivot[p1] = pivot
+        tail_pivots.setdefault(p0, []).append(pivot)
+    return head_pivot, tail_pivots
+
+
 def build_player_armature(arm_name, player_rig, scale, collection):
     """Build an Armature object whose bones mirror the Roblox Motor6D hierarchy.
 
@@ -282,7 +384,7 @@ def build_player_armature(arm_name, player_rig, scale, collection):
     parts = [p for p in player_rig.get("parts", []) if p.get("name")]
     joints = player_rig.get("joints", [])
     if not parts:
-        return None, {}, {}, {}
+        return None, {}, {}, {}, {}
 
     parent_of = {}
     for j in joints:
@@ -290,28 +392,11 @@ def build_player_armature(arm_name, player_rig, scale, collection):
         if p0 and p1:
             parent_of[p1] = p0
 
-    # head pivots come from joints whose part1 == this bone (the joint that
-    # connects it to its parent). tails come from any joint whose part0 == this
-    # bone (i.e. a child's connection). Leaves get a synthetic tail along the
-    # part's local Y axis so the bone has real length.
-    head_pivot = {}
-    tail_pivots = {}
-    for j in joints:
-        p0, p1 = j.get("part0"), j.get("part1")
-        pivot = j.get("pivot")
-        if not pivot:
-            continue
-        if p1:
-            head_pivot[p1] = pivot
-        if p0:
-            tail_pivots.setdefault(p0, []).append(pivot)
-
-    rest_cf_rob = {}
-    parts_by_name = {}
-    for p in parts:
-        parts_by_name[p["name"]] = p
-        if p.get("restCFrame"):
-            rest_cf_rob[p["name"]] = p["restCFrame"]
+    # canonical T-pose: derived purely from rig structure (C0/C1), not from
+    # whatever the player was doing at recording start.
+    canonical_Q = compute_canonical_rest_poses(player_rig, scale)
+    head_pivot, tail_pivots = compute_canonical_joint_pivots(
+        player_rig, canonical_Q, scale)
 
     arm_data = bpy.data.armatures.new(arm_name + "_data")
     arm_obj = bpy.data.objects.new(arm_name, arm_data)
@@ -328,40 +413,28 @@ def build_player_armature(arm_name, player_rig, scale, collection):
 
     edit_bones = arm_data.edit_bones
     head_world_rob = {}
-    part_rest_world = {}
+    part_rest_world = canonical_Q  # alias: this is what gets returned for animation compensation
     try:
         for p in parts:
             bone_name = p["name"]
-            rest_cf = p.get("restCFrame")
-            size    = p.get("size", [1.0, 1.0, 1.0])
+            size = p.get("size", [1.0, 1.0, 1.0])
+            Q = canonical_Q.get(bone_name)
 
-            # Q = part rest CFrame in Blender — needed by the animation
-            # compensation. Stored here so we don't recompute later.
-            Q = None
-            if rest_cf and len(rest_cf) >= 12:
-                Q = roblox_components_to_blender_matrix(rest_cf, scale)
-                part_rest_world[bone_name] = Q
-
-            # ---- joint-to-joint bone placement (visually skeletal) ----
-            # head: joint with parent (or part center / origin as fallbacks)
+            # ---- joint-to-joint bone placement in CANONICAL space ----
+            # head: parent joint pivot at canonical T-pose
             if bone_name in head_pivot:
-                head = roblox_position_to_blender(head_pivot[bone_name], scale)
-                head_rob = head_pivot[bone_name]
+                head = head_pivot[bone_name].copy()
             elif Q is not None:
                 head = Q.translation.copy()
-                head_rob = (rest_cf[0], rest_cf[1], rest_cf[2])
             else:
                 head = Vector((0.0, 0.0, 0.0))
-                head_rob = (0.0, 0.0, 0.0)
-            head_world_rob[bone_name] = head_rob
+            head_world_rob[bone_name] = (head.x, head.y, head.z)
 
-            # tail: pick the child-joint pivot farthest from head, so multi-
-            # child parts (UpperTorso has Neck + both Shoulders) still get a
-            # sensible bone direction. Leaves extend along part local Y.
+            # tail: farthest child joint pivot, or extend along the part's
+            # canonical local Y for leaves
             if bone_name in tail_pivots and tail_pivots[bone_name]:
-                candidates = [roblox_position_to_blender(pv, scale)
-                              for pv in tail_pivots[bone_name]]
-                tail = max(candidates, key=lambda v: (v - head).length_squared)
+                tail = max(tail_pivots[bone_name],
+                           key=lambda v: (v - head).length_squared).copy()
             elif Q is not None:
                 local_y = Vector((Q[0][1], Q[1][1], Q[2][1]))
                 if local_y.length < 1e-6:
@@ -528,12 +601,9 @@ def import_replay(context, filepath, scale, sphere_radius, set_fps, use_rig, bui
             mesh = make_part_object(mesh_name, p, sub)
             mesh["rocorder_user_id"] = str(uid)
             mesh["rocorder_bone"] = bone_name
-            # rest world pose for the mesh comes straight from restCFrame
-            rest_cf = p.get("restCFrame")
-            if rest_cf and len(rest_cf) >= 12:
-                rest_world_mesh = roblox_components_to_blender_matrix(rest_cf, scale)
-            else:
-                rest_world_mesh = rest_world[bone_name]
+            # mesh starts at the part's CANONICAL T-pose position (not the
+            # recorded first frame) so the rig's rest pose is a clean T.
+            rest_world_mesh = part_rest_world.get(bone_name, rest_world[bone_name])
             bind_mesh_to_bone(mesh, arm_obj, bone_name, rest_world_mesh)
 
         armatures[uid] = arm_obj
