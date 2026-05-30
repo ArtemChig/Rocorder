@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (4, 0, 0),
+    "version": (4, 1, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replay files as animated spheres",
@@ -322,43 +322,58 @@ def build_player_armature(arm_name, player_rig, scale, collection):
     try:
         for p in parts:
             bone_name = p["name"]
-
-            if bone_name in head_pivot:
-                head_rob = head_pivot[bone_name]
-            elif bone_name in rest_cf_rob:
-                cf = rest_cf_rob[bone_name]
-                head_rob = (cf[0], cf[1], cf[2])
-            else:
-                head_rob = (0.0, 0.0, 0.0)
-            head_world_rob[bone_name] = head_rob
-
-            if bone_name in tail_pivots and tail_pivots[bone_name]:
-                # pick the child joint pivot farthest from this bone's head —
-                # gives a sensible primary bone direction even when a part
-                # branches (e.g. UpperTorso has Neck + both Shoulders).
-                hx, hy, hz = head_rob
-                tail_rob = max(
-                    tail_pivots[bone_name],
-                    key=lambda pv: (pv[0]-hx)**2 + (pv[1]-hy)**2 + (pv[2]-hz)**2,
-                )
-            elif bone_name in rest_cf_rob:
-                # leaf: extend along part's local Y (its up axis) by half its
-                # height, so the bone visually fits inside the part.
-                cf = rest_cf_rob[bone_name]
-                local_y_world = (cf[4], cf[7], cf[10])  # R01, R11, R21 = local-Y in world
-                size = p.get("size", [1.0, 1.0, 1.0])
-                length = max(size[1] * 0.5, 0.5)
-                tail_rob = (head_rob[0] + local_y_world[0] * length,
-                            head_rob[1] + local_y_world[1] * length,
-                            head_rob[2] + local_y_world[2] * length)
-            else:
-                tail_rob = (head_rob[0], head_rob[1] + 1.0, head_rob[2])
+            rest_cf = p.get("restCFrame")
+            size    = p.get("size", [1.0, 1.0, 1.0])
 
             eb = edit_bones.new(bone_name)
-            eb.head = roblox_position_to_blender(head_rob, scale)
-            eb.tail = roblox_position_to_blender(tail_rob, scale)
-            if (eb.tail - eb.head).length < 1e-4:
-                eb.tail = eb.head + Vector((0.0, 0.0, 0.1))
+
+            if rest_cf and len(rest_cf) >= 12:
+                # ---- IMPORTANT: align bone.matrix_local to the part's rest
+                # CFrame. The Child Of constraint we put on the mesh later
+                # needs `bone_rest_world == part_rest_world` to make the
+                # mesh sit at the recorded pose every frame; if it doesn't,
+                # the mesh ends up offset by a per-bone constant and any
+                # rotation looks like it's pivoting around the wrong axis.
+                rest_mat = roblox_components_to_blender_matrix(rest_cf, scale)
+                head = rest_mat.translation.copy()
+                # columns 1 and 2 of the 3x3 are the part's local Y and Z
+                local_y = Vector((rest_mat[0][1], rest_mat[1][1], rest_mat[2][1]))
+                local_z = Vector((rest_mat[0][2], rest_mat[1][2], rest_mat[2][2]))
+                if local_y.length < 1e-6:
+                    local_y = Vector((0.0, 0.0, 1.0))
+                if local_z.length < 1e-6:
+                    local_z = Vector((1.0, 0.0, 0.0))
+                local_y.normalize()
+                local_z.normalize()
+
+                length = max(abs(size[1]) * scale, 0.1)
+                eb.head = head
+                eb.tail = head + local_y * length
+                if (eb.tail - eb.head).length < 1e-4:
+                    eb.tail = head + Vector((0.0, 0.0, 0.1))
+                eb.align_roll(local_z)
+                head_world_rob[bone_name] = (rest_cf[0], rest_cf[1], rest_cf[2])
+            else:
+                # Backward-compat fallback for recordings without restCFrame:
+                # use joint pivots. Animation will be offset by a constant
+                # per-bone transform; only fixed by re-recording.
+                if bone_name in head_pivot:
+                    head_rob = head_pivot[bone_name]
+                else:
+                    head_rob = (0.0, 0.0, 0.0)
+                if bone_name in tail_pivots and tail_pivots[bone_name]:
+                    hx, hy, hz = head_rob
+                    tail_rob = max(
+                        tail_pivots[bone_name],
+                        key=lambda pv: (pv[0]-hx)**2 + (pv[1]-hy)**2 + (pv[2]-hz)**2,
+                    )
+                else:
+                    tail_rob = (head_rob[0], head_rob[1] + 1.0, head_rob[2])
+                eb.head = roblox_position_to_blender(head_rob, scale)
+                eb.tail = roblox_position_to_blender(tail_rob, scale)
+                if (eb.tail - eb.head).length < 1e-4:
+                    eb.tail = eb.head + Vector((0.0, 0.0, 0.1))
+                head_world_rob[bone_name] = head_rob
 
         # parenting must happen AFTER all bones exist
         for child_name, parent_name in parent_of.items():
