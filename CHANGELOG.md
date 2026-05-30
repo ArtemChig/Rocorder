@@ -9,6 +9,26 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.1.1-alpha — 2026-05-30
+
+UI polish + fixes from the first round of screenshots.
+
+- **Fix**: status panel no longer truncates "Players tracked" at the bottom —
+  the panel auto-sizes to fit its content with a proper list layout and a
+  thin divider between the status row and the detail rows.
+- **Fix**: "Save Last N Seconds" is now a visible outlined button. The old
+  ghost style matched the content background and rendered as plain text.
+- **Fix**: Start/Stop button no longer snaps back to blue on mouse-leave
+  after the status loop has swapped it to red — hover/leave colors live on
+  attributes so external code can change a button's role atomically.
+- Bumped window to 640×560 with a 28px footer that shows the current
+  record / save-replay / toggle-window hotkeys live.
+- Tabs get an accent underline indicator under the active one and a smooth
+  tweened hover (instead of the old hard color swap).
+- Title bar gets a small accent stripe + monospace version label, plus a
+  minimize button (collapses the window to just the title bar).
+- All button hovers tween rather than snap (TweenService, 120ms).
+
 ## 1.1.0-alpha — 2026-05-30
 
 In-game UI and Instant Replay land on the recorder side. The file formats
