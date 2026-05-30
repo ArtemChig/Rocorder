@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.1.0-alpha"
+local ROCORDER_VERSION = "1.1.1-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -938,13 +938,24 @@ local UI = {
     refreshFiles = nil,
 }
 
+local HOVER_TWEEN = TweenInfo.new(0.12, Enum.EasingStyle.Quad)
+
 local function buildButton(parent, text, kind, layoutOrder)
-    local fill = THEME.panel
-    local hover = THEME.panelHi
-    local textColor = THEME.text
-    if kind == "primary" then fill = THEME.accent; hover = THEME.accentHi; textColor = Color3.new(1,1,1)
-    elseif kind == "danger"  then fill = THEME.danger; hover = THEME.dangerHi; textColor = Color3.new(1,1,1)
-    elseif kind == "ghost"   then fill = THEME.bg; hover = THEME.panel end
+    local fill, hover, textColor = THEME.panel, THEME.panelHi, THEME.text
+    local addStroke = false
+    if kind == "primary" then
+        fill, hover, textColor = THEME.accent, THEME.accentHi, Color3.new(1,1,1)
+    elseif kind == "danger" then
+        fill, hover, textColor = THEME.danger, THEME.dangerHi, Color3.new(1,1,1)
+    elseif kind == "secondary" then
+        -- Visible-but-muted; outlined so it reads as a button against the
+        -- content background (the old "ghost" was invisible because its fill
+        -- matched the surrounding bg).
+        fill, hover, textColor = THEME.panel, THEME.panelHi, THEME.accent
+        addStroke = true
+    elseif kind == "ghost" then
+        fill, hover = THEME.bg, THEME.panel
+    end
     local b = mk("TextButton", {
         Text = text, Font = THEME.fontBold, TextSize = 14,
         BackgroundColor3 = fill, TextColor3 = textColor,
@@ -952,19 +963,44 @@ local function buildButton(parent, text, kind, layoutOrder)
         Size = UDim2.new(1, 0, 0, 32), LayoutOrder = layoutOrder or 1,
     }, parent)
     corner(b, 6)
-    b.MouseEnter:Connect(function() b.BackgroundColor3 = hover end)
-    b.MouseLeave:Connect(function() b.BackgroundColor3 = fill end)
+    if addStroke then stroke(b, THEME.accent, 1) end
+    -- Attribute-based colors so external code (the status loop) can change
+    -- the button's role mid-life without the hover handlers snapping it
+    -- back to its original fill on MouseLeave.
+    b:SetAttribute("FillColor",  fill)
+    b:SetAttribute("HoverColor", hover)
+    b.MouseEnter:Connect(function()
+        TweenService:Create(b, HOVER_TWEEN,
+            { BackgroundColor3 = b:GetAttribute("HoverColor") or hover }):Play()
+    end)
+    b.MouseLeave:Connect(function()
+        TweenService:Create(b, HOVER_TWEEN,
+            { BackgroundColor3 = b:GetAttribute("FillColor") or fill }):Play()
+    end)
     return b
 end
 
+-- Helper for the status loop: swap a buildButton's role-colors atomically.
+local function setButtonColors(b, fill, hover)
+    b:SetAttribute("FillColor",  fill)
+    b:SetAttribute("HoverColor", hover)
+    b.BackgroundColor3 = fill
+end
+
 local function buildStatusPanel(parent)
+    -- Auto-sizing: panel grows to fit its content so adding fields later
+    -- doesn't truncate them at the bottom.
     local panel = mk("Frame", {
         BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
-        Size = UDim2.new(1, 0, 0, 92), LayoutOrder = 1,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1,
     }, parent)
-    corner(panel, 8); pad(panel, 12)
+    corner(panel, 8); pad(panel, 14, 12, 14, 14); vlist(panel, 10)
 
-    local row1 = mk("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1,0,0,22) }, panel)
+    -- header row: live dot + status label
+    local row1 = mk("Frame", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22),
+        LayoutOrder = 1 }, panel)
     local dot = mk("Frame", {
         Size = UDim2.fromOffset(10, 10),
         Position = UDim2.fromOffset(0, 6),
@@ -978,14 +1014,24 @@ local function buildStatusPanel(parent)
         TextXAlignment = Enum.TextXAlignment.Left,
     }, row1)
 
-    local detailRows = mk("Frame", { BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(0, 28),
-        Size = UDim2.new(1, 0, 1, -28) }, panel)
-    vlist(detailRows, 3)
+    -- thin divider
+    mk("Frame", {
+        BackgroundColor3 = THEME.border, BorderSizePixel = 0,
+        BackgroundTransparency = 0.5,
+        Size = UDim2.new(1, 0, 0, 1), LayoutOrder = 2,
+    }, panel)
 
-    local function detailRow(label)
+    -- detail rows
+    local detailRows = mk("Frame", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 3,
+    }, panel)
+    vlist(detailRows, 4)
+
+    local function detailRow(label, order)
         local f = mk("Frame", { BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 0, 16) }, detailRows)
+            Size = UDim2.new(1, 0, 0, 18), LayoutOrder = order }, detailRows)
         mk("TextLabel", { Text = label, Font = THEME.fontReg, TextSize = 13,
             TextColor3 = THEME.subtext, BackgroundTransparency = 1,
             Size = UDim2.new(0, 130, 1, 0),
@@ -998,12 +1044,11 @@ local function buildStatusPanel(parent)
         return val
     end
     local v = {
-        time   = detailRow("Elapsed"),
-        ticks  = detailRow("Ticks / size"),
-        buffer = detailRow("Replay buffer"),
-        tracked = detailRow("Players tracked"),
+        time    = detailRow("Elapsed",         1),
+        ticks   = detailRow("Ticks / size",    2),
+        buffer  = detailRow("Replay buffer",   3),
+        tracked = detailRow("Players tracked", 4),
     }
-
     return { panel = panel, statusLabel = statusLabel, dot = dot, fields = v }
 end
 
@@ -1018,8 +1063,8 @@ local function buildRecordView(parent)
     recordBtn.Size = UDim2.new(1, 0, 0, 44)
     recordBtn.TextSize = 16
 
-    local replayBtn = buildButton(view, "Save Last N Seconds", "ghost", 3)
-    replayBtn.Size = UDim2.new(1, 0, 0, 36)
+    local replayBtn = buildButton(view, "Save Last N Seconds", "secondary", 3)
+    replayBtn.Size = UDim2.new(1, 0, 0, 38)
 
     local irRow = mk("Frame", { BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
         Size = UDim2.new(1, 0, 0, 40), LayoutOrder = 4 }, view)
@@ -1289,35 +1334,65 @@ local function buildUI()
     })
     gui.Parent = parent
 
+    local WINDOW_W, WINDOW_H = 640, 560
+    local TITLE_H, TAB_H, FOOTER_H = 38, 36, 28
+
     local window = mk("Frame", {
         Name = "Window", BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
         Position = UDim2.fromOffset(60, 60),
-        Size = UDim2.fromOffset(560, 460),
-        AnchorPoint = Vector2.new(0, 0),
+        Size = UDim2.fromOffset(WINDOW_W, WINDOW_H),
+        AnchorPoint = Vector2.new(0, 0), ClipsDescendants = true,
     }, gui); corner(window, 10); stroke(window, THEME.border, 1)
+    UI.windowFullHeight = WINDOW_H
 
-    -- title bar
+    -- ---- title bar ----
     local title = mk("Frame", { Name = "TitleBar",
         BackgroundColor3 = THEME.titleBar, BorderSizePixel = 0,
-        Size = UDim2.new(1, 0, 0, 36),
+        Size = UDim2.new(1, 0, 0, TITLE_H),
     }, window); corner(title, 10)
-    -- mask bottom half of title bar's corner so it doesn't round into content
+    -- mask the bottom of the title bar's rounded corner so it merges into the content
     mk("Frame", { BackgroundColor3 = THEME.titleBar, BorderSizePixel = 0,
         Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(1, 0, 0.5, 0) }, title)
 
-    mk("TextLabel", { Text = "  ROCORDER  v" .. ROCORDER_VERSION,
+    -- accent stripe along the title bar's left edge — gives the window a recognizable mark
+    mk("Frame", { BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
+        Position = UDim2.fromOffset(0, 8),
+        Size = UDim2.fromOffset(3, TITLE_H - 16) }, title)
+
+    mk("TextLabel", { Text = "ROCORDER",
         Font = THEME.fontBold, TextSize = 14, TextColor3 = THEME.text,
-        BackgroundTransparency = 1, Size = UDim2.new(1, -90, 1, 0),
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.fromOffset(96, TITLE_H),
+        TextXAlignment = Enum.TextXAlignment.Left }, title)
+    mk("TextLabel", { Text = "v" .. ROCORDER_VERSION,
+        Font = THEME.fontMono, TextSize = 12, TextColor3 = THEME.subtext,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(94, 0),
+        Size = UDim2.new(1, -200, 1, 0),
         TextXAlignment = Enum.TextXAlignment.Left }, title)
 
-    local closeBtn = mk("TextButton", { Text = "✕", Font = THEME.fontBold,
-        TextSize = 14, TextColor3 = THEME.subtext,
-        BackgroundTransparency = 1, AutoButtonColor = false,
-        Position = UDim2.new(1, -36, 0, 0),
-        Size = UDim2.fromOffset(36, 36) }, title)
-    closeBtn.MouseEnter:Connect(function() closeBtn.TextColor3 = THEME.text end)
-    closeBtn.MouseLeave:Connect(function() closeBtn.TextColor3 = THEME.subtext end)
+    local function titleIconBtn(text, x)
+        local b = mk("TextButton", { Text = text, Font = THEME.fontBold,
+            TextSize = 16, TextColor3 = THEME.subtext,
+            BackgroundTransparency = 1, AutoButtonColor = false,
+            Position = UDim2.new(1, x, 0, 0),
+            Size = UDim2.fromOffset(TITLE_H, TITLE_H) }, title)
+        b.MouseEnter:Connect(function()
+            TweenService:Create(b, HOVER_TWEEN, { TextColor3 = THEME.text }):Play()
+        end)
+        b.MouseLeave:Connect(function()
+            TweenService:Create(b, HOVER_TWEEN, { TextColor3 = THEME.subtext }):Play()
+        end)
+        return b
+    end
+    local minBtn   = titleIconBtn("\xE2\x80\x93", -TITLE_H * 2)  -- en dash
+    local closeBtn = titleIconBtn("\xE2\x9C\x95", -TITLE_H)       -- ✕
+    minBtn.MouseButton1Click:Connect(function()
+        UI:setMinimized(not UI.minimized)
+    end)
     closeBtn.MouseButton1Click:Connect(function() UI:setVisible(false) end)
+    UI.minBtn = minBtn
 
     -- drag
     do
@@ -1348,28 +1423,71 @@ local function buildUI()
         end)
     end
 
-    -- tab bar
+    -- ---- tab bar with accent indicators ----
     local tabBar = mk("Frame", { BackgroundColor3 = THEME.titleBar,
-        BorderSizePixel = 0, Position = UDim2.new(0, 0, 0, 36),
-        Size = UDim2.new(1, 0, 0, 34) }, window)
-    hlist(tabBar, 0); pad(tabBar, 8, 4, 8, 0)
+        BorderSizePixel = 0, Position = UDim2.new(0, 0, 0, TITLE_H),
+        Size = UDim2.new(1, 0, 0, TAB_H) }, window)
+    hlist(tabBar, 4); pad(tabBar, 10, 4, 10, 0)
+    -- thin border line at the bottom of the tab bar separates it from content
+    mk("Frame", { BackgroundColor3 = THEME.border, BorderSizePixel = 0,
+        BackgroundTransparency = 0.5,
+        Position = UDim2.new(0, 0, 1, -1),
+        Size = UDim2.new(1, 0, 0, 1) }, tabBar)
+
     local content = mk("Frame", { BackgroundColor3 = THEME.bg,
-        BorderSizePixel = 0, Position = UDim2.new(0, 0, 0, 70),
-        Size = UDim2.new(1, 0, 1, -70) }, window)
-    corner(content, 8)
+        BorderSizePixel = 0,
+        Position = UDim2.new(0, 0, 0, TITLE_H + TAB_H),
+        Size = UDim2.new(1, 0, 1, -(TITLE_H + TAB_H + FOOTER_H)) }, window)
+
+    -- ---- footer / hotkey hint bar ----
+    local footer = mk("Frame", { BackgroundColor3 = THEME.titleBar,
+        BorderSizePixel = 0,
+        Position = UDim2.new(0, 0, 1, -FOOTER_H),
+        Size = UDim2.new(1, 0, 0, FOOTER_H) }, window)
+    mk("Frame", { BackgroundColor3 = THEME.border, BorderSizePixel = 0,
+        BackgroundTransparency = 0.5,
+        Size = UDim2.new(1, 0, 0, 1) }, footer)
+    local footerLabel = mk("TextLabel", {
+        Font = THEME.fontMono, TextSize = 12, TextColor3 = THEME.subtext,
+        BackgroundTransparency = 1, Text = "",
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -28, 1, 0),
+        TextXAlignment = Enum.TextXAlignment.Left }, footer)
+    UI.footerLabel = footerLabel
 
     local tabs = { "Record", "Settings", "Files", "Sources" }
     UI.tabBtns = {}
+    UI.tabIndicators = {}
     UI.tabViews = {}
     for i, name in ipairs(tabs) do
         local b = mk("TextButton", { Text = name, Font = THEME.fontBold,
             TextSize = 13, TextColor3 = THEME.subtext,
             BackgroundColor3 = THEME.tabInact,
             BorderSizePixel = 0, AutoButtonColor = false,
-            Size = UDim2.fromOffset(86, 28), LayoutOrder = i }, tabBar)
+            Size = UDim2.fromOffset(94, 30), LayoutOrder = i }, tabBar)
         corner(b, 6)
+        -- accent underline shown when active
+        local indicator = mk("Frame", {
+            BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
+            Position = UDim2.new(0.5, -16, 1, -2),
+            Size = UDim2.fromOffset(32, 2), Visible = false,
+        }, b)
+        corner(indicator, 1)
+        b.MouseEnter:Connect(function()
+            if UI.activeTab ~= name then
+                TweenService:Create(b, HOVER_TWEEN,
+                    { TextColor3 = THEME.text }):Play()
+            end
+        end)
+        b.MouseLeave:Connect(function()
+            if UI.activeTab ~= name then
+                TweenService:Create(b, HOVER_TWEEN,
+                    { TextColor3 = THEME.subtext }):Play()
+            end
+        end)
         b.MouseButton1Click:Connect(function() UI:selectTab(name) end)
         UI.tabBtns[name] = b
+        UI.tabIndicators[name] = indicator
     end
 
     UI.recordCtl   = buildRecordView(content)
@@ -1383,6 +1501,7 @@ local function buildUI()
     UI.tabViews.Sources  = UI.sourcesCtl.view
 
     UI.gui = gui; UI.window = window
+    UI.tabBar = tabBar; UI.content = content; UI.footer = footer
     UI:selectTab("Record")
     UI:_startStatusLoop()
 end
@@ -1393,13 +1512,13 @@ function UI:selectTab(name)
         view.Visible = (tabName == name)
     end
     for tabName, btn in pairs(self.tabBtns) do
-        if tabName == name then
-            btn.BackgroundColor3 = THEME.tabActive
-            btn.TextColor3 = THEME.text
-        else
-            btn.BackgroundColor3 = THEME.tabInact
-            btn.TextColor3 = THEME.subtext
-        end
+        local active = (tabName == name)
+        TweenService:Create(btn, HOVER_TWEEN, {
+            BackgroundColor3 = active and THEME.tabActive or THEME.tabInact,
+            TextColor3 = active and THEME.text or THEME.subtext,
+        }):Play()
+        local ind = self.tabIndicators and self.tabIndicators[tabName]
+        if ind then ind.Visible = active end
     end
     if name == "Files" and self.refreshFiles then self.refreshFiles() end
 end
@@ -1411,6 +1530,20 @@ end
 
 function UI:toggle() self:setVisible(not self.visible) end
 
+function UI:setMinimized(min)
+    if not self.window then return end
+    self.minimized = min
+    if self.tabBar then  self.tabBar.Visible  = not min end
+    if self.content then self.content.Visible = not min end
+    if self.footer then  self.footer.Visible  = not min end
+    -- collapse window to just the title bar height when minimized
+    local h = min and 38 or (self.windowFullHeight or 560)
+    self.window.Size = UDim2.new(0, self.window.AbsoluteSize.X, 0, h)
+    if self.minBtn then
+        self.minBtn.Text = min and "\xE2\x96\xA2" or "\xE2\x80\x93"  -- ▢ vs –
+    end
+end
+
 function UI:_refreshStatus()
     local ctl = self.recordCtl; if not ctl then return end
     local s = ctl.status
@@ -1419,7 +1552,7 @@ function UI:_refreshStatus()
         s.dot.BackgroundColor3 = THEME.recording
         s.statusLabel.Text = "Recording"
         ctl.recordBtn.Text = "Stop Recording"
-        ctl.recordBtn.BackgroundColor3 = THEME.danger
+        setButtonColors(ctl.recordBtn, THEME.danger, THEME.dangerHi)
         s.fields.time.Text = humanDuration(rec.session:elapsed())
         s.fields.ticks.Text = fmt("%d / %s", rec.session.tickCount,
             humanBytes(rec.session.bytesWritten + 0))
@@ -1427,14 +1560,14 @@ function UI:_refreshStatus()
         s.dot.BackgroundColor3 = THEME.accent
         s.statusLabel.Text = "Instant Replay (buffering)"
         ctl.recordBtn.Text = "Start Recording"
-        ctl.recordBtn.BackgroundColor3 = THEME.accent
+        setButtonColors(ctl.recordBtn, THEME.accent, THEME.accentHi)
         s.fields.time.Text = "—"
         s.fields.ticks.Text = "—"
     else
         s.dot.BackgroundColor3 = THEME.standby
         s.statusLabel.Text = "Idle"
         ctl.recordBtn.Text = "Start Recording"
-        ctl.recordBtn.BackgroundColor3 = THEME.accent
+        setButtonColors(ctl.recordBtn, THEME.accent, THEME.accentHi)
         s.fields.time.Text = "—"
         s.fields.ticks.Text = "—"
     end
@@ -1460,6 +1593,13 @@ function UI:_refreshStatus()
                 c.Text = tostring(rec.cfg[key])
             end
         end
+    end
+
+    -- footer hotkey hints
+    if self.footerLabel then
+        self.footerLabel.Text = fmt(
+            "%s record  ·  %s save replay  ·  %s toggle window",
+            rec.cfg.HOTKEY_RECORD, rec.cfg.HOTKEY_SAVE_REPLAY, rec.cfg.HOTKEY_UI)
     end
 end
 
