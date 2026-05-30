@@ -9,6 +9,39 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.1.0-alpha — 2026-05-30
+
+In-game UI and Instant Replay land on the recorder side. The file formats
+(`ROCORDER/3`, `ROCORDER-RIG/2`) are unchanged — existing importers keep
+working, recordings from 1.0 still import.
+
+- **In-game UI** — a draggable window with four tabs (Record / Settings /
+  Files / Sources). Open with `Right Shift` (rebindable). Shows live status:
+  recording state, elapsed time, tick count, approximate file size, replay
+  buffer fill, tracked-player count.
+- **Instant Replay** — when enabled, the recorder continuously buffers the
+  last N seconds (default 30s) in memory without writing to disk. Press
+  `F7` or the Save button to dump the rolling buffer as a normal `.rec` /
+  `.rig.json` clip. Works alongside a normal recording.
+- **Settings persistence** — all settings live in `ROCORDER/settings.json`
+  and survive reloads. Edit them in the UI or via `_G.ROCORDER:SetSetting`.
+  Hotkeys are part of the settings and can be rebound from the UI.
+- **Files tab** — lists every `.rec` in the workspace with size, refresh
+  button, and a delete button per row (also removes the matching
+  `.rig.json` and `.debug.log`).
+- **Sources tab** — surface the planned capture-source modules. "Player
+  parts" is the only enabled one for now; "Player cameras" (CFrame + FOV)
+  and "Audio events" are listed as planned.
+- **Internals** — Tracker / Session / Replay are now distinct subsystems so
+  one snapshot per tick feeds whichever consumers are active. Adding a new
+  capture source in the future means writing a new Source module that
+  drops into the same loop without disturbing anything else.
+
+API additions on `_G.ROCORDER`: `OpenUI()`, `CloseUI()`, `ToggleUI()` (via
+the hotkey), `SaveReplay([seconds])`, `GetRecordings()`,
+`DeleteRecording(name)`, `SetSetting(key, value)`, and a `cfg` table you
+can read.
+
 ## 1.0.0-alpha — 2026-05-30
 
 First tagged alpha. Project consolidated under a single project version.
