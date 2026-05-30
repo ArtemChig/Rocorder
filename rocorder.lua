@@ -26,6 +26,9 @@ local CONFIG = {
     TICK_RATE       = 30,        -- samples per second
     FLUSH_INTERVAL  = 0.5,       -- seconds between disk flushes (smaller = less stall per flush)
     MAX_CATCHUP_SEC = 5.0,       -- cap on how much missed time we'll backfill after a stall
+    MAX_DISTANCE    = 0,         -- studs from workspace.CurrentCamera.CFrame.Position.
+                                 -- Players whose HumanoidRootPart is beyond this radius
+                                 -- are skipped entirely for the tick. 0 = unlimited.
     PRECISION       = 2,         -- decimal places for floats
     HOTKEY          = Enum.KeyCode.F8,
     FOLDER          = "ROCORDER",
@@ -248,22 +251,62 @@ end
 -- across multiple missed sample slots after a stall.
 function Recorder:_takeSnapshot()
     local entries = {}
+
+    local cameraPos
+    local cam = workspace.CurrentCamera
+    if cam then cameraPos = cam.CFrame.Position end
+    local maxDistSq = CONFIG.MAX_DISTANCE > 0 and (CONFIG.MAX_DISTANCE * CONFIG.MAX_DISTANCE) or nil
+
     for _, p in ipairs(Players:GetPlayers()) do
         if CONFIG.INCLUDE_LOCAL or p ~= Players.LocalPlayer then
+            local playerEntries  -- nil = emit nothing for this player this tick
             local char = p.Character
+
             if char then
-                for _, child in ipairs(char:GetChildren()) do
-                    if child:IsA("BasePart") then
-                        local boneName = sanitizeName(child.Name)
-                        local cf = child.CFrame
-                        local px, py, pz = cf.X, cf.Y, cf.Z
-                        local rx, ry, rz = cf:ToEulerAnglesYXZ()
-                        entries[#entries + 1] = fmt(
-                            "%d:%s=%s,%s,%s,%s,%s,%s",
-                            p.UserId, boneName,
-                            f(px), f(py), f(pz), f(rx), f(ry), f(rz)
-                        )
+                local inRange = true
+                if maxDistSq and cameraPos then
+                    local root = char:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        local d = root.Position - cameraPos
+                        if (d.X * d.X + d.Y * d.Y + d.Z * d.Z) > maxDistSq then
+                            inRange = false
+                        end
                     end
+                end
+
+                if inRange then
+                    playerEntries = {}
+                    for _, child in ipairs(char:GetChildren()) do
+                        if child:IsA("BasePart") then
+                            local boneName = sanitizeName(child.Name)
+                            local cf = child.CFrame
+                            local px, py, pz = cf.X, cf.Y, cf.Z
+                            local rx, ry, rz = cf:ToEulerAnglesYXZ()
+                            playerEntries[#playerEntries + 1] = fmt(
+                                "%d:%s=%s,%s,%s,%s,%s,%s",
+                                p.UserId, boneName,
+                                f(px), f(py), f(pz), f(rx), f(ry), f(rz)
+                            )
+                        end
+                    end
+                    if #playerEntries > 0 then
+                        -- cache for gap-holding when char briefly becomes nil (respawn etc.)
+                        self.lastPoseByPlayer[p.UserId] = playerEntries
+                    end
+                end
+                -- out-of-range players intentionally emit nothing — that's the
+                -- whole point of distance filtering. If you want them held at
+                -- last-seen pose instead, fall through to the last-pose branch.
+            else
+                -- Character missing (respawning, briefly streamed out): hold the
+                -- last successful pose so Blender keyframes stay dense and we
+                -- don't see "gap" stretches that line up with respawns.
+                playerEntries = self.lastPoseByPlayer[p.UserId]
+            end
+
+            if playerEntries then
+                for i = 1, #playerEntries do
+                    entries[#entries + 1] = playerEntries[i]
                 end
             end
         end
@@ -299,6 +342,7 @@ function Recorder:Start()
     self.nextTickAt  = self.startClock
     self.lastFlushAt = self.startClock
     self.tickCount   = 0
+    self.lastPoseByPlayer = {}  -- uid -> { entry strings } for gap-holding
     table.clear(self.buffer)
 
     self:_writeRigFile()
