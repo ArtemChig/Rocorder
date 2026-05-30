@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (6, 1, 0),
+    "version": (6, 2, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
@@ -38,6 +38,43 @@ ROBLOX_TO_BLENDER = Matrix((
     (0, 0,  0, 1),
 ))
 ROBLOX_TO_BLENDER_INV = ROBLOX_TO_BLENDER.inverted()
+
+
+# Standard R6 Motor6D C0/C1 in CFrame:GetComponents() row-major form
+# (x, y, z, R00, R01, R02, R10, R11, R12, R20, R21, R22). These are the
+# values Roblox sets on a freshly-spawned R6 character. Many games mutate
+# C0/C1 at runtime (e.g. shooters that rotate the upper body to aim, or
+# scripts that "look at" the cursor), which means the captured C0/C1 no
+# longer represent the structural rest — they encode whatever the game was
+# doing at capture time. Overriding with these constants gives every R6
+# character a clean canonical T-pose regardless of script interference.
+R6_STANDARD_JOINTS = {
+    # (part0, part1): (c0, c1)
+    ("HumanoidRootPart", "Torso"): (
+        [0, 0, 0,  -1, 0, 0,  0, 0, 1,  0, 1, 0],
+        [0, 0, 0,  -1, 0, 0,  0, 0, 1,  0, 1, 0],
+    ),
+    ("Torso", "Head"): (
+        [0,  1.0, 0,  -1, 0, 0,  0, 0, 1,  0, 1, 0],
+        [0, -0.5, 0,  -1, 0, 0,  0, 0, 1,  0, 1, 0],
+    ),
+    ("Torso", "Right Arm"): (
+        [ 1.0, 0.5, 0,  0, 0, 1,  0, 1, 0,  -1, 0, 0],
+        [-0.5, 0.5, 0,  0, 0, 1,  0, 1, 0,  -1, 0, 0],
+    ),
+    ("Torso", "Left Arm"): (
+        [-1.0, 0.5, 0,  0, 0, -1,  0, 1, 0,  1, 0, 0],
+        [ 0.5, 0.5, 0,  0, 0, -1,  0, 1, 0,  1, 0, 0],
+    ),
+    ("Torso", "Right Leg"): (
+        [1.0, -1.0, 0,  0, 0, 1,  0, 1, 0,  -1, 0, 0],
+        [0.5,  1.0, 0,  0, 0, 1,  0, 1, 0,  -1, 0, 0],
+    ),
+    ("Torso", "Left Leg"): (
+        [-1.0, -1.0, 0,  0, 0, -1,  0, 1, 0,  1, 0, 0],
+        [-0.5,  1.0, 0,  0, 0, -1,  0, 1, 0,  1, 0, 0],
+    ),
+}
 
 
 # ----------------------------------------------------------------------------
@@ -183,20 +220,47 @@ def load_rig_file(rec_filepath, header, log):
 # ----------------------------------------------------------------------------
 # Canonical rest pose
 # ----------------------------------------------------------------------------
-def compute_canonical_rest_poses(player_rig, scale):
+def compute_canonical_rest_poses(player_rig, scale, force_standard_r6=True):
+    """Build the canonical rest pose by walking Motor6D C0/C1 from each root.
+
+    Diagnostic reports (returned for the log):
+        skipped_self_loops : joints with part0 == part1 (engines occasionally
+                             produce these and they create cycles in the bone
+                             hierarchy that silently kill skinning)
+        overridden_joints  : standard R6 joints whose captured C0/C1 we
+                             replaced with canonical defaults
+    """
     parts = [p for p in player_rig.get("parts", []) if p.get("name")]
     joints = player_rig.get("joints", [])
+    rig_type = player_rig.get("rigType")
+    use_std = force_standard_r6 and rig_type == "R6"
 
     parent_of = {}
     children_of = {}
     c0c1 = {}
+    skipped_self_loops = []
+    overridden_joints = []
     for j in joints:
         p0, p1 = j.get("part0"), j.get("part1")
         if not p0 or not p1:
             continue
+        # Self-loops (e.g. an extra Motor6D with Part0 == Part1) create a
+        # cycle in parent_of when seen after the real joint, which collapses
+        # the pose-basis formula to identity for that bone. Skip them.
+        if p0 == p1:
+            skipped_self_loops.append((p0, p1, j.get("name")))
+            continue
+
+        c0, c1 = j.get("c0"), j.get("c1")
+        if use_std:
+            std = R6_STANDARD_JOINTS.get((p0, p1))
+            if std is not None:
+                c0_std, c1_std = std
+                overridden_joints.append((p0, p1, j.get("name")))
+                c0, c1 = c0_std, c1_std
+
         parent_of[p1] = p0
         children_of.setdefault(p0, []).append(p1)
-        c0, c1 = j.get("c0"), j.get("c1")
         if c0 and len(c0) >= 12 and c1 and len(c1) >= 12:
             c0c1[(p0, p1)] = (c0, c1)
 
@@ -234,7 +298,7 @@ def compute_canonical_rest_poses(player_rig, scale):
         D[name] = (roblox_components_to_blender_matrix(rcf, scale)
                    if rcf and len(rcf) >= 12 else Matrix.Identity(4))
 
-    return D, parent_of, children_of, c0c1, roots
+    return D, parent_of, children_of, c0c1, roots, skipped_self_loops, overridden_joints
 
 
 def compute_joint_pivots(player_rig, D, c0c1, scale):
@@ -253,16 +317,28 @@ def compute_joint_pivots(player_rig, D, c0c1, scale):
 # ----------------------------------------------------------------------------
 # Armature + skinned mesh
 # ----------------------------------------------------------------------------
-def build_player(player_rig, label, scale, collection, log):
+def build_player(player_rig, label, scale, collection, log, force_standard_r6=True):
     parts = [p for p in player_rig.get("parts", []) if p.get("name")]
     if not parts:
         log("  no parts in rig — skipping player")
         return None
 
-    D, parent_of, _children_of, c0c1, roots = compute_canonical_rest_poses(
-        player_rig, scale)
+    (D, parent_of, _children_of, c0c1, roots,
+     skipped_self_loops, overridden_joints) = compute_canonical_rest_poses(
+        player_rig, scale, force_standard_r6=force_standard_r6)
     head_pivot, tail_pivots = compute_joint_pivots(player_rig, D, c0c1, scale)
     order = [p["name"] for p in parts]
+
+    if skipped_self_loops:
+        log("  *** skipped {} self-loop joints (these would have broken "
+            "skinning):".format(len(skipped_self_loops)))
+        for p0, p1, jname in skipped_self_loops:
+            log("    {!r}: {} -> {}".format(jname, p0, p1))
+    if overridden_joints:
+        log("  applied standard R6 C0/C1 to {} joints (rigType=R6, "
+            "force_standard_r6=True):".format(len(overridden_joints)))
+        for p0, p1, jname in overridden_joints:
+            log("    {!r}: {} -> {}".format(jname, p0, p1))
 
     log("  roots: {}".format(roots))
     log("  parent_of:")
@@ -347,6 +423,9 @@ def build_player(player_rig, label, scale, collection, log):
             created_names.append(eb.name)  # may differ if Blender renamed
 
         for child, parent in parent_of.items():
+            if child == parent:
+                log("    skip self-parent edit-bone link: {}".format(child))
+                continue
             if child in ebs and parent in ebs:
                 ebs[child].parent = ebs[parent]
                 ebs[child].use_connect = False
@@ -463,7 +542,8 @@ def _short_matrix(m):
     return "({:+.3f},{:+.3f},{:+.3f})".format(t.x, t.y, t.z)
 
 
-def import_replay(context, filepath, scale, set_fps, build_armature, debug, report):
+def import_replay(context, filepath, scale, set_fps, build_armature,
+                  force_standard_r6, debug, report):
     log_lines = []
     log_path = None
     if debug:
@@ -486,8 +566,8 @@ def import_replay(context, filepath, scale, set_fps, build_armature, debug, repo
     log("=" * 76)
     log("ROCORDER import @ {}".format(time.strftime("%Y-%m-%d %H:%M:%S")))
     log("file:  {}".format(filepath))
-    log("scale: {}  set_fps: {}  build_armature: {}".format(
-        scale, set_fps, build_armature))
+    log("scale: {}  set_fps: {}  build_armature: {}  force_standard_r6: {}".format(
+        scale, set_fps, build_armature, force_standard_r6))
 
     try:
         fh = open(filepath, "r", encoding="utf-8")
@@ -582,7 +662,8 @@ def import_replay(context, filepath, scale, set_fps, build_armature, debug, repo
         log("  rigType={} parts={} joints={}".format(
             rig.get("rigType"), len(rig.get("parts", [])), len(rig.get("joints", []))))
         built = build_player(rig, _player_label(roster, uid), scale,
-                             player_coll(uid), log)
+                             player_coll(uid), log,
+                             force_standard_r6=force_standard_r6)
         if built is None:
             return None
         built["last_quat"] = {}
@@ -796,6 +877,16 @@ class IMPORT_OT_rocorder(Operator, ImportHelper):
                     "Off = plain animated spheres",
         default=True,
     )
+    force_standard_r6: BoolProperty(
+        name="Force standard R6 rest pose",
+        description="Override captured Motor6D C0/C1 with canonical R6 default "
+                    "values. Many games mutate C0/C1 at runtime (shooters that "
+                    "rotate the upper body to aim, look-at-cursor scripts, etc.), "
+                    "which makes the captured 'rest pose' look twisted. With "
+                    "this on, every R6 character starts from a clean T-pose. "
+                    "No effect on R15 or custom rigs",
+        default=True,
+    )
     debug: BoolProperty(
         name="Write debug log",
         description="Write a verbose .import.log next to the .rec listing the "
@@ -808,7 +899,8 @@ class IMPORT_OT_rocorder(Operator, ImportHelper):
     def execute(self, context):
         return import_replay(
             context, self.filepath, self.scale,
-            self.set_scene_fps, self.build_armature, self.debug, self.report,
+            self.set_scene_fps, self.build_armature,
+            self.force_standard_r6, self.debug, self.report,
         )
 
 

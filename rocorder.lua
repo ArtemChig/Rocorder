@@ -240,10 +240,10 @@ end
 function Recorder:_flushDebug()
     if not CONFIG.DEBUG or #self.debugBuffer == 0 then return end
     local chunk = table.concat(self.debugBuffer, "\n") .. "\n"
-    table.clear(self.debugBuffer)
-    pcall(function()
-        appendfile(CONFIG.FOLDER .. "/" .. self.debugFilename, chunk)
-    end)
+    local ok = pcall(appendfile,
+        CONFIG.FOLDER .. "/" .. self.debugFilename, chunk)
+    if ok then table.clear(self.debugBuffer) end
+    -- if it fails, retain — but don't recursively try to log the failure
 end
 
 function Recorder:_ensureTracked(player)
@@ -408,8 +408,20 @@ end
 function Recorder:_flush()
     if #self.buffer == 0 then return end
     local chunk = table.concat(self.buffer, "\n") .. "\n"
-    table.clear(self.buffer)
-    appendfile(CONFIG.FOLDER .. "/" .. self.filename, chunk)
+    -- IMPORTANT: pcall the append and only clear the buffer on success. The
+    -- previous version cleared first, so any silent appendfile failure (the
+    -- executor occasionally drops a chunk under load) lost ~FLUSH_INTERVAL
+    -- seconds of frames, producing the keyframe gaps we kept seeing in
+    -- Blender's dopesheet despite the recorder reporting no internal gaps.
+    local ok, err = pcall(appendfile,
+        CONFIG.FOLDER .. "/" .. self.filename, chunk)
+    if ok then
+        table.clear(self.buffer)
+    else
+        self:_debugLog(fmt(
+            "*** FLUSH FAILED: %s — kept %d lines for retry next flush",
+            tostring(err), #self.buffer))
+    end
 end
 
 function Recorder:_writeRigFile()
