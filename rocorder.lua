@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.5-alpha"
+local ROCORDER_VERSION = "1.9.6-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -389,10 +389,63 @@ local function _geomPath(id) return ASSETS_FOLDER .. "/" .. id .. ".geom.json" e
 local function _imgPath(id)  return ASSETS_FOLDER .. "/" .. id .. ".rgba"      end
 local function _binPath(id)  return ASSETS_FOLDER .. "/" .. id              end
 
--- True if any form of this asset is already cached on disk.
+-- True if any form of this asset is already cached on disk OR has been
+-- extracted during this session (the in-memory flag covers the brief race
+-- where the queue worker has written the file but a downstream pass checks
+-- before the filesystem cache catches up).
 local function _isCached(id)
-    if not (isfile and id) then return false end
+    if not id then return false end
+    if EXTRACTED[id] then return true end
+    if not isfile then return false end
     return isfile(_geomPath(id)) or isfile(_imgPath(id)) or isfile(_binPath(id))
+end
+
+-- ============================================================================
+-- Frame-rate-aware pacing for the extractor.
+--
+-- The earlier "yield every 500 verts / every entry" policy meant a single
+-- ReadPixelsBuffer of a 1024x1024 texture (4 MB pulled atomically) or a 5000-
+-- vertex mesh could chew ~50 ms in one go — visible as stutters even on a 144
+-- fps client. We now:
+--
+--   1. Sample the actual frame delta via Heartbeat. A single global handler
+--      under _G survives reloads (each load cleans up the previous one).
+--   2. Before each chunk, ask paceExtractor() whether to yield. If the
+--      previous frame was below ~45 fps, yield TWO frames to give the game
+--      breathing room. Otherwise, take ~3 ms slices.
+--
+-- The trade-off: extraction takes longer in wall-clock (often 2-3x), but the
+-- game doesn't stutter. Per user preference: smooth game > fast extraction.
+-- ============================================================================
+_G.ROCORDER_FRAME_DELTA = _G.ROCORDER_FRAME_DELTA or (1/60)
+if _G.ROCORDER_FRAME_DELTA_HOOK then
+    pcall(_G.ROCORDER_FRAME_DELTA_HOOK)
+end
+do
+    local conn = RunService.Heartbeat:Connect(function(dt)
+        _G.ROCORDER_FRAME_DELTA = dt
+    end)
+    _G.ROCORDER_FRAME_DELTA_HOOK = function()
+        pcall(function() conn:Disconnect() end)
+    end
+end
+
+local EXTRACT_SLICE_SEC = 0.003   -- ~3 ms of work per frame, max
+local EXTRACT_BACKOFF_FPS = 45    -- below this, back off harder
+local _lastPaceYieldAt = 0
+local function paceExtractor()
+    local now = os.clock()
+    if _G.ROCORDER_FRAME_DELTA > (1 / EXTRACT_BACKOFF_FPS) then
+        -- Game is below our floor — yield two frames so we don't pile on.
+        task.wait()
+        task.wait()
+        _lastPaceYieldAt = os.clock()
+        return
+    end
+    if now - _lastPaceYieldAt > EXTRACT_SLICE_SEC then
+        task.wait()
+        _lastPaceYieldAt = os.clock()
+    end
 end
 
 -- Roblox sometimes hands us a Content userdata and sometimes a URL string.
@@ -443,8 +496,8 @@ local function extractMeshFromPart(part)
     if not vids or #vids == 0 then return nil, "no vertices" end
     local verts, uvs, normals = {}, {}, {}
     local idMap = {}    -- engine-vertex-id -> 0-indexed slot
-    -- Yield every 500 vertices so a 5000-vertex mesh becomes ~10 frame-spread
-    -- chunks instead of one 250ms stall.
+    -- Pace every 100 vertices: at ~50us per vert that's ~5ms before each
+    -- pace check, then paceExtractor decides whether to actually yield.
     for i, vid in ipairs(vids) do
         idMap[vid] = i - 1
         local p = em:GetPosition(vid)
@@ -459,7 +512,7 @@ local function extractMeshFromPart(part)
         if okN and n then
             normals[#normals+1] = n.X; normals[#normals+1] = n.Y; normals[#normals+1] = n.Z
         end
-        if i % 500 == 0 then task.wait() end
+        if i % 100 == 0 then paceExtractor() end
     end
 
     -- Faces (triangles). Method name varies by Roblox API revision.
@@ -482,7 +535,7 @@ local function extractMeshFromPart(part)
                     faces[#faces+1] = a; faces[#faces+1] = b; faces[#faces+1] = c
                 end
             end
-            if i % 500 == 0 then task.wait() end
+            if i % 100 == 0 then paceExtractor() end
         end
     end
     if #faces == 0 then return nil, "no faces produced" end
@@ -507,17 +560,47 @@ local function extractImageFromContent(ref)
     local sz = ei.Size
     local w, h = math.floor(sz.X), math.floor(sz.Y)
     if w <= 0 or h <= 0 then return nil, "zero-size image" end
-    local okBuf, buf = pcall(function()
-        return ei:ReadPixelsBuffer(Vector2.new(0, 0), sz)
+
+    -- Read pixels in row-strips instead of one big atomic call. A 1024x1024
+    -- RGBA8 image is 4 MB; pulling that in one ReadPixelsBuffer call stalls
+    -- the frame for ~30-50 ms. Strips of ~64 KB pace the work across frames.
+    local STRIP_BYTES = 65536
+    local stripRows = math.max(4, math.min(h, math.floor(STRIP_BYTES / (w * 4))))
+    local rowStride = w * 4
+    local totalBytes = w * h * 4
+
+    local accumulated
+    local okBuf, errBuf = pcall(function()
+        accumulated = buffer.create(totalBytes)
     end)
-    if not okBuf or not buf then return nil, "ReadPixelsBuffer: " .. tostring(buf) end
+    if not okBuf or not accumulated then
+        return nil, "buffer.create failed: " .. tostring(errBuf)
+    end
+
+    for y = 0, h - 1, stripRows do
+        local sh = math.min(stripRows, h - y)
+        local strip
+        local okR, errR = pcall(function()
+            strip = ei:ReadPixelsBuffer(Vector2.new(0, y), Vector2.new(w, sh))
+        end)
+        if not okR or not strip then
+            return nil, fmt("ReadPixelsBuffer strip y=%d: %s", y, tostring(errR))
+        end
+        local okC = pcall(function()
+            buffer.copy(accumulated, y * rowStride, strip, 0, sh * rowStride)
+        end)
+        if not okC then
+            return nil, fmt("buffer.copy strip y=%d failed", y)
+        end
+        paceExtractor()
+    end
+
     local data
-    local okStr = pcall(function() data = buffer.tostring(buf) end)
+    local okStr = pcall(function() data = buffer.tostring(accumulated) end)
     if not okStr or not data then return nil, "buffer.tostring failed" end
-    local expected = w * h * 4
-    if #data ~= expected then
+    if #data ~= totalBytes then
         return nil, fmt("size mismatch: got %d expected %d (w=%d h=%d)",
-            #data, expected, w, h)
+            #data, totalBytes, w, h)
     end
     -- Header: "ROCORDER-RGBA8\n<w>\n<h>\n" then raw RGBA bytes
     return fmt("ROCORDER-RGBA8\n%d\n%d\n", w, h) .. data
@@ -769,36 +852,60 @@ local function _processOne(entry, dbg)
         end
     end
 
-    -- Fallback: authenticated HTTP one-shot. Re-uses the existing httpRequest
-    -- function probed at module load. This handles the case where the player
-    -- left and their parts were destroyed before we got to them.
+    -- HTTP fallback. Used for two cases:
+    --
+    --   1. The player left mid-session and their parts were destroyed before
+    --      we got to them in the queue. EditableMesh/Image require a live
+    --      instance, HTTP doesn't.
+    --   2. Clothing templates (Shirt.ShirtTemplate, Pants.PantsTemplate).
+    --      AssetService:CreateEditableImageAsync does NOT accept clothing
+    --      asset IDs — the engine has no public read-back API for them. So
+    --      they always come through this path even when the player is live.
+    --      The Roblox CDN does serve them publicly though, so the auth'd
+    --      request reliably gets the same bytes the engine loaded.
+    --
+    -- Two attempts × two endpoints with a brief backoff between rounds.
+    -- Most clothing fetches succeed on attempt 1; the retry handles 429
+    -- rate-limits and transient CDN hiccups that are otherwise visible as
+    -- "couldn't be fetched" failures.
     if httpRequest then
         local urls = {
             "https://assetdelivery.roblox.com/v1/asset/?id=" .. entry.id,
             "https://assetdelivery.roblox.com/v2/asset/?id=" .. entry.id,
         }
-        for _, url in ipairs(urls) do
-            local okr, resp = pcall(httpRequest, {
-                Url = url, Method = "GET",
-                Headers = {
-                    ["User-Agent"]      = "Roblox/WinInet",
-                    ["Roblox-Place-Id"] = tostring(game.PlaceId),
-                },
-            })
-            if okr and type(resp) == "table" then
-                local code = resp.StatusCode or resp.Status or 200
-                if resp.Body and code >= 200 and code < 300 and looksLikeAsset(resp.Body) then
-                    if pcall(writefile, _binPath(entry.id), resp.Body) then
-                        _markEntryDone(entry, dbg)
-                        if dbg then
-                            dbg(fmt("  EXTRACT %s %s OK via HTTP fallback (%d bytes)",
-                                entry.kind, entry.id, #resp.Body))
+        local lastErr
+        for attempt = 1, 2 do
+            for _, url in ipairs(urls) do
+                local okr, resp = pcall(httpRequest, {
+                    Url = url, Method = "GET",
+                    Headers = {
+                        ["User-Agent"]      = "Roblox/WinInet",
+                        ["Roblox-Place-Id"] = tostring(game.PlaceId),
+                    },
+                })
+                if okr and type(resp) == "table" then
+                    local code = resp.StatusCode or resp.Status or 200
+                    if resp.Body and code >= 200 and code < 300 and looksLikeAsset(resp.Body) then
+                        if pcall(writefile, _binPath(entry.id), resp.Body) then
+                            _markEntryDone(entry, dbg)
+                            if dbg then
+                                dbg(fmt("  EXTRACT %s %s OK via HTTP fallback "
+                                    .. "(%d bytes, attempt %d)",
+                                    entry.kind, entry.id, #resp.Body, attempt))
+                            end
+                            return true
                         end
-                        return true
+                    else
+                        lastErr = fmt("HTTP %s", tostring(code))
                     end
+                else
+                    lastErr = tostring(resp)
                 end
             end
+            -- Backoff before retry (only between rounds, not after the last).
+            if attempt < 2 then task.wait(0.8) end
         end
+        err = err or lastErr
     end
 
     _markEntryFailed(entry, ref == nil, dbg)
