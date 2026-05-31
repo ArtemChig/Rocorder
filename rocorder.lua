@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.6.3-alpha"
+local ROCORDER_VERSION = "1.7.0-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -64,23 +64,40 @@ local httpRequest = (syn and syn.request)
     or request
     or (fluxus and fluxus.request)
 
--- ContentProvider-backed asset fetch. Roblox's client has these assets in
--- memory; executors expose them as files on disk via getcustomasset (Xeno,
--- Synapse, etc.) or via a raw bytes function. This is far more reliable than
--- hitting assetdelivery.roblox.com (which 401s most modern UGC).
-local getCustomAsset = getcustomasset or (syn and syn.protect_gui and syn.getcustomasset) or get_custom_asset
-local function readFromContentProvider(assetId)
-    -- 1) Try direct executor "give me the bytes of this rbxassetid" if exposed.
+-- Names of executor functions that return the bytes of an asset the client
+-- already has loaded. We probe both per-id and the rbxassetid URL form.
+local getCustomAsset = getcustomasset or get_custom_asset
+    or (syn and syn.protect_gui and syn.getcustomasset)
+local getSynAsset    = getsynasset
+local readCustomAsset = readcustomasset  -- some forks expose direct bytes
+local function readFromContentProvider(assetId, dbg)
     local rbxUrl = "rbxassetid://" .. assetId
-    if getCustomAsset then
-        local ok, localPath = pcall(getCustomAsset, rbxUrl)
-        if ok and type(localPath) == "string" and #localPath > 0 then
-            -- getcustomasset returns a content:// or file:// path; some executors
-            -- expose a sibling reader for those paths.
-            local rf = readfile
-            local okr, data = pcall(rf, localPath)
-            if okr and type(data) == "string" and #data > 0 then return data end
-            -- Some return paths that aren't readfile-friendly; fall through.
+    -- 1) Direct bytes function if exposed (cleanest path).
+    if readCustomAsset then
+        local ok, data = pcall(readCustomAsset, rbxUrl)
+        if ok and type(data) == "string" and #data > 0 then return data, "readcustomasset" end
+    end
+    -- 2) getcustomasset returns an rbxasset://temp/... or content:// path; on
+    --    Xeno/Synapse that path is readable via the executor's readfile.
+    for _, fn in ipairs({ getCustomAsset, getSynAsset }) do
+        if fn then
+            local ok, localPath = pcall(fn, rbxUrl)
+            if ok and type(localPath) == "string" and #localPath > 0 then
+                if readfile then
+                    -- Try the returned path AND the workspace-relative version.
+                    -- getcustomasset paths like "rbxasset://temp/N.bin" map to
+                    -- the executor's workspace folder.
+                    local candidates = { localPath }
+                    local tail = localPath:match("rbxasset://(.+)$")
+                    if tail then candidates[#candidates+1] = tail end
+                    for _, p in ipairs(candidates) do
+                        local okr, data = pcall(readfile, p)
+                        if okr and type(data) == "string" and #data > 0 then
+                            return data, "getcustomasset"
+                        end
+                    end
+                end
+            end
         end
     end
     return nil
@@ -1129,11 +1146,13 @@ function rec:_downloadAssets(logSink)
     task.spawn(function()
         if not isfolder(ASSETS_FOLDER) then pcall(makefolder, ASSETS_FOLDER) end
         local okc, failc, skipc = 0, 0, 0
+        local missing = {}  -- ids that couldn't be fetched anywhere
         dbg(fmt("ASSET DOWNLOAD start: %d unique assets (httpRequest=%s, "
-            .. "getcustomasset=%s)",
+            .. "getcustomasset=%s, readcustomasset=%s)",
             #list,
             httpRequest and "yes" or "no (game:HttpGet only)",
-            getCustomAsset and "yes" or "no"))
+            getCustomAsset and "yes" or "no",
+            readCustomAsset and "yes" or "no"))
         notify("ROCORDER", fmt("Downloading %d assets…", #list), 3)
 
         for _, id in ipairs(list) do
@@ -1164,8 +1183,8 @@ function rec:_downloadAssets(logSink)
                 --    asset loaded — pull bytes straight from the in-memory copy.
                 --    Works for any asset the player can currently see in-game,
                 --    including UGC the CDN refuses to serve us anonymously.
-                local cp = readFromContentProvider(id)
-                if cp and #cp > 0 then body, source = cp, "contentProvider" end
+                local cp, cpSrc = readFromContentProvider(id, dbg)
+                if cp and #cp > 0 then body, source = cp, cpSrc end
 
                 -- 2) Authenticated HTTP with proper game-client headers.
                 if not body and httpRequest then
@@ -1225,6 +1244,7 @@ function rec:_downloadAssets(logSink)
                         dbg(fmt("  asset %s — all download paths failed", id))
                     end
                     failc += 1
+                    missing[#missing + 1] = id
                 end
             end
             task.wait()  -- yield between downloads so we never hitch the client
@@ -1232,8 +1252,25 @@ function rec:_downloadAssets(logSink)
 
         dbg(fmt("ASSET DOWNLOAD done: %d saved, %d already cached, %d failed -> %s",
             okc, skipc, failc, ASSETS_FOLDER))
+        -- Write a human-readable list of unfetchable assets next to the cache
+        -- so the user can hand-drop them (drag any equivalent .mesh / .png /
+        -- .jpg into ROCORDER/assets named '<id>' and the importer will pick
+        -- it up automatically).
+        if #missing > 0 then
+            local lines = {
+                "# Assets the executor couldn't fetch (CDN refused, asset has",
+                "# restricted permissions, or the in-memory copy wasn't reachable).",
+                "# Drop a file named EXACTLY '<id>' into ROCORDER/assets/ — the",
+                "# importer's local-first lookup will use it.",
+                "",
+            }
+            for _, id in ipairs(missing) do lines[#lines + 1] = id end
+            pcall(writefile, ASSETS_FOLDER .. "/_missing.txt",
+                table.concat(lines, "\n") .. "\n")
+        end
         notify("ROCORDER",
-            fmt("Assets: %d saved, %d cached, %d failed", okc, skipc, failc), 5)
+            fmt("Assets: %d saved, %d cached, %d failed%s", okc, skipc, failc,
+                #missing > 0 and "\nSee ROCORDER/assets/_missing.txt" or ""), 6)
     end)
 end
 

@@ -9,6 +9,32 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.7.0-alpha — 2026-05-31
+
+The 1.6.3 log showed the validator + 4-endpoint fallback got 13/25 assets
+saved — but `via contentProvider` never appeared in the log, meaning the
+in-memory path wasn't actually being used. Also showed `getcustomasset=yes`
+on Xeno. Two real changes:
+
+- **In-memory asset fetch actually works now.** The recorder used to call
+  `getcustomasset` and try `readfile()` on the returned path verbatim, which
+  failed silently. It now (a) tries `readcustomasset` first (a direct
+  bytes-getter some forks expose), then (b) tries `getcustomasset`/`getsynasset`
+  and feeds the returned path to `readfile` with the `rbxasset://` prefix
+  stripped (which is the executor-workspace path). Every success logs
+  `via getcustomasset` / `via readcustomasset` so the path is auditable.
+- **Manual-drop workflow for unfetchable assets.** When the executor *and*
+  every HTTP endpoint still 401, those assets are genuinely beyond the
+  recorder's reach (the asset's permissions exclude even the player). The
+  recorder now writes `ROCORDER/assets/_missing.txt` listing every such ID.
+  Drop a file named exactly `<id>` (or `<id>.mesh` / `<id>.png`) into
+  `ROCORDER/assets/` — the importer's local-first lookup picks it up
+  automatically. The importer's first log section now echoes the missing-IDs
+  list at the top so it's obvious what's outstanding.
+
+Minor bump per CLAUDE.md (new fetch path + new manifest file + new manual
+workflow).
+
 ## 1.6.3-alpha — 2026-05-31
 
 Logs from 1.6.2 confirmed the validator works (30 error-page bodies caught

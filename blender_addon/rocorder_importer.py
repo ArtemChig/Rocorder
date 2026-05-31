@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 6, 3),
+    "version": (1, 7, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.6.3-alpha"
+ROCORDER_VERSION = "1.7.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -281,7 +281,8 @@ class AssetFetcher:
 
     def _find_local(self, asset_id):
         """Return a path to a recorder-downloaded asset file for this id, if any
-        (file named exactly '<id>' or '<id>.<ext>')."""
+        (file named exactly '<id>' or '<id>.<ext>'). Honors a user-drop folder
+        so you can hand-place any asset the executor couldn't reach."""
         for d in self.local_dirs:
             exact = os.path.join(d, asset_id)
             if os.path.isfile(exact) and os.path.getsize(exact) > 0:
@@ -1305,6 +1306,22 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
         log("local asset dirs found: {}".format(found or "none "
             "(Blender will try the network — expect 401s for modern assets "
             "unless you enabled 'Download Assets' in the recorder)"))
+        # Surface the recorder's "couldn't fetch these" list right at the top
+        # so it's obvious which assets need a manual drop.
+        for d in found:
+            missing_txt = os.path.join(d, "_missing.txt")
+            if os.path.isfile(missing_txt):
+                try:
+                    with open(missing_txt, "r", encoding="utf-8") as fh:
+                        ids = [ln.strip() for ln in fh
+                               if ln.strip() and not ln.strip().startswith("#")]
+                except OSError:
+                    ids = []
+                if ids:
+                    log("recorder reported {} unfetchable assets (drop a file "
+                        "named '<id>' into {} to use it):".format(len(ids), d))
+                    for i in ids:
+                        log("    {}".format(i))
         assets = AssetFetcher(cache_dir, roblosecurity, log, local_dirs=local_dirs)
 
     scene = context.scene
