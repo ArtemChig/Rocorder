@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.1-alpha"
+local ROCORDER_VERSION = "1.9.2-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -786,45 +786,80 @@ local function _processOne(entry, dbg)
 end
 
 -- Worker — single global coroutine. Drains the queue continuously, yielding
--- one frame between entries so the game gets to breathe. We DON'T gate on
--- frame-health: a busy Roblox game can sit at 40-100ms/frame indefinitely
--- (which my earlier "dt < 40ms" gate read as "always too busy" and never
--- processed). The politeness is in `extractMeshFromPart` itself — it yields
--- every 500 verts/faces, so it can't monopolize a frame.
+-- one frame between entries so the game gets to breathe. Politeness comes
+-- from `extractMeshFromPart` yielding every 500 verts/faces.
+--
+-- Robustness: the worker writes its heartbeat timestamp to Q.lastIterationAt
+-- every iteration. A separate watchdog respawns the worker if it dies. The
+-- iteration body is double-pcall'd so nothing inside can silently kill it.
 local function _startExtractorWorker()
     if not EXTRACT_OK then return end
     Q.workerVersion = (Q.workerVersion or 0) + 1
     local myVersion = Q.workerVersion
+    Q.lastIterationAt = os.clock()
+    Q.iterations = 0
+    print("[ROCORDER] asset extractor worker v"
+        .. tostring(myVersion) .. " starting")
     task.spawn(function()
         while Q.workerVersion == myVersion do
-            if #Q.queue == 0 then
-                Q.activeId = nil; Q.activeKind = nil; Q.activePlayer = nil
-                task.wait(0.1)
-            else
+            -- Outer pcall: catches ANYTHING inside one iteration (including
+            -- errors in queue manipulation, perPlayer updates, etc.) so a
+            -- single bad extract or a typo can't take the whole loop down.
+            pcall(function()
+                Q.lastIterationAt = os.clock()
+                Q.iterations = (Q.iterations or 0) + 1
+
+                if #Q.queue == 0 then
+                    Q.activeId = nil; Q.activeKind = nil; Q.activePlayer = nil
+                    task.wait(0.1)
+                    return
+                end
+
                 local entry = table.remove(Q.queue, 1)
-                if entry then
-                    Q.byId[entry.id] = nil
-                    Q.activeId = entry.id
-                    Q.activeKind = entry.kind
-                    for uid in pairs(entry.owners) do
-                        local ps = Q.perPlayer[uid]
-                        if ps then Q.activePlayer = ps.name; break end
-                    end
-                    -- pcall so one bad extract can't kill the worker
-                    -- (previous symptom: 26 seconds of silence after a single
-                    -- buggy extract took the whole coroutine down).
-                    local ok, err = pcall(_processOne, entry,
-                        _G.ROCORDER_CURRENT_DBG)
-                    if not ok then
-                        _markEntryFailed(entry, false)
-                        if _G.ROCORDER_CURRENT_DBG then
-                            pcall(_G.ROCORDER_CURRENT_DBG, fmt(
-                                "  EXTRACT %s %s threw: %s",
-                                entry.kind, entry.id, tostring(err)))
-                        end
+                if not entry then return end
+                Q.byId[entry.id] = nil
+                Q.activeId = entry.id
+                Q.activeKind = entry.kind
+                for uid in pairs(entry.owners) do
+                    local ps = Q.perPlayer[uid]
+                    if ps then Q.activePlayer = ps.name; break end
+                end
+
+                local ok, err = pcall(_processOne, entry,
+                    _G.ROCORDER_CURRENT_DBG)
+                if not ok then
+                    pcall(_markEntryFailed, entry, false)
+                    if _G.ROCORDER_CURRENT_DBG then
+                        pcall(_G.ROCORDER_CURRENT_DBG, fmt(
+                            "  EXTRACT %s %s threw: %s",
+                            entry.kind, entry.id, tostring(err)))
                     end
                 end
-                task.wait()  -- one frame between entries
+                task.wait()
+            end)
+        end
+        print("[ROCORDER] asset extractor worker v"
+            .. tostring(myVersion) .. " exiting (replaced by v"
+            .. tostring(Q.workerVersion) .. ")")
+    end)
+end
+
+-- Watchdog — checks every 3 seconds whether the worker has updated its
+-- heartbeat. If the queue is non-empty but the worker has been silent for
+-- more than 5 seconds, respawn it. Also self-exits when its workerVersion
+-- gets bumped (so reloads don't accumulate watchdogs).
+local function _startWatchdog()
+    if not EXTRACT_OK then return end
+    local myWatchdogVersion = (Q.watchdogVersion or 0) + 1
+    Q.watchdogVersion = myWatchdogVersion
+    task.spawn(function()
+        while Q.watchdogVersion == myWatchdogVersion do
+            task.wait(3.0)
+            local age = os.clock() - (Q.lastIterationAt or 0)
+            if #Q.queue > 0 and age > 5.0 then
+                warn(fmt("[ROCORDER] extractor worker silent for %.1fs with "
+                    .. "%d items queued — respawning", age, #Q.queue))
+                _startExtractorWorker()
             end
         end
     end)
@@ -870,15 +905,17 @@ end
 -- Public read-only snapshot for the UI status loop.
 local function queueSnapshot()
     return {
-        queued     = #Q.queue,
-        done       = Q.stats.done,
-        failed     = Q.stats.failed,
-        missed     = Q.stats.missed,
-        totalSeen  = Q.stats.totalSeen,
-        activeId   = Q.activeId,
-        activeKind = Q.activeKind,
+        queued       = #Q.queue,
+        done         = Q.stats.done,
+        failed       = Q.stats.failed,
+        missed       = Q.stats.missed,
+        totalSeen    = Q.stats.totalSeen,
+        activeId     = Q.activeId,
+        activeKind   = Q.activeKind,
         activePlayer = Q.activePlayer,
-        perPlayer  = Q.perPlayer,
+        perPlayer    = Q.perPlayer,
+        workerAgeSec = os.clock() - (Q.lastIterationAt or 0),
+        iterations   = Q.iterations or 0,
     }
 end
 
@@ -3284,6 +3321,14 @@ function UI:_refreshStatus()
         local pct = total > 0 and (snap.done / total) or 0
         ctl.assetBarFill.Size = UDim2.new(pct, 0, 1, 0)
 
+        -- Worker health indicator: if the queue is non-empty but the worker
+        -- hasn't ticked recently, surface it loudly so we can see the problem
+        -- without digging through a debug log.
+        local workerHealth = ""
+        if snap.workerAgeSec > 5 and snap.queued > 0 then
+            workerHealth = fmt(" — WORKER SILENT %.0fs", snap.workerAgeSec)
+        end
+
         if total == 0 then
             ctl.assetHeadline.Text = "extractor ready · waiting for players"
         else
@@ -3292,11 +3337,13 @@ function UI:_refreshStatus()
                     snap.activeKind or "?", snap.activeId,
                     snap.activePlayer and ("  (" .. snap.activePlayer .. ")") or "")
                 or ""
-            ctl.assetHeadline.Text = fmt("%d / %d extracted%s",
-                snap.done, total, activity)
+            ctl.assetHeadline.Text = fmt("%d / %d extracted%s%s",
+                snap.done, total, activity, workerHealth)
         end
-        ctl.assetStats.Text = fmt("queued %d  ·  done %d  ·  failed %d  ·  missed %d",
-            snap.queued, snap.done, snap.failed, snap.missed)
+        ctl.assetStats.Text = fmt(
+            "queued %d  ·  done %d  ·  failed %d  ·  missed %d  ·  worker tick %d (%.1fs ago)",
+            snap.queued, snap.done, snap.failed, snap.missed,
+            snap.iterations, snap.workerAgeSec)
 
         -- per-player rows: rebuild from sorted snapshot
         local list = ctl.assetPlayerList
@@ -3375,9 +3422,11 @@ rec.onStateChange = function() if UI.gui then UI:_refreshStatus() end end
 buildUI()
 Indicator:refresh()  -- pick up persisted state (e.g. IR_ENABLED) on script load
 
--- Asset extractor worker: a single global coroutine that drains the queue
--- when the game is idle. Survives Stop and reloads.
+-- Asset extractor worker + watchdog. The worker drains the queue; the
+-- watchdog respawns it if it goes silent (defensive — should never actually
+-- need to trigger, but if it does we recover automatically).
 _startExtractorWorker()
+_startWatchdog()
 
 -- Mark a player as "left" so the UI can show "X assets missed" for them. The
 -- extractor's own fallback already tries HTTP when no live partRef remains.

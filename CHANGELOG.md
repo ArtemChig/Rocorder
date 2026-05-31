@@ -9,6 +9,33 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.2-alpha — 2026-05-31
+
+User reported the worker still stalling at 144 fps, ruling out my frame-
+health theory entirely. The fact that it stopped processing means something
+is killing the coroutine. This release makes the worker basically
+impossible to kill, and visible when it tries.
+
+- **Outer pcall** around the entire iteration body. Anything inside (queue
+  manipulation, perPlayer updates, anything) gets caught and the loop
+  continues.
+- **Watchdog coroutine** — wakes every 3 seconds, checks `Q.lastIterationAt`
+  against `os.clock()`. If the queue has items but the worker hasn't ticked
+  in > 5 seconds, respawn it. Self-exits when its `Q.watchdogVersion` is
+  bumped so reloads don't accumulate watchdogs.
+- **Worker prints to system console** on start and exit, with a version
+  number — so "did the worker actually start?" is answerable by opening F9.
+- **UI surfaces worker health.** Stats line now shows `worker tick N (X.Xs
+  ago)`; if the worker has been silent for > 5 seconds with queue items,
+  the headline gains ` — WORKER SILENT Xs` in red-ish wording so we can see
+  the death without reading a debug log.
+
+If your queue still hangs at "9 / 36", the new UI will tell us instantly
+which of three things is true:
+1. Worker tick count climbing → it's running, just slow
+2. Worker tick frozen but watchdog warning fires → death + respawn loop
+3. Worker tick 0 forever → worker never started in the first place
+
 ## 1.9.1-alpha — 2026-05-31
 
 The 1.9.0 worker got stuck — debug log showed 9 extractions in the first 7s
