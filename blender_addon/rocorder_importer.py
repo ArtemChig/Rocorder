@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 6, 0),
+    "version": (1, 6, 1),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.6.0-alpha"
+ROCORDER_VERSION = "1.6.1-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -542,12 +542,17 @@ def _parse_mesh_v2(body, ver):
 
 
 def _parse_mesh_v3(body, ver):
+    # v3 header (16 bytes): u16 sizeof_header, u8 cbVertex, u8 cbFace,
+    #   u16 sizeof_LOD, u16 numLODs, u32 numVerts, u32 numFaces.
+    # (The earlier parser missed the sizeof_LOD u16 and read numVerts/numFaces
+    # from the wrong offsets, which blew past the buffer on real v3 meshes.)
     cb_header = struct.unpack_from("<H", body, 0)[0]
     cb_vertex = body[2]
     cb_face = body[3]
-    num_lods = struct.unpack_from("<H", body, 4)[0]
-    num_verts = struct.unpack_from("<I", body, 6)[0]
-    num_faces = struct.unpack_from("<I", body, 10)[0]
+    cb_lod = struct.unpack_from("<H", body, 4)[0]   # sizeof each LOD entry
+    num_lods = struct.unpack_from("<H", body, 6)[0]
+    num_verts = struct.unpack_from("<I", body, 8)[0]
+    num_faces = struct.unpack_from("<I", body, 12)[0]
     off = cb_header
     verts, uvs = _read_vert_block(body, off, num_verts, cb_vertex)
     foff = off + num_verts * cb_vertex
@@ -555,12 +560,14 @@ def _parse_mesh_v3(body, ver):
     for i in range(num_faces):
         a, b, c = struct.unpack_from("<3I", body, foff + i * cb_face)
         faces.append((a, b, c))
-    # LOD offsets (num_lods uint32) after faces; LOD 0 = highest detail
+    # LOD offset table (numLODs entries, cb_lod bytes each, usually a u32);
+    # LOD 0 (highest detail) is faces[lods[0]:lods[1]].
     loff = foff + num_faces * cb_face
     try:
-        lods = [struct.unpack_from("<I", body, loff + i * 4)[0]
+        step = cb_lod if cb_lod >= 4 else 4
+        lods = [struct.unpack_from("<I", body, loff + i * step)[0]
                 for i in range(num_lods)]
-        if len(lods) >= 2:
+        if len(lods) >= 2 and 0 <= lods[0] < lods[1] <= num_faces:
             faces = faces[lods[0]:lods[1]]
     except Exception:
         pass
@@ -590,7 +597,7 @@ def _parse_mesh_v4plus(body, ver, log):
     try:
         lods = [struct.unpack_from("<I", body, foff_end + i * 4)[0]
                 for i in range(num_lods)]
-        if len(lods) >= 2:
+        if len(lods) >= 2 and 0 <= lods[0] < lods[1] <= num_faces:
             faces = faces[lods[0]:lods[1]]
     except Exception:
         pass

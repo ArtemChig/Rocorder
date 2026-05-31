@@ -9,6 +9,19 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.6.1-alpha — 2026-05-31
+
+Executor asset download confirmed working (0 auth fails, all assets fetched
+locally). Follow-up mesh-parser fix:
+
+- **Fix: v3 mesh parsing** — the v3 header has a `sizeof_LOD` `u16` field that
+  the parser skipped, so `numVerts`/`numFaces` were read from the wrong offsets
+  and real v3 meshes blew past the buffer (`unpack_from requires a buffer of
+  at least …`) and fell back to a box. Header now read correctly (16 bytes:
+  sizeof, cbVertex, cbFace, sizeof_LOD, numLODs, numVerts, numFaces).
+- LOD face-slicing in v3 and v4 is now range-checked before use, so a bad LOD
+  table can't truncate or corrupt the face list.
+
 ## 1.6.0-alpha — 2026-05-31
 
 Executor-side asset download — the real fix for "everything is a box". Import
