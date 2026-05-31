@@ -9,6 +9,22 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.8.1-alpha — 2026-05-31
+
+The 1.8.0 log showed the extractor catching essentially everything except
+the **7 clothing assets** (Shirt/Pants templates) because those live on the
+Shirt/Pants instances, not on parts.
+
+- **Clothing extraction.** `extractClothingAssets(clothing, dbg)` walks
+  `Shirt.ShirtTemplate`, `Pants.PantsTemplate`, `ShirtGraphic.Graphic` and
+  feeds each through the existing `EditableImage` path. Called once per
+  player at the end of the per-player extraction coroutine.
+- Refactored the per-part image walk into a small helper `_extractImageRef`
+  so the same dedup + write logic is used for clothing and decals.
+
+Expected effect in the next debug log: those 7 "rejected via HttpGet" lines
+should disappear and become `EXTRACT image <id> OK` entries instead.
+
 ## 1.8.0-alpha — 2026-05-31
 
 Pivot from "ask the CDN for the file" to "ask the engine for the geometry it
