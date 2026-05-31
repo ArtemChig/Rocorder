@@ -9,6 +9,38 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.8.0-alpha — 2026-05-31
+
+Pivot from "ask the CDN for the file" to "ask the engine for the geometry it
+already loaded." This is the architectural fix for the 21/44-failed wall —
+EditableMesh / EditableImage work for assets the CDN refuses because the
+engine ALREADY has the bytes parsed in memory. Recorder side this commit;
+Blender import support next.
+
+- **In-engine asset extraction.** New `extractMeshFromPart()` uses
+  `AssetService:CreateEditableMeshAsync(part.MeshContent)` to pull verts /
+  uvs / normals / faces straight from the engine. Works for any MeshPart
+  currently in the workspace, regardless of asset permission gating, because
+  Roblox grants `EditableMesh` access whenever the part is actively rendering.
+- **Image extraction.** `extractImageFromContent()` uses
+  `AssetService:CreateEditableImageAsync()` + `ReadPixelsBuffer` to dump raw
+  RGBA8 bytes. No PNG encode (we'd need a library); the Blender side reads
+  the small text header (`ROCORDER-RGBA8\n<w>\n<h>\n` + bytes) and converts.
+- **Storage**: `ROCORDER/assets/<id>.geom.json` (geometry, JSON) and
+  `<id>.rgba` (raw pixels). Hash-keyed by asset ID so the same accessory
+  shared across players is extracted once. Survives across recordings.
+- **Background extraction.** Triggered from `Tracker:ensure` the first time
+  a player is seen — runs in a `task.spawn` coroutine with `task.wait()`
+  between assets so the game stays smooth and extractions survive Stop.
+- **HTTP downloader stays as fallback.** Anything the extractor couldn't
+  get (extremely rare — the API really does allow restricted-UGC access for
+  parts you can see) falls through to the existing v1/v2/cdn HTTP chain.
+  The downloader now skips assets the extractor already cached, so the
+  failure tally only counts the assets that truly can't be reached.
+- **Importer support for `.geom.json` / `.rgba` is NOT in this commit** —
+  it's the next one. For now the assets/ folder will fill with files
+  Blender can't yet read; full pipeline lands in 1.8.1 or 1.9.0.
+
 ## 1.7.2-alpha — 2026-05-31
 
 Three real bugs caught from a single debug log.
