@@ -9,6 +9,26 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.2.1-alpha — 2026-05-30
+
+Four small fixes from the 1.2.0 screenshots.
+
+- **Fix**: deleting a recording no longer flickers every other row out + back
+  in. The Delete handler now destroys just that row optimistically; the list
+  only fully re-populates if the last row was deleted (to show the empty
+  state).
+- **Fix**: the `CLIP` pill is bigger (46×18) and explicitly center-aligned in
+  both axes, so the text actually sits in the middle of the pill.
+- **Fix**: the "Save Last N Seconds" button now shows the real number from
+  `IR_BUFFER_SEC` (e.g. "Save Last 30 Seconds") and re-renders whenever the
+  setting changes.
+- **Fix**: F7 (default Save-Replay hotkey) now fires. Roblox marks F-keys as
+  `processed = true` because the engine consumes them for built-in features,
+  and our handler was bailing on `processed`. We now ignore `processed` for
+  our hotkeys and instead skip them only when a settings TextBox is focused
+  (via `UserInputService:GetFocusedTextBox`), which is the actual case
+  worth guarding against.
+
 ## 1.2.0-alpha — 2026-05-30
 
 Files-tab metadata, camera source, functional Sources tab. The `.rec` format
