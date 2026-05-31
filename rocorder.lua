@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.0-alpha"
+local ROCORDER_VERSION = "1.9.1-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -785,41 +785,46 @@ local function _processOne(entry, dbg)
     return false
 end
 
--- Worker — single global coroutine. Polls the queue, processes one entry at a
--- time when the game is idle. Survives reloads via workerVersion check.
+-- Worker — single global coroutine. Drains the queue continuously, yielding
+-- one frame between entries so the game gets to breathe. We DON'T gate on
+-- frame-health: a busy Roblox game can sit at 40-100ms/frame indefinitely
+-- (which my earlier "dt < 40ms" gate read as "always too busy" and never
+-- processed). The politeness is in `extractMeshFromPart` itself — it yields
+-- every 500 verts/faces, so it can't monopolize a frame.
 local function _startExtractorWorker()
     if not EXTRACT_OK then return end
     Q.workerVersion = (Q.workerVersion or 0) + 1
     local myVersion = Q.workerVersion
     task.spawn(function()
-        local FRAME_BUDGET = 0.040  -- 40ms = ~25fps; skip work when slower
         while Q.workerVersion == myVersion do
-            -- back off if queue is empty
             if #Q.queue == 0 then
                 Q.activeId = nil; Q.activeKind = nil; Q.activePlayer = nil
                 task.wait(0.1)
             else
-                -- wait for next frame and read its delta as a freshness signal
-                local dt = RunService.Heartbeat:Wait()
-                if dt > FRAME_BUDGET then
-                    -- game is busy; back off proportionally
-                    task.wait(0.15)
-                else
-                    local entry = table.remove(Q.queue, 1)
-                    if entry then
-                        Q.byId[entry.id] = nil
-                        Q.activeId = entry.id
-                        Q.activeKind = entry.kind
-                        -- surface first owner for UI
-                        for uid in pairs(entry.owners) do
-                            local ps = Q.perPlayer[uid]
-                            if ps then Q.activePlayer = ps.name; break end
+                local entry = table.remove(Q.queue, 1)
+                if entry then
+                    Q.byId[entry.id] = nil
+                    Q.activeId = entry.id
+                    Q.activeKind = entry.kind
+                    for uid in pairs(entry.owners) do
+                        local ps = Q.perPlayer[uid]
+                        if ps then Q.activePlayer = ps.name; break end
+                    end
+                    -- pcall so one bad extract can't kill the worker
+                    -- (previous symptom: 26 seconds of silence after a single
+                    -- buggy extract took the whole coroutine down).
+                    local ok, err = pcall(_processOne, entry,
+                        _G.ROCORDER_CURRENT_DBG)
+                    if not ok then
+                        _markEntryFailed(entry, false)
+                        if _G.ROCORDER_CURRENT_DBG then
+                            pcall(_G.ROCORDER_CURRENT_DBG, fmt(
+                                "  EXTRACT %s %s threw: %s",
+                                entry.kind, entry.id, tostring(err)))
                         end
-                        -- ROCORDER_CURRENT_DBG is set during a recording so the
-                        -- session debug log captures extraction lines too
-                        _processOne(entry, _G.ROCORDER_CURRENT_DBG)
                     end
                 end
+                task.wait()  -- one frame between entries
             end
         end
     end)

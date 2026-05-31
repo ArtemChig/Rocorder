@@ -9,6 +9,27 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.1-alpha — 2026-05-31
+
+The 1.9.0 worker got stuck — debug log showed 9 extractions in the first 7s
+then 26 seconds of silence even with 27 items still queued. Two real bugs.
+
+- **Drop the frame-health gate.** The "only process when last heartbeat dt
+  < 40ms" rule was too strict for any busy Roblox game. Many games sit at
+  20–25fps (40–50ms/frame) under normal load, which the worker read as
+  "always too busy" and never resumed. Politeness now comes entirely from
+  the mid-mesh `task.wait()` (already added in 1.9.0) and a single
+  `task.wait()` between entries. Throughput stays smooth and the queue
+  actually drains.
+- **Wrap `_processOne` in pcall.** If an extraction errored deep inside
+  EditableMesh / `buffer.tostring` / `writefile`, the worker coroutine died
+  silently and never recovered for the rest of the script session. Now the
+  error is caught, the entry is marked failed, and the loop continues.
+
+Expected effect: extraction completes for every newly-seen asset within
+a few seconds of seeing the player, regardless of game framerate. UI
+progress will tick steadily.
+
 ## 1.9.0-alpha — 2026-05-31
 
 Reworked extractor for sustained Instant Replay sessions + new Assets status
