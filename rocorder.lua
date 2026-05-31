@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.5.0-alpha"
+local ROCORDER_VERSION = "1.5.1-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -417,7 +417,7 @@ end
 local Tracker = {}; Tracker.__index = Tracker
 
 function Tracker.new()
-    return setmetatable({ tracked = {} }, Tracker)
+    return setmetatable({ tracked = {}, pending = {} }, Tracker)
 end
 
 function Tracker:reset() self.tracked = {} end
@@ -495,7 +495,21 @@ end
 function Tracker:ensure(player, encode, debugLog)
     local uid = player.UserId
     if self.tracked[uid] then return self.tracked[uid] end
-    if not player.Character then return nil end
+    local char = player.Character
+    if not char then return nil end
+
+    -- Readiness gate: don't capture a half-loaded character. If we capture
+    -- before the Motor6Ds exist we get rigType=Custom / joints=0 and every
+    -- part piles at the origin (the broken-player bug). Wait until the rig
+    -- exists, with a short grace fallback for genuinely jointless models.
+    local firstSeen = self.pending[uid]
+    if not firstSeen then firstSeen = os.clock(); self.pending[uid] = firstSeen end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hasMotor = char:FindFirstChildWhichIsA("Motor6D", true) ~= nil
+    if not (hrp and (hasMotor or (os.clock() - firstSeen) > 2.0)) then
+        return nil  -- try again next tick
+    end
+
     local ok, rig, refs = pcall(captureRig, player)
     if not ok or not rig then
         if debugLog then
@@ -504,6 +518,7 @@ function Tracker:ensure(player, encode, debugLog)
         end
         return nil
     end
+    self.pending[uid] = nil
     local entry = {
         uid = uid, rig = rig, refs = refs, last = {},
         char = player.Character, known = {},
