@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.3-alpha"
+local ROCORDER_VERSION = "1.9.4-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2513,8 +2513,17 @@ local function buildStatusPanel(parent)
 end
 
 local function buildRecordView(parent)
-    local view = mk("Frame", { BackgroundTransparency = 1,
-        Size = UDim2.fromScale(1, 1) }, parent)
+    -- ScrollingFrame so content (especially the Assets panel's per-player
+    -- list) never collides with the bottom footer. Same pattern as Settings.
+    local view = mk("ScrollingFrame", {
+        BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 6,
+        ScrollBarImageColor3 = THEME.border,
+        BorderSizePixel = 0,
+    }, parent)
     pad(view, 16); vlist(view, 12)
 
     local status = buildStatusPanel(view)

@@ -9,6 +9,14 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.4-alpha — 2026-05-31
+
+- **Record tab is now scrollable.** When the Assets panel's per-player list
+  grew, the bottom of the panel collided with the footer hotkey bar and you
+  couldn't see the full status (or scroll to see more players). The Record
+  view now uses a `ScrollingFrame` with `AutomaticCanvasSize`, same pattern
+  the Settings tab already used. Content of any height is now reachable.
+
 ## 1.9.3-alpha — 2026-05-31
 
 The "stuck at 31/39" report turned out to be a **UI bug**, not a worker bug.
