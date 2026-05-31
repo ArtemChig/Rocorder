@@ -9,6 +9,35 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.2.0-alpha — 2026-05-30
+
+Files-tab metadata, camera source, functional Sources tab. The `.rec` format
+identifier stays at `ROCORDER/3` and the change is backward-compatible: pre-1.2
+importers silently skip the new `cam:` chunks, and the new importer reads pre-
+1.2 recordings unchanged.
+
+- **Files tab** now shows for each recording: filename, **duration**, **date
+  recorded**, **game name**, file size, plus a small **CLIP** pill on
+  instant-replay clips. Game name comes from `MarketplaceService:GetProductInfo`
+  (cached). For pre-1.2 recordings without a `.meta.json` sidecar the date /
+  game still appear (read from the header), but duration shows as `?`.
+- **Meta sidecar** — every recording (full session OR replay clip) now also
+  writes a `<base>.meta.json` next to the `.rec` with the duration / frame
+  count / place / size. Tiny; lets the Files tab refresh instantly without
+  having to scan the (potentially huge) `.rec` itself.
+- **Camera capture source** — new `SRC_CAMERA` toggle records the local
+  camera's CFrame + FOV per tick into a `cam:` chunk on each frame line.
+  Off by default. The Blender importer detects this and creates a real
+  Camera object (`base_name + "_camera"`) animated frame-by-frame with the
+  right world transform and `lens_unit=FOV` (vertical FOV in radians, exact
+  mapping from Roblox's `FieldOfView`).
+- **Sources tab** is now functional: each enabled source gets a real
+  ON/OFF toggle bound to settings. Cross-tab sync keeps them consistent
+  with anything else that flips them. "Audio events" stays as a `PLANNED`
+  pill until that source is built.
+- `_G.ROCORDER.cfg.SRC_PLAYER_PARTS` / `SRC_CAMERA` and the corresponding
+  `_G.ROCORDER:SetSetting` calls work the same as any other setting.
+
 ## 1.1.2-alpha — 2026-05-30
 
 - **Fix**: tab buttons (Record / Settings / Files / Sources) were invisible in
