@@ -9,6 +9,33 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.6-alpha — 2026-05-31
+
+Asset extraction no longer stutters the game. Trade-off: extraction is
+slower in wall-clock (often 2-3x), but the game stays smooth.
+
+- **Frame-rate-aware pacing**: a Heartbeat-sampled frame-delta tracker
+  drives a `paceExtractor()` helper that yields based on the game's
+  *actual* current frame rate, not a fixed chunk size. Slices are capped
+  at ~3 ms; if the game drops below 45 fps, the extractor yields two
+  full frames before doing anything else.
+- **Image extraction is now strip-based**: a 1024×1024 RGBA8 texture is
+  4 MB. The previous `ReadPixelsBuffer(0, fullSize)` pulled that atomically
+  — a single ~30-50 ms frame stall, visible as a hitch. We now read in
+  ~64 KB row strips, pacing between strips.
+- **Mesh extraction pacing tightened**: was yielding every 500 verts /
+  500 faces (fixed), now paces every 100 with the budget-aware helper.
+- **HTTP fallback retries once after 0.8 s** on failure. Clothing
+  templates (Shirt.ShirtTemplate, Pants.PantsTemplate) MUST go through
+  HTTP — `AssetService:CreateEditableImageAsync` rejects clothing-template
+  asset IDs and the engine has no public read-back API for them. The
+  Roblox CDN does serve them publicly though, and the retry handles the
+  occasional 429 rate-limit during dense join bursts.
+- **`_isCached` now also checks the in-session EXTRACTED flag**, not just
+  the filesystem. This kills a tiny race where the legacy `downloadAssets`
+  pass would re-fetch an asset the queue worker had just written but not
+  yet flushed.
+
 ## 1.9.5-alpha — 2026-05-31
 
 Fixes spurious "couldn't be fetched" failures for clothing templates (shirts
