@@ -9,6 +9,33 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.7-alpha — 2026-05-31
+
+Instant Replay no longer fills disk with assets from people who joined,
+left, and never made it into a saved clip.
+
+- **IR cache pruning**: a background scanner runs every 3 s while IR is on
+  and no normal recording session is active. For each known asset id, it
+  checks whether any owning player was seen within (IR_BUFFER_SEC + 5 s).
+  If not — they've fallen out of the rolling buffer — every form of the
+  file (`.geom.json` / `.rgba` / bare bin) is deleted and the id is
+  forgotten. Logged as `IR cache: evicted N stale asset(s)` to the debug
+  file when it happens.
+- **Saved recordings are protected**: the scanner first builds a "kept"
+  set of asset ids referenced by any `.rig.json` already on disk and
+  never evicts those. The `ROCORDER/assets/` folder is shared across all
+  recordings, so an id used by an older saved clip must not be deleted
+  just because the original owner has left the live game.
+- **Save-time race protection**: `SaveReplay` now sets a
+  `_G.ROCORDER_SAVE_IN_PROGRESS` flag for the duration of the save call;
+  the eviction scanner skips while it's held. Save body is wrapped in
+  a pcall so the flag is always cleared even on a throw.
+- **`ASSET_OWNERS` persistent map**: a new `{[id] = {[uid] = true}}` table
+  lives under `_G` and survives the queue worker finishing a single
+  asset. The previous `Q.byId[id].owners` was cleared as soon as the
+  asset extracted, so the scanner had no way to know who originally
+  needed it.
+
 ## 1.9.6-alpha — 2026-05-31
 
 Asset extraction no longer stutters the game. Trade-off: extraction is
