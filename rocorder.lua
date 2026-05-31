@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.4-alpha"
+local ROCORDER_VERSION = "1.9.5-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -712,6 +712,32 @@ local function _markEntryFailed(entry, wasMissed, dbg)
             ps.lastActivityAt = os.clock()
         end
     end
+end
+
+-- Heuristic: does this byte-string look like a real Roblox asset, or like an
+-- error page (401/403/HTML/JSON) the CDN handed back with a 2xx status? Used
+-- by both the queue worker's HTTP fallback and the legacy downloadAssets
+-- pass. Hoisted to module scope: the queue worker (line ~764 below) needs
+-- it before the legacy pass defines it locally — without this hoist that
+-- call was nil and the fallback threw "attempt to call a nil value", which
+-- the worker counted as a failure even when the legacy pass later rescued
+-- the same asset over HTTP.
+local function looksLikeAsset(b)
+    if type(b) ~= "string" or #b < 64 then return false end
+    local head = b:sub(1, 8)
+    if head:sub(1, 8) == "version " then return true end          -- Roblox mesh
+    local b0 = string.byte(b, 1, 1)
+    if b0 == 0x89 or b0 == 0xFF or b0 == 0x47 or b0 == 0x42 then    -- PNG/JPG/GIF/BMP/DDS
+        return true
+    end
+    local first = b:sub(1, 1)
+    if first == "{" or first == "<" then return false end          -- JSON / XML / HTML
+    local probe = b:sub(1, 256)
+    if probe:find("Unauthorized") or probe:find("Forbidden")
+        or probe:find("InsufficientPermission") or probe:find("\"errors\"") then
+        return false
+    end
+    return true  -- unknown-but-binary; let the importer decide
 end
 
 -- Try the extractor path; if it fails or no live part remains, try a one-shot
@@ -1769,25 +1795,8 @@ function rec:_downloadAssets(logSink)
     -- Reject error-page bodies. game:HttpGet (and some request impls) return
     -- the 401/403 error TEXT as a normal string for non-2xx responses; saving
     -- that as the asset file produced "meshes" that silently fell back to a box
-    -- on import. A real mesh starts with "version "; images start with a binary
-    -- magic. Anything that looks like JSON/HTML/an error message is rejected.
-    local function looksLikeAsset(b)
-        if type(b) ~= "string" or #b < 64 then return false end
-        local head = b:sub(1, 8)
-        if head:sub(1, 8) == "version " then return true end          -- Roblox mesh
-        local b0, b1 = string.byte(b, 1, 2)
-        if b0 == 0x89 or b0 == 0xFF or b0 == 0x47 or b0 == 0x42 then    -- PNG/JPG/GIF/BMP/DDS
-            return true
-        end
-        local first = b:sub(1, 1)
-        if first == "{" or first == "<" then return false end          -- JSON / XML / HTML
-        local probe = b:sub(1, 256)
-        if probe:find("Unauthorized") or probe:find("Forbidden")
-            or probe:find("InsufficientPermission") or probe:find("\"errors\"") then
-            return false
-        end
-        return true  -- unknown-but-binary; let the importer decide
-    end
+    -- on import. We reject JSON/HTML/known error-page bodies via the
+    -- module-scope `looksLikeAsset` helper hoisted near _processOne.
 
     task.spawn(function()
         if not isfolder(ASSETS_FOLDER) then pcall(makefolder, ASSETS_FOLDER) end

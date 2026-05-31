@@ -9,6 +9,24 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.5-alpha — 2026-05-31
+
+Fixes spurious "couldn't be fetched" failures for clothing templates (shirts
+and pants).
+
+- **The queue worker's HTTP fallback was throwing on every invocation**: it
+  called `looksLikeAsset`, which was defined as a local nested inside the
+  legacy `downloadAssets` pass much later in the file. From the worker's
+  scope it was `nil`, so the call raised "attempt to call a nil value", got
+  caught by the worker's outer pcall, and the entry was marked failed even
+  though the same asset would download cleanly seconds later when the
+  legacy pass ran. `looksLikeAsset` is now hoisted to module scope, so both
+  paths see the same implementation.
+- This was hitting shirt/pants templates specifically because
+  `AssetService:CreateEditableImageAsync` doesn't accept clothing-template
+  asset IDs — the extractor correctly fell through to HTTP, where the bug
+  lived. Mesh-part textures still extracted fine and weren't affected.
+
 ## 1.9.4-alpha — 2026-05-31
 
 - **Record tab is now scrollable.** When the Assets panel's per-player list
