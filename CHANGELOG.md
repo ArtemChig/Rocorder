@@ -9,6 +9,25 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.3.2-alpha — 2026-05-30
+
+- **Fix**: importing a recording that includes camera data crashed with
+  `TypeError: bpy_struct.keyframe_insert() property "angle" not animatable`.
+  Blender's `Camera.angle` is a derived property (computed from `lens` +
+  sensor size) and isn't directly animatable. We now convert the recorded
+  vertical FOV to focal length —
+  `f = sensor_height / (2 · tan(fov / 2))` — and keyframe `lens` instead.
+  With `sensor_fit = "VERTICAL"` the mapping is exact, so the imported
+  camera renders identical to the in-game one.
+
+## 1.3.1-alpha — 2026-05-30
+
+- Indicator overlay redesigned to look like a classic record button:
+  a colored ring (UIStroke on a transparent circle) with a smaller solid
+  dot in the middle, instead of a single filled blob. Both elements share
+  the state color (red recording / white buffering) and the 25% opacity.
+  Bumped to 22px so the ring + inner dot have room to read as an icon.
+
 ## 1.3.0-alpha — 2026-05-30
 
 UI polish + new on-screen indicator overlay + advanced-settings reveal.
