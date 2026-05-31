@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.6.2-alpha"
+local ROCORDER_VERSION = "1.6.3-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -63,6 +63,28 @@ local httpRequest = (syn and syn.request)
     or http_request
     or request
     or (fluxus and fluxus.request)
+
+-- ContentProvider-backed asset fetch. Roblox's client has these assets in
+-- memory; executors expose them as files on disk via getcustomasset (Xeno,
+-- Synapse, etc.) or via a raw bytes function. This is far more reliable than
+-- hitting assetdelivery.roblox.com (which 401s most modern UGC).
+local getCustomAsset = getcustomasset or (syn and syn.protect_gui and syn.getcustomasset) or get_custom_asset
+local function readFromContentProvider(assetId)
+    -- 1) Try direct executor "give me the bytes of this rbxassetid" if exposed.
+    local rbxUrl = "rbxassetid://" .. assetId
+    if getCustomAsset then
+        local ok, localPath = pcall(getCustomAsset, rbxUrl)
+        if ok and type(localPath) == "string" and #localPath > 0 then
+            -- getcustomasset returns a content:// or file:// path; some executors
+            -- expose a sibling reader for those paths.
+            local rf = readfile
+            local okr, data = pcall(rf, localPath)
+            if okr and type(data) == "string" and #data > 0 then return data end
+            -- Some return paths that aren't readfile-friendly; fall through.
+        end
+    end
+    return nil
+end
 
 -- Forward-declared so rec methods (defined before the UI section) can call
 -- Indicator:refresh() — the actual table is assigned later in the UI section.
@@ -1107,8 +1129,11 @@ function rec:_downloadAssets(logSink)
     task.spawn(function()
         if not isfolder(ASSETS_FOLDER) then pcall(makefolder, ASSETS_FOLDER) end
         local okc, failc, skipc = 0, 0, 0
-        dbg(fmt("ASSET DOWNLOAD start: %d unique assets (httpRequest=%s)",
-            #list, httpRequest and "yes" or "no (game:HttpGet only)"))
+        dbg(fmt("ASSET DOWNLOAD start: %d unique assets (httpRequest=%s, "
+            .. "getcustomasset=%s)",
+            #list,
+            httpRequest and "yes" or "no (game:HttpGet only)",
+            getCustomAsset and "yes" or "no"))
         notify("ROCORDER", fmt("Downloading %d assets…", #list), 3)
 
         for _, id in ipairs(list) do
@@ -1133,35 +1158,71 @@ function rec:_downloadAssets(logSink)
             if cached then
                 skipc += 1
             else
-                local url = "https://assetdelivery.roblox.com/v1/asset/?id=" .. id
-                local body
+                local body, source
 
-                if httpRequest then
-                    local okr, resp = pcall(httpRequest, { Url = url, Method = "GET" })
-                    if okr and type(resp) == "table" then
-                        local code = resp.StatusCode or resp.Status or 200
-                        if resp.Body and #resp.Body > 0 and code >= 200 and code < 300 then
-                            body = resp.Body
-                        else
-                            dbg(fmt("  asset %s http status=%s", id, tostring(code)))
+                -- 1) ContentProvider/getcustomasset: the client already has this
+                --    asset loaded — pull bytes straight from the in-memory copy.
+                --    Works for any asset the player can currently see in-game,
+                --    including UGC the CDN refuses to serve us anonymously.
+                local cp = readFromContentProvider(id)
+                if cp and #cp > 0 then body, source = cp, "contentProvider" end
+
+                -- 2) Authenticated HTTP with proper game-client headers.
+                if not body and httpRequest then
+                    local urls = {
+                        "https://assetdelivery.roblox.com/v1/asset/?id=" .. id,
+                        "https://assetdelivery.roblox.com/v2/asset/?id=" .. id,
+                        "https://c0.rbxcdn.com/" .. id,
+                        "https://t0.rbxcdn.com/" .. id,
+                    }
+                    for _, url in ipairs(urls) do
+                        local okr, resp = pcall(httpRequest, {
+                            Url = url, Method = "GET",
+                            Headers = {
+                                ["User-Agent"]      = "Roblox/WinInet",
+                                ["Roblox-Place-Id"] = tostring(game.PlaceId),
+                                ["Accept"]          = "*/*",
+                            },
+                        })
+                        if okr and type(resp) == "table" then
+                            local code = resp.StatusCode or resp.Status or 200
+                            if resp.Body and #resp.Body > 0 and code >= 200 and code < 300 then
+                                body, source = resp.Body, url:match("//([^/]+)")
+                                break
+                            else
+                                dbg(fmt("  asset %s %s -> %s",
+                                    id, url:match("//([^/]+)"), tostring(code)))
+                            end
                         end
                     end
                 end
+
+                -- 3) Last resort: plain game:HttpGet on the v1 endpoint.
                 if not body then
+                    local url = "https://assetdelivery.roblox.com/v1/asset/?id=" .. id
                     local okg, b = pcall(function() return game:HttpGet(url, true) end)
                     if okg and type(b) == "string" and #b > 0 and b:sub(1, 3) ~= "404" then
-                        body = b
+                        body, source = b, "HttpGet"
                     end
                 end
 
                 if body and looksLikeAsset(body) then
                     local okw = pcall(writefile, path, body)
-                    if okw then okc += 1 else failc += 1 end
+                    if okw then
+                        okc += 1
+                        dbg(fmt("  asset %s via %s (%d bytes) OK",
+                            id, tostring(source), #body))
+                    else
+                        failc += 1
+                    end
                 else
                     -- don't save an error page as if it were the asset
                     if body then
-                        dbg(fmt("  asset %s rejected (not a mesh/image — likely "
-                            .. "401/403 error body, %d bytes)", id, #body))
+                        dbg(fmt("  asset %s rejected via %s (not a mesh/image, "
+                            .. "%d bytes — likely 401/403 body)",
+                            id, tostring(source), #body))
+                    else
+                        dbg(fmt("  asset %s — all download paths failed", id))
                     end
                     failc += 1
                 end

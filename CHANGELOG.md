@@ -9,6 +9,29 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.6.3-alpha — 2026-05-31
+
+Logs from 1.6.2 confirmed the validator works (30 error-page bodies caught
+and rejected instead of saved-as-meshes) but also showed the executor's
+plain HTTP gets 401 on most modern UGC. So we now go through the path the
+*client* uses — the asset bytes are already in memory, the CDN URL just
+won't serve them on a raw GET.
+
+- **ContentProvider / `getcustomasset` first.** Before any HTTP, the
+  recorder tries the executor's `getcustomasset` (Xeno, Synapse, etc.),
+  which returns the asset the client already has loaded. This works for
+  any asset currently visible in-game — including UGC the CDN refuses.
+- **Multi-endpoint HTTP fallback with proper headers.** If the in-memory
+  copy isn't accessible, the HTTP fallback now sends a `User-Agent` +
+  `Roblox-Place-Id` (modern Roblox CDN checks these) and walks v1 → v2 →
+  `c0.rbxcdn.com` → `t0.rbxcdn.com` instead of giving up on one URL.
+- **Source logging.** Each saved asset records which path succeeded
+  (`contentProvider`, `assetdelivery.roblox.com`, `rbxcdn.com`, `HttpGet`)
+  and each failure lists the status per endpoint, so the next log makes
+  it unambiguous where the wall is. The startup line also reports
+  `getcustomasset=yes/no` so we know whether the in-memory path is
+  available on your executor at all.
+
 ## 1.6.2-alpha — 2026-05-31
 
 Two bugs found from field logs — both made characters import wrong.
