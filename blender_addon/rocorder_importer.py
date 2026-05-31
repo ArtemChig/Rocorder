@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 3, 0),
+    "version": (1, 3, 2),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.3.0-alpha"
+ROCORDER_VERSION = "1.3.2-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -767,11 +767,18 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
             camera_obj.keyframe_insert(data_path="location", frame=frame_num)
             camera_obj.keyframe_insert(data_path="rotation_quaternion",
                                        frame=frame_num)
-            # FOV: Roblox stores vertical FOV in degrees; Blender's
-            # cam_data.angle is in radians. With sensor_fit=VERTICAL the
-            # mapping is exact.
-            camera_data.angle = math.radians(max(1e-3, float(fov)))
-            camera_data.keyframe_insert(data_path="angle", frame=frame_num)
+            # FOV: Roblox stores vertical FOV in degrees. Blender's
+            # Camera.angle is a derived property (computed from `lens` +
+            # sensor size) and is NOT directly animatable — keyframe_insert
+            # on it raises 'property "angle" not animatable'. So we convert
+            # vertical FOV to focal length and animate `lens` instead, which
+            # is the actual underlying animatable channel. With
+            # sensor_fit=VERTICAL the mapping is exact:
+            #     f = sensor_height / (2 * tan(fov / 2))
+            fov_rad = math.radians(max(1e-3, float(fov)))
+            camera_data.lens = (camera_data.sensor_height
+                                / (2.0 * math.tan(fov_rad / 2.0)))
+            camera_data.keyframe_insert(data_path="lens", frame=frame_num)
             camera_keys += 3
 
         for uid, part_list in data.items():

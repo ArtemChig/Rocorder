@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.3.0-alpha"
+local ROCORDER_VERSION = "1.3.2-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -1162,12 +1162,14 @@ end
 -- Indicator overlay (small dot in a screen corner while capturing)
 ----------------------------------------------------------------
 Indicator = {
-    gui      = nil,
-    dot      = nil,
-    DOT_SIZE = 14,
-    MARGIN   = 14,
+    gui        = nil,
+    dot        = nil,
+    ringStroke = nil,
+    innerDot   = nil,
+    DOT_SIZE   = 22,
+    MARGIN     = 14,
     -- BackgroundTransparency 0.75 = 25% opaque per the user's request
-    OPACITY  = 0.75,
+    OPACITY    = 0.75,
 }
 
 function Indicator:_ensureGui()
@@ -1182,19 +1184,43 @@ function Indicator:_ensureGui()
         ZIndexBehavior  = Enum.ZIndexBehavior.Sibling,
     })
     self.gui.Parent = parent
-    local dot = mk("Frame", {
-        Name                  = "Dot",
-        Size                  = UDim2.fromOffset(self.DOT_SIZE, self.DOT_SIZE),
-        BackgroundColor3      = THEME.recording,
-        BackgroundTransparency= self.OPACITY,
-        BorderSizePixel       = 0,
-        Visible               = false,
+
+    -- Container = the outer ring. Its background is transparent, the colored
+    -- ring comes from a thick UIStroke. UICorner with radius=size/2 makes
+    -- both the (invisible) background and the stroke render as a circle.
+    local container = mk("Frame", {
+        Name                   = "Indicator",
+        Size                   = UDim2.fromOffset(self.DOT_SIZE, self.DOT_SIZE),
+        BackgroundTransparency = 1,
+        BorderSizePixel        = 0,
+        Visible                = false,
     }, self.gui)
-    corner(dot, math.floor(self.DOT_SIZE / 2))
-    -- subtle dark outline so the dot stays visible on bright backgrounds
-    local s = stroke(dot, Color3.new(0, 0, 0), 1)
-    s.Transparency = 0.4
-    self.dot = dot
+    corner(container, math.floor(self.DOT_SIZE / 2))
+
+    local ringStroke = mk("UIStroke", {
+        Color           = THEME.recording,
+        Thickness       = math.max(2, math.floor(self.DOT_SIZE / 7)),
+        Transparency    = self.OPACITY,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, container)
+
+    -- Inner solid dot — together with the ring this gives the classic
+    -- record-button look (the user's reference image).
+    local innerSize = math.max(4, math.floor(self.DOT_SIZE * 0.32))
+    local inner = mk("Frame", {
+        Name                   = "Inner",
+        Size                   = UDim2.fromOffset(innerSize, innerSize),
+        Position               = UDim2.fromScale(0.5, 0.5),
+        AnchorPoint            = Vector2.new(0.5, 0.5),
+        BackgroundColor3       = THEME.recording,
+        BackgroundTransparency = self.OPACITY,
+        BorderSizePixel        = 0,
+    }, container)
+    corner(inner, math.floor(innerSize / 2))
+
+    self.dot        = container
+    self.ringStroke = ringStroke
+    self.innerDot   = inner
 end
 
 function Indicator:_setCorner(name)
@@ -1223,15 +1249,18 @@ function Indicator:refresh()
         return
     end
     self:_setCorner(rec.cfg.INDICATOR_CORNER)
+    local color
     if rec:IsRecording() then
-        self.dot.BackgroundColor3 = THEME.recording   -- red while recording
-        self.dot.Visible = true
+        color = THEME.recording                      -- red while recording
     elseif rec.cfg.IR_ENABLED then
-        self.dot.BackgroundColor3 = Color3.fromRGB(245, 245, 245)  -- white while buffering
-        self.dot.Visible = true
+        color = Color3.fromRGB(245, 245, 245)        -- white while buffering
     else
         self.dot.Visible = false
+        return
     end
+    self.dot.Visible = true
+    if self.ringStroke then self.ringStroke.Color = color end
+    if self.innerDot   then self.innerDot.BackgroundColor3 = color end
 end
 
 function Indicator:destroy()
