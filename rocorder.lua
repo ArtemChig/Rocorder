@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.7-alpha"
+local ROCORDER_VERSION = "1.9.8-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -1365,7 +1365,11 @@ end
 -- Re-scan for newly-attached parts (a tool/accessory equipped mid-recording)
 -- and append them. Only APPENDS — never reorders/removes — so the positional
 -- frame indices stay aligned (new parts simply have no keyframes before they
--- appeared, exactly like a late-joining player).
+-- appeared, exactly like a late-joining player). Also enqueues assets for
+-- the new part — the previous "append only, don't enqueue" behavior meant
+-- a tool equipped mid-recording (Handle ATTACHED) showed up in the .rec
+-- file but its mesh/texture had to be rescued by the end-of-recording legacy
+-- HTTP pass, never appearing in the live extractor UI.
 function Tracker:_appendNewParts(entry, char, encode, debugLog)
     local used = {}
     for _, r in ipairs(entry.refs) do used[r.name] = true end
@@ -1382,17 +1386,57 @@ function Tracker:_appendNewParts(entry, char, encode, debugLog)
             entry.known[desc] = true
             local nm = uniqueName(desc.Name)
             local idx = #entry.refs + 1
+            local info = partInfo(desc, nm)
             entry.refs[idx] = { name = nm, inst = desc }
-            entry.rig.parts[idx] = partInfo(desc, nm)
+            entry.rig.parts[idx] = info
             entry.last[idx] = encode(desc.CFrame)
             added += 1
             if debugLog then
                 debugLog(fmt("uid=%d part[%d] %s ATTACHED mid-recording (%s)",
-                    entry.uid, idx - 1, nm, entry.rig.parts[idx].shape or "?"))
+                    entry.uid, idx - 1, nm, info.shape or "?"))
+            end
+            if EXTRACT_OK then
+                enqueuePartAssets(desc, info, entry.uid, entry.displayName)
             end
         end
     end
     return added
+end
+
+-- Re-run partInfo on existing refs and enqueue any assets that materialized
+-- since the initial ENSURE. Avatars stream in stages on Roblox: skeleton +
+-- Motor6Ds first (which the readiness gate waits for), THEN mesh content
+-- attaches as SpecialMesh children or MeshPart MeshId/TextureID populate.
+-- A player joining mid-recording often captures with shape=Block parts and
+-- no meshId; ~1 s later the engine fills in the FileMesh. This sweep catches
+-- that and enqueues the now-available asset ids. Cheap: _enqueueAsset
+-- dedupes via EXTRACTED + Q.byId so re-calling for already-seen ids is a
+-- no-op.
+function Tracker:_rescanExistingAssets(entry, debugLog)
+    if not EXTRACT_OK then return end
+    for i, r in ipairs(entry.refs) do
+        local inst = r.inst
+        if inst and inst.Parent and inst:IsA("BasePart") then
+            local old = entry.rig.parts[i]
+            local oldName = (old and old.name) or r.name
+            local new = partInfo(inst, oldName)
+            local upgraded = false
+            if new.meshId and not (old and old.meshId) then upgraded = true end
+            if new.textureId and not (old and old.textureId) then upgraded = true end
+            if new.colorMap and not (old and old.colorMap) then upgraded = true end
+            local oldDecals = (old and old.decals) or {}
+            if new.decals and #new.decals > #oldDecals then upgraded = true end
+            if upgraded then
+                if debugLog then
+                    debugLog(fmt("uid=%d part[%d] %s mesh content arrived (mesh=%s tex=%s)",
+                        entry.uid, i - 1, new.name,
+                        tostring(new.meshId), tostring(new.textureId)))
+                end
+                entry.rig.parts[i] = new
+                enqueuePartAssets(inst, new, entry.uid, entry.displayName)
+            end
+        end
+    end
 end
 
 -- Rebuild the part references after a respawn (new Character = new Instances).
@@ -1448,7 +1492,9 @@ function Tracker:ensure(player, encode, debugLog)
     end
     self.pending[uid] = nil
     local entry = {
-        uid = uid, rig = rig, refs = refs, last = {},
+        uid = uid,
+        displayName = player.DisplayName or player.Name,
+        rig = rig, refs = refs, last = {},
         char = player.Character, known = {},
         ticks = 0, culledTicks = 0,
         hadChar = true, partLost = {}, rangeIn = true,
@@ -1530,10 +1576,14 @@ function Tracker:snapshot(cfg, encode, debugLog)
                 if hasChar and char ~= entry.char then
                     self:_rebuildRefs(entry, p, encode, debugLog)
                 end
-                -- mid-recording equip: throttled append-scan (~1/s)
+                -- mid-recording equip & late mesh streaming: throttled
+                -- append-scan + asset rescan (~1/s). _rescanExistingAssets
+                -- catches Heads / accessories that captured as Block on
+                -- ENSURE because mesh content hadn't streamed in yet.
                 if hasChar and now - entry.lastScanClock >= 1.0 then
                     entry.lastScanClock = now
                     self:_appendNewParts(entry, char, encode, debugLog)
+                    self:_rescanExistingAssets(entry, debugLog)
                 end
 
                 local inRange = true
