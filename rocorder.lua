@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.2.1-alpha"
+local ROCORDER_VERSION = "1.3.0-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -54,28 +54,22 @@ end
 local FOLDER = "ROCORDER"
 if not isfolder(FOLDER) then makefolder(FOLDER) end
 
+-- Forward-declared so rec methods (defined before the UI section) can call
+-- Indicator:refresh() — the actual table is assigned later in the UI section.
+local Indicator
+
 ----------------------------------------------------------------
 -- Settings: defs, defaults, load/save
 ----------------------------------------------------------------
--- Each def: key, type (number/bool/key), default, label, desc, group,
---           plus per-type extras (min, max, int for numbers).
+-- Each def: key, type (number/bool/key/choice), default, label, desc, group,
+--           plus per-type extras (min, max, int for numbers; choices for choice).
+-- An item flagged advanced=true is hidden behind the Settings tab's
+-- "Show advanced settings" toggle so casual users aren't drowned in knobs.
 local SETTING_DEFS = {
-    -- Capture
+    -- Capture: basics first, advanced last
     { key="TICK_RATE",       type="number", default=30,   label="Tick Rate (Hz)",
       desc="Samples per second.",                                  group="Capture",
       min=1,   max=240, int=true },
-    { key="POS_PRECISION",   type="number", default=3,    label="Position Decimals",
-      desc="Decimal places for positions (studs).",                group="Capture",
-      min=0,   max=6,   int=true },
-    { key="ROT_PRECISION",   type="number", default=5,    label="Rotation Decimals",
-      desc="Decimal places for quaternion components.",            group="Capture",
-      min=0,   max=8,   int=true },
-    { key="FLUSH_INTERVAL",  type="number", default=0.5,  label="Flush Interval (s)",
-      desc="Seconds between disk writes.",                         group="Capture",
-      min=0.05, max=10 },
-    { key="MAX_CATCHUP_SEC", type="number", default=5.0,  label="Max Catchup (s)",
-      desc="Cap on backfilled frames after a stall.",              group="Capture",
-      min=0,   max=60 },
     { key="MAX_DISTANCE",    type="number", default=0,    label="Max Distance (studs)",
       desc="Skip players beyond this distance from the camera. 0 = unlimited.",
       group="Capture",
@@ -84,6 +78,18 @@ local SETTING_DEFS = {
       desc="Record yourself too.",                                 group="Capture" },
     { key="DEBUG",           type="bool",   default=true, label="Write Debug Log",
       desc="Write a verbose .debug.log next to each recording.",   group="Capture" },
+    { key="POS_PRECISION",   type="number", default=3,    label="Position Decimals",
+      desc="Decimal places for positions (studs).",                group="Capture",
+      min=0,   max=6,   int=true, advanced=true },
+    { key="ROT_PRECISION",   type="number", default=5,    label="Rotation Decimals",
+      desc="Decimal places for quaternion components.",            group="Capture",
+      min=0,   max=8,   int=true, advanced=true },
+    { key="FLUSH_INTERVAL",  type="number", default=0.5,  label="Flush Interval (s)",
+      desc="Seconds between disk writes.",                         group="Capture",
+      min=0.05, max=10, advanced=true },
+    { key="MAX_CATCHUP_SEC", type="number", default=5.0,  label="Max Catchup (s)",
+      desc="Cap on backfilled frames after a stall.",              group="Capture",
+      min=0,   max=60, advanced=true },
 
     -- Instant Replay
     { key="IR_ENABLED",      type="bool",   default=false, label="Instant Replay",
@@ -93,6 +99,16 @@ local SETTING_DEFS = {
     { key="IR_BUFFER_SEC",   type="number", default=30,   label="Buffer Length (s)",
       desc="How many seconds to keep in the rolling buffer.",      group="Instant Replay",
       min=5,   max=600, int=true },
+
+    -- Indicator overlay (small dot in a screen corner while capturing)
+    { key="INDICATOR_ENABLED", type="bool",   default=true, label="Show indicator",
+      desc="A small dot in a screen corner — red while recording, white while "
+        .. "Instant Replay is buffering. Sits at low opacity to stay out of the way.",
+      group="Indicator" },
+    { key="INDICATOR_CORNER",  type="choice", default="TopRight", label="Corner",
+      desc="Which corner of the screen the indicator appears in.",
+      group="Indicator",
+      choices={ "TopLeft", "TopRight", "BottomLeft", "BottomRight" } },
 
     -- Hotkeys
     { key="HOTKEY_RECORD",       type="key", default="F8",        label="Record Toggle",
@@ -126,7 +142,16 @@ local function loadSettings()
             if ok2 and type(data) == "table" then
                 for _, d in ipairs(SETTING_DEFS) do
                     local v = data[d.key]
-                    if v ~= nil and type(v) == type(d.default) then cfg[d.key] = v end
+                    if v ~= nil and type(v) == type(d.default) then
+                        if d.type == "choice" then
+                            -- only accept values that are still in the allowed list
+                            for _, c in ipairs(d.choices or {}) do
+                                if c == v then cfg[d.key] = v; break end
+                            end
+                        else
+                            cfg[d.key] = v
+                        end
+                    end
                 end
             end
         end
@@ -758,6 +783,7 @@ end
 
 function rec:_signalUI()
     if self.onStateChange then pcall(self.onStateChange) end
+    if Indicator then Indicator:refresh() end
 end
 
 function rec:_setActive()
@@ -940,7 +966,16 @@ end
 function rec:SetSetting(key, value)
     local d = defByKey(key)
     if not d then return false, "no such setting" end
-    if type(value) ~= type(d.default) then return false, "wrong type" end
+    if d.type == "choice" then
+        if type(value) ~= "string" then return false, "wrong type" end
+        local valid = false
+        for _, c in ipairs(d.choices or {}) do
+            if c == value then valid = true; break end
+        end
+        if not valid then return false, "not in choices" end
+    elseif type(value) ~= type(d.default) then
+        return false, "wrong type"
+    end
     self.cfg[key] = value
     saveSettings(self.cfg)
     -- live-apply effects
@@ -950,6 +985,9 @@ function rec:SetSetting(key, value)
     if key == "IR_ENABLED" then
         if value then self:_ensureReplay()
         elseif self.replay then self.replay:clear() end
+    end
+    if key == "IR_ENABLED" or key == "INDICATOR_ENABLED" or key == "INDICATOR_CORNER" then
+        if Indicator then Indicator:refresh() end
     end
     self:_signalUI()
     return true
@@ -1121,6 +1159,88 @@ local function humanDuration(seconds)
 end
 
 ----------------------------------------------------------------
+-- Indicator overlay (small dot in a screen corner while capturing)
+----------------------------------------------------------------
+Indicator = {
+    gui      = nil,
+    dot      = nil,
+    DOT_SIZE = 14,
+    MARGIN   = 14,
+    -- BackgroundTransparency 0.75 = 25% opaque per the user's request
+    OPACITY  = 0.75,
+}
+
+function Indicator:_ensureGui()
+    if self.gui and self.gui.Parent then return end
+    local parent = getUIParent()
+    if not parent then return end
+    self.gui = mk("ScreenGui", {
+        Name            = "ROCORDER_Indicator",
+        IgnoreGuiInset  = true,
+        ResetOnSpawn    = false,
+        DisplayOrder    = 999990,   -- below the main UI window
+        ZIndexBehavior  = Enum.ZIndexBehavior.Sibling,
+    })
+    self.gui.Parent = parent
+    local dot = mk("Frame", {
+        Name                  = "Dot",
+        Size                  = UDim2.fromOffset(self.DOT_SIZE, self.DOT_SIZE),
+        BackgroundColor3      = THEME.recording,
+        BackgroundTransparency= self.OPACITY,
+        BorderSizePixel       = 0,
+        Visible               = false,
+    }, self.gui)
+    corner(dot, math.floor(self.DOT_SIZE / 2))
+    -- subtle dark outline so the dot stays visible on bright backgrounds
+    local s = stroke(dot, Color3.new(0, 0, 0), 1)
+    s.Transparency = 0.4
+    self.dot = dot
+end
+
+function Indicator:_setCorner(name)
+    if not self.dot then return end
+    local m = self.MARGIN
+    if name == "TopLeft" then
+        self.dot.AnchorPoint = Vector2.new(0, 0)
+        self.dot.Position    = UDim2.new(0,  m, 0,  m)
+    elseif name == "BottomLeft" then
+        self.dot.AnchorPoint = Vector2.new(0, 1)
+        self.dot.Position    = UDim2.new(0,  m, 1, -m)
+    elseif name == "BottomRight" then
+        self.dot.AnchorPoint = Vector2.new(1, 1)
+        self.dot.Position    = UDim2.new(1, -m, 1, -m)
+    else  -- TopRight (default)
+        self.dot.AnchorPoint = Vector2.new(1, 0)
+        self.dot.Position    = UDim2.new(1, -m, 0,  m)
+    end
+end
+
+function Indicator:refresh()
+    self:_ensureGui()
+    if not self.dot then return end
+    if not rec.cfg.INDICATOR_ENABLED then
+        self.dot.Visible = false
+        return
+    end
+    self:_setCorner(rec.cfg.INDICATOR_CORNER)
+    if rec:IsRecording() then
+        self.dot.BackgroundColor3 = THEME.recording   -- red while recording
+        self.dot.Visible = true
+    elseif rec.cfg.IR_ENABLED then
+        self.dot.BackgroundColor3 = Color3.fromRGB(245, 245, 245)  -- white while buffering
+        self.dot.Visible = true
+    else
+        self.dot.Visible = false
+    end
+end
+
+function Indicator:destroy()
+    if self.gui then pcall(function() self.gui:Destroy() end) end
+    self.gui = nil
+    self.dot = nil
+end
+
+----------------------------------------------------------------
 -- UI: build
 ----------------------------------------------------------------
 local UI = {
@@ -1256,10 +1376,12 @@ local function buildRecordView(parent)
     recordBtn.Size = UDim2.new(1, 0, 0, 44)
     recordBtn.TextSize = 16
 
-    local replayBtn = buildButton(view, "Save Last 30 Seconds", "secondary", 3)
+    local replayBtn = buildButton(view, "Save Instant Replay", "secondary", 3)
     replayBtn.Size = UDim2.new(1, 0, 0, 38)
-    -- the literal "30" is just an initial placeholder; _refreshStatus
-    -- rewrites it from rec.cfg.IR_BUFFER_SEC on the first paint.
+    -- track the stroke ref so _refreshStatus can dim it when IR is off
+    for _, c in ipairs(replayBtn:GetChildren()) do
+        if c:IsA("UIStroke") then replayBtn:SetAttribute("StrokeRef", c.Name) end
+    end
 
     local irRow = mk("Frame", { BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
         Size = UDim2.new(1, 0, 0, 40), LayoutOrder = 4 }, view)
@@ -1306,6 +1428,12 @@ local function buildSettingsView(parent)
 
     local order, groups = settingsByGroup(SETTINGS_TAB_OMIT)
     local controls = {}
+    -- Track per-group bookkeeping so we can hide a whole group when all of
+    -- its items are advanced and advanced is currently hidden.
+    local groupInfo = {}        -- gname -> { box, hasBasic, advancedRows[] }
+    local advancedRows = {}     -- flat list of all advanced item rows
+    local advancedTextBoxes = {} -- TextBox refs we need to NOT overwrite while focused
+
     for gi, gname in ipairs(order) do
         local groupBox = mk("Frame", { BackgroundColor3 = THEME.panel,
             BorderSizePixel = 0, Size = UDim2.new(1, -6, 0, 36),
@@ -1317,6 +1445,7 @@ local function buildSettingsView(parent)
             Size = UDim2.new(1, 0, 0, 18),
             TextXAlignment = Enum.TextXAlignment.Left }, groupBox)
 
+        local hasBasic = false
         for _, d in ipairs(groups[gname]) do
             local row = mk("Frame", { BackgroundTransparency = 1,
                 Size = UDim2.new(1, 0, 0, 44) }, groupBox)
@@ -1386,9 +1515,78 @@ local function buildSettingsView(parent)
                     UI.keyBindBtn = { btn = btn, key = d.key }
                 end)
                 controls[d.key] = btn
+
+            elseif d.type == "choice" then
+                -- click cycles through d.choices
+                local btn = mk("TextButton", {
+                    Text = tostring(rec.cfg[d.key]),
+                    Font = THEME.fontMono, TextSize = 13,
+                    TextColor3 = THEME.text, BackgroundColor3 = THEME.bg,
+                    BorderSizePixel = 0, AutoButtonColor = false,
+                    Position = UDim2.new(1, -118, 0, 4),
+                    Size = UDim2.fromOffset(112, 26),
+                }, row); corner(btn, 4); stroke(btn, THEME.border, 1)
+                local function refresh()
+                    btn.Text = tostring(rec.cfg[d.key])
+                end
+                btn.MouseButton1Click:Connect(function()
+                    local cur = rec.cfg[d.key]
+                    local nextIdx = 1
+                    for i, c in ipairs(d.choices or {}) do
+                        if c == cur then nextIdx = (i % #d.choices) + 1; break end
+                    end
+                    rec:SetSetting(d.key, d.choices[nextIdx])
+                    refresh()
+                end)
+                controls[d.key] = { btn = btn, refresh = refresh }
+            end
+
+            if d.advanced then
+                advancedRows[#advancedRows + 1] = row
+                row.Visible = false  -- hidden by default
+            else
+                hasBasic = true
             end
         end
+
+        groupInfo[gname] = { box = groupBox, hasBasic = hasBasic }
+        groupBox.Visible = hasBasic  -- if a group has ONLY advanced items, hide it
     end
+
+    -- "Show advanced settings" toggle button (always last in the list)
+    local advBtn = mk("TextButton", {
+        Text = "\xE2\x96\xBC  Show advanced settings",   -- ▼
+        Font = THEME.fontBold, TextSize = 13,
+        TextColor3 = THEME.subtext, BackgroundColor3 = THEME.panel,
+        BorderSizePixel = 0, AutoButtonColor = false,
+        Size = UDim2.new(1, -6, 0, 36),
+        LayoutOrder = 9999,
+    }, view); corner(advBtn, 6); stroke(advBtn, THEME.border, 1)
+    advBtn.MouseEnter:Connect(function()
+        TweenService:Create(advBtn, HOVER_TWEEN,
+            { TextColor3 = THEME.text }):Play()
+    end)
+    advBtn.MouseLeave:Connect(function()
+        TweenService:Create(advBtn, HOVER_TWEEN,
+            { TextColor3 = THEME.subtext }):Play()
+    end)
+
+    local showAdvanced = false
+    local function refreshAdvanced()
+        for _, row in ipairs(advancedRows) do row.Visible = showAdvanced end
+        for _, info in pairs(groupInfo) do
+            info.box.Visible = info.hasBasic or showAdvanced
+        end
+        advBtn.Text = showAdvanced
+            and "\xE2\x96\xB2  Hide advanced settings"   -- ▲
+            or  "\xE2\x96\xBC  Show advanced settings"   -- ▼
+    end
+    advBtn.MouseButton1Click:Connect(function()
+        showAdvanced = not showAdvanced
+        refreshAdvanced()
+    end)
+    refreshAdvanced()
+
     return { view = view, controls = controls }
 end
 
@@ -1872,8 +2070,23 @@ function UI:_refreshStatus()
     end
     local nt = 0; for _ in pairs(rec.tracker.tracked) do nt = nt + 1 end
     s.fields.tracked.Text = tostring(nt)
-    ctl.replayBtn.Active = rec.cfg.IR_ENABLED
-    ctl.replayBtn.Text = fmt("Save Last %d Seconds", rec.cfg.IR_BUFFER_SEC)
+    -- replay button: grayed out when Instant Replay is off so it's obvious
+    -- the button won't do anything (clicks still notify).
+    if rec.cfg.IR_ENABLED then
+        setButtonColors(ctl.replayBtn, THEME.panel, THEME.panelHi)
+        ctl.replayBtn.TextColor3 = THEME.accent
+        for _, c in ipairs(ctl.replayBtn:GetChildren()) do
+            if c:IsA("UIStroke") then c.Color = THEME.accent; c.Transparency = 0 end
+        end
+    else
+        -- equal Fill/Hover -> no hover swap when disabled
+        setButtonColors(ctl.replayBtn, THEME.panel, THEME.panel)
+        ctl.replayBtn.TextColor3 = THEME.subtext
+        for _, c in ipairs(ctl.replayBtn:GetChildren()) do
+            if c:IsA("UIStroke") then c.Color = THEME.border; c.Transparency = 0.4 end
+        end
+    end
+    ctl.replayBtn.Text = "Save Instant Replay"
     ctl.refreshIrToggle()
 
     -- cross-tab: keep settings boolean toggles + key-binding labels in sync
@@ -1881,6 +2094,8 @@ function UI:_refreshStatus()
         for key, c in pairs(self.settingsCtl.controls) do
             local d = defByKey(key)
             if d and d.type == "bool" and type(c) == "table" and c.refresh then
+                c.refresh()
+            elseif d and d.type == "choice" and type(c) == "table" and c.refresh then
                 c.refresh()
             elseif d and d.type == "key" and typeof(c) == "Instance"
                 and c:IsA("TextButton") and (not UI.keyBindBtn or UI.keyBindBtn.key ~= key) then
@@ -1920,6 +2135,7 @@ rec.onStateChange = function() if UI.gui then UI:_refreshStatus() end end
 -- Hotkeys + boot
 ----------------------------------------------------------------
 buildUI()
+Indicator:refresh()  -- pick up persisted state (e.g. IR_ENABLED) on script load
 
 rec.conns.input = UserInputService.InputBegan:Connect(function(input, processed)
     -- key-bind picker captures the next key regardless of processed flag
@@ -1957,6 +2173,7 @@ function rec:_destroy()
     for _, c in pairs(self.conns) do pcall(function() c:Disconnect() end) end
     self.conns = {}
     if UI.gui then pcall(function() UI.gui:Destroy() end); UI.gui = nil end
+    if Indicator then Indicator:destroy() end
 end
 
 notify("ROCORDER", fmt("v%s loaded. %s = UI, %s = record.", ROCORDER_VERSION,

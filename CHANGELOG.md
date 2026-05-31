@@ -9,6 +9,30 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.3.0-alpha — 2026-05-30
+
+UI polish + new on-screen indicator overlay + advanced-settings reveal.
+
+- **Save Instant Replay button** — renamed from "Save Last N Seconds" (which
+  was misleading when a recording just started). It now also reads as
+  visibly disabled (muted text, muted border, no hover) when Instant Replay
+  is off, instead of just being unresponsive.
+- **Indicator overlay** — a small dot in a screen corner appears while
+  capturing. **Red** while a full recording is in progress, **white** while
+  Instant Replay is buffering. Sits at 25% opacity with a thin dark outline
+  so it stays visible on bright backgrounds without being obnoxious.
+  - New setting **Indicator > Show indicator** (default on).
+  - New setting **Indicator > Corner** — TopLeft / TopRight / BottomLeft /
+    BottomRight (default TopRight).
+- **Advanced settings collapse** — Position Decimals, Rotation Decimals,
+  Flush Interval, and Max Catchup are now flagged advanced and hidden by
+  default behind a "Show advanced settings ▼" toggle at the bottom of the
+  Settings tab. The vital basics (Tick Rate, Max Distance, Include Local,
+  Debug, Instant Replay, Indicator, Hotkeys) stay visible up front.
+- New setting type **`choice`** — cycling button that walks through a
+  fixed list of string values. Used by the new Indicator Corner setting;
+  available for any future setting that needs a small enum.
+
 ## 1.2.1-alpha — 2026-05-30
 
 Four small fixes from the 1.2.0 screenshots.
