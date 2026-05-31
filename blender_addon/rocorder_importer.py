@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 3, 2),
+    "version": (1, 4, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.3.2-alpha"
+ROCORDER_VERSION = "1.4.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -25,7 +25,11 @@ ROCORDER_VERSION = "1.3.2-alpha"
 import json
 import math
 import os
+import re
+import struct
 import time
+import urllib.request
+import urllib.error
 import bpy
 import bmesh
 from bpy.props import StringProperty, FloatProperty, BoolProperty
@@ -197,7 +201,12 @@ def _color_material(color, transparency):
     if bsdf is not None:
         bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
         if a < 1.0:
-            mat.blend_method = "BLEND"
+            # blend_method was removed from Material in Blender 4.3+ (EEVEE
+            # Next); guard so setting it can't abort the import.
+            try:
+                mat.blend_method = "BLEND"
+            except (AttributeError, TypeError):
+                pass
             alpha_input = bsdf.inputs.get("Alpha")
             if alpha_input is not None:
                 alpha_input.default_value = a
@@ -225,6 +234,369 @@ def _add_part_geometry(bm, part, place_mat, scale):
 
     bmesh.ops.transform(bm, matrix=place_mat, verts=new_verts)
     return new_verts
+
+
+# ============================================================================
+# Roblox asset fetching + mesh parsing + textures
+# ----------------------------------------------------------------------------
+# The recorder captures every part's MeshId / TextureID / ColorMap. Here we
+# download those assets from Roblox's CDN (no browser => no CORS), parse the
+# binary mesh format, and build real geometry + UV-mapped image materials so
+# the Blender scene matches what the player saw in-game. Everything is cached
+# on disk so re-imports are instant and assets shared across players (or across
+# imports) only download once. Any failure degrades gracefully to a box.
+# ============================================================================
+
+def _asset_id(ref):
+    """Extract the numeric asset id from any Roblox content string:
+    'rbxassetid://123', 'http://www.roblox.com/asset/?id=123',
+    'https://assetdelivery.roblox.com/v1/asset/?id=123', or bare '123'."""
+    if not ref:
+        return None
+    s = str(ref)
+    m = re.search(r"(\d{4,})", s)  # asset ids are long integers
+    return m.group(1) if m else None
+
+
+class AssetFetcher:
+    def __init__(self, cache_dir, cookie, log, throttle=0.05):
+        self.cache_dir = cache_dir
+        self.cookie = (cookie or "").strip()
+        self.log = log
+        self.throttle = throttle
+        self._mesh_cache = {}     # id -> parsed mesh dict (or False on failure)
+        self._image_cache = {}    # id -> local image path (or False)
+        self._last_request = 0.0
+        self.stats = {"downloads": 0, "cache_hits": 0, "fails": 0}
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError as e:
+            self.log("WARN could not create asset cache dir {}: {}".format(cache_dir, e))
+
+    # ---- raw download (with on-disk cache) -------------------------------
+    def _download(self, asset_id, ext):
+        """Return the local cached file path for an asset id, downloading if
+        needed. ext is a hint for the cache filename only."""
+        cache_path = os.path.join(self.cache_dir, "{}{}".format(asset_id, ext))
+        if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+            self.stats["cache_hits"] += 1
+            return cache_path
+
+        url = "https://assetdelivery.roblox.com/v1/asset/?id={}".format(asset_id)
+        headers = {
+            "User-Agent": "Roblox/WinInet",
+            "Accept": "*/*",
+        }
+        if self.cookie:
+            headers["Cookie"] = ".ROBLOSECURITY={}".format(self.cookie)
+
+        # be polite to the CDN — tiny gap between requests
+        import time as _t
+        dt = _t.monotonic() - self._last_request
+        if dt < self.throttle:
+            _t.sleep(self.throttle - dt)
+
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = resp.read()
+                self._last_request = _t.monotonic()
+                if not data:
+                    raise ValueError("empty response")
+                # old "decal" assets return an XML wrapper pointing at the real
+                # image id — follow one level of indirection.
+                if data[:5] == b"<?xml" or data[:8].lstrip()[:7] == b"<roblox":
+                    inner = self._xml_inner_id(data)
+                    if inner and inner != asset_id:
+                        self.log("    asset {} is a wrapper -> {}".format(asset_id, inner))
+                        return self._download(inner, ext)
+                with open(cache_path, "wb") as fh:
+                    fh.write(data)
+                self.stats["downloads"] += 1
+                return cache_path
+            except (urllib.error.URLError, urllib.error.HTTPError,
+                    ValueError, OSError) as e:
+                self.log("    download attempt {}/3 for asset {} failed: {}".format(
+                    attempt + 1, asset_id, e))
+                _t.sleep(0.4 * (attempt + 1))
+        self.stats["fails"] += 1
+        return None
+
+    @staticmethod
+    def _xml_inner_id(data):
+        try:
+            text = data.decode("utf-8", "ignore")
+        except Exception:
+            return None
+        m = re.search(r"(?:rbxassetid://|id=)(\d{4,})", text)
+        return m.group(1) if m else None
+
+    # ---- meshes ----------------------------------------------------------
+    def get_mesh(self, ref):
+        aid = _asset_id(ref)
+        if not aid:
+            return None
+        if aid in self._mesh_cache:
+            c = self._mesh_cache[aid]
+            return c or None
+        path = self._download(aid, ".mesh")
+        if not path:
+            self._mesh_cache[aid] = False
+            return None
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+            mesh = parse_roblox_mesh(data, self.log)
+        except Exception as e:
+            self.log("    mesh parse error for asset {}: {}".format(aid, e))
+            mesh = None
+        if mesh:
+            self.log("    mesh {} -> v{} verts={} faces={}".format(
+                aid, mesh.get("version", "?"), len(mesh["verts"]), len(mesh["faces"])))
+        self._mesh_cache[aid] = mesh or False
+        return mesh
+
+    # ---- images ----------------------------------------------------------
+    def get_image_path(self, ref):
+        aid = _asset_id(ref)
+        if not aid:
+            return None
+        if aid in self._image_cache:
+            c = self._image_cache[aid]
+            return c or None
+        path = self._download(aid, ".png")  # ext is cosmetic; Blender sniffs content
+        self._image_cache[aid] = path or False
+        return path
+
+
+# ---- Roblox binary/text mesh parser ---------------------------------------
+def parse_roblox_mesh(data, log=None):
+    """Parse Roblox's mesh format into {verts, uvs, faces, version}.
+    Supports v1.x (text), v2.x, v3.x (binary). v4+/skinned are best-effort.
+    Returns None on unsupported/failed parse (caller falls back to a box)."""
+    if data[:8] != b"version ":
+        return None
+    nl = data.find(b"\n")
+    if nl < 0:
+        return None
+    ver = data[8:nl].decode("ascii", "ignore").strip()
+    major = ver.split(".")[0]
+    body = data[nl + 1:]
+    try:
+        if major == "1":
+            return _parse_mesh_v1(data, ver)
+        if major == "2":
+            return _parse_mesh_v2(body, ver)
+        if major == "3":
+            return _parse_mesh_v3(body, ver)
+        # v4, v5, v6, v7 — skinned/LOD formats; best effort
+        return _parse_mesh_v4plus(body, ver, log)
+    except Exception as e:
+        if log:
+            log("    mesh v{} parse exception: {}".format(ver, e))
+        return None
+
+
+def _parse_mesh_v1(data, ver):
+    text = data.decode("ascii", "ignore")
+    parts = text.split("\n", 2)
+    if len(parts) < 3:
+        return None
+    blob = parts[2]
+    groups = re.findall(r"\[([^\]]*)\]", blob)
+    sc = 0.5 if ver == "1.00" else 1.0
+    verts, uvs = [], []
+    vcount = len(groups) // 3
+    for vi in range(vcount):
+        pos = groups[vi * 3].split(",")
+        uv = groups[vi * 3 + 2].split(",")
+        verts.append((float(pos[0]) * sc, float(pos[1]) * sc, float(pos[2]) * sc))
+        uvs.append((float(uv[0]) if len(uv) > 0 else 0.0,
+                    float(uv[1]) if len(uv) > 1 else 0.0))
+    faces = [(i * 3, i * 3 + 1, i * 3 + 2) for i in range(vcount // 3)]
+    return {"verts": verts, "uvs": uvs, "faces": faces, "version": ver}
+
+
+def _read_vert_block(body, off, num, stride):
+    """Read num vertices (pos@0, uv@24 if stride>=32 else @24-clamped). Returns
+    (verts, uvs). pos = first 3 floats, uv = floats at byte offset 24."""
+    verts, uvs = [], []
+    for i in range(num):
+        base = off + i * stride
+        px, py, pz = struct.unpack_from("<3f", body, base)
+        # uv lives after pos(12)+normal(12) = byte 24
+        if stride >= 32:
+            u, v = struct.unpack_from("<2f", body, base + 24)
+        else:
+            u, v = 0.0, 0.0
+        verts.append((px, py, pz))
+        uvs.append((u, v))
+    return verts, uvs
+
+
+def _parse_mesh_v2(body, ver):
+    cb_header = struct.unpack_from("<H", body, 0)[0]
+    cb_vertex = body[2]
+    cb_face = body[3]
+    num_verts = struct.unpack_from("<I", body, 4)[0]
+    num_faces = struct.unpack_from("<I", body, 8)[0]
+    off = cb_header
+    verts, uvs = _read_vert_block(body, off, num_verts, cb_vertex)
+    foff = off + num_verts * cb_vertex
+    faces = []
+    for i in range(num_faces):
+        a, b, c = struct.unpack_from("<3I", body, foff + i * cb_face)
+        faces.append((a, b, c))
+    return {"verts": verts, "uvs": uvs, "faces": faces, "version": ver}
+
+
+def _parse_mesh_v3(body, ver):
+    cb_header = struct.unpack_from("<H", body, 0)[0]
+    cb_vertex = body[2]
+    cb_face = body[3]
+    num_lods = struct.unpack_from("<H", body, 4)[0]
+    num_verts = struct.unpack_from("<I", body, 6)[0]
+    num_faces = struct.unpack_from("<I", body, 10)[0]
+    off = cb_header
+    verts, uvs = _read_vert_block(body, off, num_verts, cb_vertex)
+    foff = off + num_verts * cb_vertex
+    faces = []
+    for i in range(num_faces):
+        a, b, c = struct.unpack_from("<3I", body, foff + i * cb_face)
+        faces.append((a, b, c))
+    # LOD offsets (num_lods uint32) after faces; LOD 0 = highest detail
+    loff = foff + num_faces * cb_face
+    try:
+        lods = [struct.unpack_from("<I", body, loff + i * 4)[0]
+                for i in range(num_lods)]
+        if len(lods) >= 2:
+            faces = faces[lods[0]:lods[1]]
+    except Exception:
+        pass
+    return {"verts": verts, "uvs": uvs, "faces": faces, "version": ver}
+
+
+def _parse_mesh_v4plus(body, ver, log):
+    # v4 header: u16 sizeof, u16 lodType, u32 numVerts, u32 numFaces,
+    #            u16 numLODs, u16 numBones, u32 sizeofBoneNames, u16 numSubsets,
+    #            u8 numHQLods, u8 unused  => 24 bytes
+    cb_header = struct.unpack_from("<H", body, 0)[0]
+    num_verts = struct.unpack_from("<I", body, 4)[0]
+    num_faces = struct.unpack_from("<I", body, 8)[0]
+    num_lods = struct.unpack_from("<H", body, 12)[0]
+    num_bones = struct.unpack_from("<H", body, 14)[0]
+    STRIDE = 40  # v4 vertex: pos12 + normal12 + uv8 + tangent4 + rgba4
+    off = cb_header
+    verts, uvs = _read_vert_block(body, off, num_verts, STRIDE)
+    off += num_verts * STRIDE
+    if num_bones > 0:
+        off += num_verts * 8  # per-vertex bone indices(4) + weights(4)
+    faces = []
+    for i in range(num_faces):
+        a, b, c = struct.unpack_from("<3I", body, off + i * 12)
+        faces.append((a, b, c))
+    foff_end = off + num_faces * 12
+    try:
+        lods = [struct.unpack_from("<I", body, foff_end + i * 4)[0]
+                for i in range(num_lods)]
+        if len(lods) >= 2:
+            faces = faces[lods[0]:lods[1]]
+    except Exception:
+        pass
+    if log:
+        log("    (v{} best-effort: verts={} faces={} bones={})".format(
+            ver, num_verts, len(faces), num_bones))
+    return {"verts": verts, "uvs": uvs, "faces": faces, "version": ver}
+
+
+def _add_mesh_geometry(bm, uv_layer, mesh, place_mat, part, scale, flip_v=True):
+    """Add a parsed Roblox mesh to the shared bmesh, scaled to the part's Size,
+    converted Roblox-local -> Blender-local, then placed by place_mat (the
+    canonical rest). Sets per-loop UVs. Returns the new BMVerts."""
+    raw = mesh["verts"]
+    uvs = mesh["uvs"]
+    faces = mesh["faces"]
+    if not raw or not faces:
+        return None
+
+    size = part.get("size", [1.0, 1.0, 1.0])
+    sx, sy, sz = (float(s) for s in size)
+
+    if part.get("shape") == "FileMesh":
+        # legacy SpecialMesh: render at Scale, no auto-fit to part size
+        ms = part.get("meshScale", [1.0, 1.0, 1.0])
+        fx, fy, fz = float(ms[0]), float(ms[1]), float(ms[2])
+        cx = cy = cz = 0.0
+    else:
+        # MeshPart: Roblox scales the mesh so its bbox matches Size
+        xs = [v[0] for v in raw]; ys = [v[1] for v in raw]; zs = [v[2] for v in raw]
+        bx = max(xs) - min(xs); by = max(ys) - min(ys); bz = max(zs) - min(zs)
+        cx = (max(xs) + min(xs)) * 0.5
+        cy = (max(ys) + min(ys)) * 0.5
+        cz = (max(zs) + min(zs)) * 0.5
+        fx = sx / bx if bx > 1e-6 else 1.0
+        fy = sy / by if by > 1e-6 else 1.0
+        fz = sz / bz if bz > 1e-6 else 1.0
+
+    bmverts = []
+    for (x, y, z) in raw:
+        x = (x - cx) * fx; y = (y - cy) * fy; z = (z - cz) * fz
+        # Roblox-local -> Blender-local axis swap (x, y, z) -> (x, -z, y)
+        bmverts.append(bm.verts.new((x * scale, -z * scale, y * scale)))
+    bm.verts.ensure_lookup_table()
+
+    n = len(bmverts)
+    for (a, b, c) in faces:
+        if a >= n or b >= n or c >= n:
+            continue
+        try:
+            f = bm.faces.new((bmverts[a], bmverts[b], bmverts[c]))
+        except ValueError:
+            continue  # duplicate/degenerate face
+        for loop, vidx in zip(f.loops, (a, b, c)):
+            if vidx < len(uvs):
+                u, v = uvs[vidx]
+                loop[uv_layer].uv = (u, (1.0 - v) if flip_v else v)
+
+    bmesh.ops.transform(bm, matrix=place_mat, verts=bmverts)
+    return bmverts
+
+
+def _image_material(name, image_path, color, transparency, log):
+    """Principled-BSDF material with an image-texture base color. Falls back to
+    a flat color material when image_path is None."""
+    if not image_path:
+        return _color_material(color, transparency)
+    key = "ROCORDER_TEX_" + os.path.basename(image_path)
+    mat = bpy.data.materials.get(key)
+    if mat is not None:
+        return mat
+    try:
+        img = bpy.data.images.load(image_path, check_existing=True)
+    except Exception as e:
+        if log:
+            log("    image load failed {}: {}".format(image_path, e))
+        return _color_material(color, transparency)
+    mat = bpy.data.materials.new(key)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    bsdf = nt.nodes.get("Principled BSDF")
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    tex.image = img
+    tex.location = (-300, 200)
+    if bsdf is not None:
+        nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+        # use texture alpha for transparency if the image has it
+        if img.channels == 4:
+            alpha_in = bsdf.inputs.get("Alpha")
+            if alpha_in is not None:
+                nt.links.new(tex.outputs["Alpha"], alpha_in)
+            try:
+                mat.blend_method = "HASHED"
+            except (AttributeError, TypeError):
+                pass
+    return mat
 
 
 # ----------------------------------------------------------------------------
@@ -354,7 +726,8 @@ def compute_joint_pivots(player_rig, D, c0c1, scale):
 # ----------------------------------------------------------------------------
 # Armature + skinned mesh
 # ----------------------------------------------------------------------------
-def build_player(player_rig, label, scale, collection, log, force_standard_r6=True):
+def build_player(player_rig, label, scale, collection, log, force_standard_r6=True,
+                 assets=None, import_meshes=False):
     parts = [p for p in player_rig.get("parts", []) if p.get("name")]
     if not parts:
         log("  no parts in rig — skipping player")
@@ -494,32 +867,67 @@ def build_player(player_rig, label, scale, collection, log, force_standard_r6=Tr
     # ---- combined skinned mesh ----
     mesh = bpy.data.meshes.new(label + "_mesh")
     bm = bmesh.new()
+    uv_layer = bm.loops.layers.uv.verify()
     groups = []
     mat_index = {}
     materials = []
     skipped_parts = []
+    mesh_stats = {"real": 0, "box": 0, "tex": 0}
 
     for p in parts:
         name = p["name"]
         if name not in R:
             skipped_parts.append((name, "bone missing from R"))
             continue
-        if float(p.get("transparency", 0.0)) >= 0.999:
-            skipped_parts.append((name, "transparency>=0.999 (bone kept, geom skipped)"))
+        # Fully-transparent parts that carry NO mesh (e.g. HumanoidRootPart) are
+        # geometry-skipped but keep their bone. A transparent part that DOES
+        # carry a mesh (some accessories) is still drawn — its texture decides
+        # visibility.
+        if float(p.get("transparency", 0.0)) >= 0.999 and not p.get("meshId"):
+            skipped_parts.append((name, "transparency>=0.999, no mesh (bone kept)"))
             continue
         place = D.get(name, Matrix.Identity(4))
-        verts = _add_part_geometry(bm, p, place, scale)
+
+        # try real mesh + texture, fall back to box
+        mesh_data = None
+        img_path = None
+        if import_meshes and assets is not None:
+            if p.get("meshId"):
+                mesh_data = assets.get_mesh(p.get("meshId"))
+            tex_ref = p.get("textureId") or p.get("colorMap")
+            if tex_ref:
+                img_path = assets.get_image_path(tex_ref)
+
+        verts = None
+        if mesh_data:
+            verts = _add_mesh_geometry(bm, uv_layer, mesh_data, place, p, scale)
+        if verts:
+            mesh_stats["real"] += 1
+        else:
+            verts = _add_part_geometry(bm, p, place, scale)
+            mesh_stats["box"] += 1
         if not verts:
             skipped_parts.append((name, "no verts produced"))
             continue
         groups.append((name, verts))
 
-        key = "{}|{}".format(p.get("color", [0.7, 0.7, 0.7]),
-                             p.get("transparency", 0.0))
+        # material: textured if we have an image, else flat color
+        if img_path:
+            key = "tex|" + os.path.basename(img_path)
+            mesh_stats["tex"] += 1
+        else:
+            key = "{}|{}".format(p.get("color", [0.7, 0.7, 0.7]),
+                                 p.get("transparency", 0.0))
         if key not in mat_index:
             mat_index[key] = len(materials)
-            materials.append(_color_material(p.get("color", [0.7, 0.7, 0.7]),
-                                             float(p.get("transparency", 0.0))))
+            if img_path:
+                materials.append(_image_material(
+                    name, img_path, p.get("color", [0.7, 0.7, 0.7]),
+                    float(p.get("transparency", 0.0)), log))
+            else:
+                materials.append(_color_material(
+                    p.get("color", [0.7, 0.7, 0.7]),
+                    float(p.get("transparency", 0.0))))
         idx = mat_index[key]
         faces = set()
         for v in verts:
@@ -553,6 +961,8 @@ def build_player(player_rig, label, scale, collection, log, force_standard_r6=Tr
             log("    {}: {}".format(name, reason))
     log("  mesh build — verts={} mats={} vertex_groups={}".format(
         len(mesh.vertices), len(materials), len(mesh_obj.vertex_groups)))
+    log("  geometry — real meshes={} boxes={} textured={}".format(
+        mesh_stats["real"], mesh_stats["box"], mesh_stats["tex"]))
 
     return {
         "arm": arm_obj,
@@ -580,7 +990,8 @@ def _short_matrix(m):
 
 
 def import_replay(context, filepath, scale, set_fps, build_armature,
-                  force_standard_r6, debug, report):
+                  force_standard_r6, import_meshes, roblosecurity, cache_dir,
+                  debug, report):
     log_lines = []
     log_path = None
     if debug:
@@ -606,6 +1017,8 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     log("file:  {}".format(filepath))
     log("scale: {}  set_fps: {}  build_armature: {}  force_standard_r6: {}".format(
         scale, set_fps, build_armature, force_standard_r6))
+    log("import_meshes: {}  cookie: {}".format(
+        import_meshes, "set" if (roblosecurity or "").strip() else "none"))
 
     try:
         fh = open(filepath, "r", encoding="utf-8")
@@ -663,6 +1076,14 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     rig_data = load_rig_file(filepath, header, log)
     rig_players = (rig_data or {}).get("players", {})
     log("rig players: {}".format(list(rig_players.keys())))
+
+    # asset fetcher (meshes + textures). Default cache dir sits next to the .rec.
+    assets = None
+    if import_meshes:
+        if not cache_dir or not cache_dir.strip():
+            cache_dir = os.path.join(os.path.dirname(filepath), "rocorder_assets")
+        log("asset cache dir: {}".format(cache_dir))
+        assets = AssetFetcher(cache_dir, roblosecurity, log)
 
     scene = context.scene
     if set_fps:
@@ -725,7 +1146,8 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
             rig.get("rigType"), len(rig.get("parts", [])), len(rig.get("joints", []))))
         built = build_player(rig, _player_label(roster, uid), scale,
                              player_coll(uid), log,
-                             force_standard_r6=force_standard_r6)
+                             force_standard_r6=force_standard_r6,
+                             assets=assets, import_meshes=import_meshes)
         if built is None:
             return None
         built["last_quat"] = {}
@@ -934,6 +1356,12 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
         for b, c in sorted_kc[:5]:
             log("    {}: {}".format(b, c))
 
+    if assets is not None:
+        log("")
+        log("assets: {} downloaded, {} cache hits, {} fails".format(
+            assets.stats["downloads"], assets.stats["cache_hits"],
+            assets.stats["fails"]))
+
     log("")
     log("totals: armatures={} fallback_objs={} cameras={} frames={} "
         "keyframes={} bone_keys={} camera_keys={}".format(
@@ -987,12 +1415,38 @@ class IMPORT_OT_rocorder(Operator, ImportHelper):
                     "No effect on R15 or custom rigs",
         default=True,
     )
+    import_meshes: BoolProperty(
+        name="Import meshes & textures",
+        description="Download each part's real mesh + texture from Roblox's "
+                    "CDN and build proper geometry instead of colored boxes. "
+                    "Covers body MeshParts, accessories, hats, and held tools. "
+                    "Assets are cached on disk so re-imports are instant. "
+                    "Anything that can't be fetched falls back to a box",
+        default=True,
+    )
+    roblosecurity: StringProperty(
+        name=".ROBLOSECURITY (optional)",
+        description="Optional Roblox auth cookie. Leave blank for public "
+                    "assets (covers almost everything). Only needed for gated "
+                    "assets that refuse anonymous download. SECURITY: this is "
+                    "your account session token — only paste it if you "
+                    "understand the risk; it is passed to Roblox's CDN only",
+        default="",
+        subtype="PASSWORD",
+    )
+    asset_cache_dir: StringProperty(
+        name="Asset cache folder",
+        description="Where downloaded meshes/textures are cached. Leave blank "
+                    "to use a 'rocorder_assets' folder next to the .rec",
+        default="",
+        subtype="DIR_PATH",
+    )
     debug: BoolProperty(
         name="Write debug log",
         description="Write a verbose .import.log next to the .rec listing the "
-                    "rig structure, bones created, mesh build, keyframe counts "
-                    "per bone, and any anomalies. Recommended while diagnosing "
-                    "rig issues",
+                    "rig structure, bones created, mesh build, asset fetches, "
+                    "keyframe counts per bone, and any anomalies. Recommended "
+                    "while diagnosing rig issues",
         default=True,
     )
 
@@ -1000,7 +1454,9 @@ class IMPORT_OT_rocorder(Operator, ImportHelper):
         return import_replay(
             context, self.filepath, self.scale,
             self.set_scene_fps, self.build_armature,
-            self.force_standard_r6, self.debug, self.report,
+            self.force_standard_r6, self.import_meshes,
+            self.roblosecurity, self.asset_cache_dir,
+            self.debug, self.report,
         )
 
 

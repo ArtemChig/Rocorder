@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.3.2-alpha"
+local ROCORDER_VERSION = "1.4.0-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -252,6 +252,61 @@ end
 ----------------------------------------------------------------
 -- Rig capture
 ----------------------------------------------------------------
+-- Pull every asset reference + geometry hint off a single BasePart so the
+-- Blender importer can fetch the real mesh + texture instead of a box.
+-- Handles MeshPart (MeshId/TextureID/SurfaceAppearance) AND legacy
+-- Part+SpecialMesh hats/gear (SpecialMesh.MeshId/TextureId/Scale).
+local function partInfo(part, boneName)
+    local cf = part.CFrame
+    local info = {
+        name         = boneName,
+        className    = part.ClassName,
+        size         = { part.Size.X, part.Size.Y, part.Size.Z },
+        color        = { part.Color.R, part.Color.G, part.Color.B },
+        transparency = part.Transparency,
+        restCFrame   = { cf:GetComponents() },
+    }
+    if part:IsA("Part") then
+        info.shape = part.Shape.Name
+    elseif part:IsA("MeshPart") then
+        info.shape = "MeshPart"
+        local ok, m = pcall(function() return part.MeshId end)
+        if ok and m and m ~= "" then info.meshId = m end
+        local ok2, tx = pcall(function() return part.TextureID end)
+        if ok2 and tx and tx ~= "" then info.textureId = tx end
+    elseif part:IsA("WedgePart") then
+        info.shape = "Wedge"
+    else
+        info.shape = "Block"
+    end
+
+    -- legacy SpecialMesh (Part-based hats/tools): MeshId/TextureId/Scale
+    local sm = part:FindFirstChildOfClass("SpecialMesh")
+        or part:FindFirstChildOfClass("FileMesh")
+    if sm then
+        local ok, mid = pcall(function() return sm.MeshId end)
+        if ok and mid and mid ~= "" then info.meshId = mid; info.shape = "FileMesh" end
+        local ok2, tid = pcall(function() return sm.TextureId end)
+        if ok2 and tid and tid ~= "" then info.textureId = tid end
+        local oksc, sc = pcall(function() return sm.Scale end)
+        if oksc and sc then info.meshScale = { sc.X, sc.Y, sc.Z } end
+    end
+
+    -- SurfaceAppearance PBR color map (modern layered clothing / accessories)
+    local sa = part:FindFirstChildOfClass("SurfaceAppearance")
+    if sa then
+        local ok, cm = pcall(function() return sa.ColorMap end)
+        if ok and cm and cm ~= "" then info.colorMap = cm end
+    end
+    return info
+end
+
+-- Deep-scan a character into an ordered part list. Direct-child BaseParts
+-- come first (these are the rig body parts that Motor6D joints reference by
+-- name); everything else attached (accessory Handles, tool parts, nested
+-- meshes) follows. Returns rig (parts + joints) and refs = { {name, inst}, ... }
+-- where `inst` is a live Instance reference (so duplicate-named accessory
+-- parts each resolve to the right object every tick).
 local function captureRig(player)
     local char = player.Character
     if not char then return nil end
@@ -269,45 +324,48 @@ local function captureRig(player)
         elseif humanoid.RigType == Enum.HumanoidRigType.R6 then rig.rigType = "R6" end
     end
 
-    local order = {}
+    local refs = {}
+    local used = {}
+    local function uniqueName(raw)
+        local nm = sanitizeName(raw)
+        local cand, i = nm, 1
+        while used[cand] do i = i + 1; cand = nm .. "_" .. i end
+        used[cand] = true
+        return cand
+    end
+
+    local directSet = {}
     for _, child in ipairs(char:GetChildren()) do
         if child:IsA("BasePart") then
-            local cf = child.CFrame
-            local info = {
-                name         = sanitizeName(child.Name),
-                className    = child.ClassName,
-                size         = { child.Size.X, child.Size.Y, child.Size.Z },
-                color        = { child.Color.R, child.Color.G, child.Color.B },
-                transparency = child.Transparency,
-                restCFrame   = { cf:GetComponents() },
-            }
-            if child:IsA("Part") then info.shape = child.Shape.Name
-            elseif child:IsA("MeshPart") then
-                info.shape = "MeshPart"
-                local ok, m = pcall(function() return child.MeshId end)
-                if ok and m and m ~= "" then info.meshId = m end
-                local ok2, tx = pcall(function() return child.TextureID end)
-                if ok2 and tx and tx ~= "" then info.textureId = tx end
-            else info.shape = "Block" end
-            rig.parts[#rig.parts + 1] = info
-            order[#order + 1] = child.Name
+            directSet[child] = true
+            local nm = uniqueName(child.Name)
+            rig.parts[#rig.parts + 1] = partInfo(child, nm)
+            refs[#refs + 1] = { name = nm, inst = child }
         end
     end
     for _, desc in ipairs(char:GetDescendants()) do
-        if desc:IsA("Motor6D") then
-            local p0, p1 = desc.Part0, desc.Part1
+        if desc:IsA("BasePart") and not directSet[desc] then
+            local nm = uniqueName(desc.Name)
+            rig.parts[#rig.parts + 1] = partInfo(desc, nm)
+            refs[#refs + 1] = { name = nm, inst = desc }
+        end
+    end
+
+    for _, dsc in ipairs(char:GetDescendants()) do
+        if dsc:IsA("Motor6D") then
+            local p0, p1 = dsc.Part0, dsc.Part1
             if p0 and p1 then
                 rig.joints[#rig.joints + 1] = {
-                    name  = desc.Name,
+                    name  = dsc.Name,
                     part0 = sanitizeName(p0.Name),
                     part1 = sanitizeName(p1.Name),
-                    c0    = { desc.C0:GetComponents() },
-                    c1    = { desc.C1:GetComponents() },
+                    c0    = { dsc.C0:GetComponents() },
+                    c1    = { dsc.C1:GetComponents() },
                 }
             end
         end
     end
-    return rig, order
+    return rig, refs
 end
 
 ----------------------------------------------------------------
@@ -334,11 +392,69 @@ function Tracker:_makeEncoder(posPrec, rotPrec)
     end
 end
 
+-- Re-scan for newly-attached parts (a tool/accessory equipped mid-recording)
+-- and append them. Only APPENDS — never reorders/removes — so the positional
+-- frame indices stay aligned (new parts simply have no keyframes before they
+-- appeared, exactly like a late-joining player).
+function Tracker:_appendNewParts(entry, char, encode, debugLog)
+    local used = {}
+    for _, r in ipairs(entry.refs) do used[r.name] = true end
+    local function uniqueName(raw)
+        local nm = sanitizeName(raw)
+        local cand, i = nm, 1
+        while used[cand] do i = i + 1; cand = nm .. "_" .. i end
+        used[cand] = true
+        return cand
+    end
+    local added = 0
+    for _, desc in ipairs(char:GetDescendants()) do
+        if desc:IsA("BasePart") and not entry.known[desc] then
+            entry.known[desc] = true
+            local nm = uniqueName(desc.Name)
+            local idx = #entry.refs + 1
+            entry.refs[idx] = { name = nm, inst = desc }
+            entry.rig.parts[idx] = partInfo(desc, nm)
+            entry.last[idx] = encode(desc.CFrame)
+            added += 1
+            if debugLog then
+                debugLog(fmt("uid=%d part[%d] %s ATTACHED mid-recording (%s)",
+                    entry.uid, idx - 1, nm, entry.rig.parts[idx].shape or "?"))
+            end
+        end
+    end
+    return added
+end
+
+-- Rebuild the part references after a respawn (new Character = new Instances).
+-- Re-captures the new character, then re-points each existing index's `inst`
+-- by name so frame indices stay aligned; genuinely new parts are appended.
+function Tracker:_rebuildRefs(entry, player, encode, debugLog)
+    local ok, _rig, refs = pcall(captureRig, player)
+    if not ok or not refs then return end
+    local byName = {}
+    for _, r in ipairs(refs) do byName[r.name] = r.inst end
+    -- re-point existing
+    for _, r in ipairs(entry.refs) do
+        r.inst = byName[r.name]  -- nil if that part no longer exists
+    end
+    -- rebuild known-set + append any new parts
+    entry.known = {}
+    for _, r in ipairs(entry.refs) do
+        if r.inst then entry.known[r.inst] = true end
+    end
+    entry.char = player.Character
+    self:_appendNewParts(entry, player.Character, encode, debugLog)
+    if debugLog then
+        debugLog(fmt("uid=%d refs rebuilt after respawn (%d parts)",
+            entry.uid, #entry.refs))
+    end
+end
+
 function Tracker:ensure(player, encode, debugLog)
     local uid = player.UserId
     if self.tracked[uid] then return self.tracked[uid] end
     if not player.Character then return nil end
-    local ok, rig, order = pcall(captureRig, player)
+    local ok, rig, refs = pcall(captureRig, player)
     if not ok or not rig then
         if debugLog then
             debugLog(fmt("captureRig FAILED for uid=%d (%s) err=%s",
@@ -347,32 +463,35 @@ function Tracker:ensure(player, encode, debugLog)
         return nil
     end
     local entry = {
-        rig = rig, order = order, last = {},
+        uid = uid, rig = rig, refs = refs, last = {},
+        char = player.Character, known = {},
         ticks = 0, culledTicks = 0,
         hadChar = true, partLost = {}, rangeIn = true,
+        lastScanClock = os.clock(),
     }
-    local char = player.Character
-    for i, raw in ipairs(order) do
-        local p = char:FindFirstChild(raw)
-        entry.last[i] = (p and p:IsA("BasePart")) and encode(p.CFrame) or "0,0,0,0,0,0,1"
-        if not p then entry.partLost[i] = true end
+    for i, r in ipairs(refs) do
+        if r.inst then entry.known[r.inst] = true end
+        entry.last[i] = (r.inst and r.inst:IsA("BasePart"))
+            and encode(r.inst.CFrame) or "0,0,0,0,0,0,1"
+        if not r.inst then entry.partLost[i] = true end
     end
     self.tracked[uid] = entry
     if debugLog then
-        debugLog(fmt("ENSURE uid=%d name=%s display=%s rigType=%s parts=%d joints=%d",
-            uid, player.Name, player.DisplayName, rig.rigType, #rig.parts, #rig.joints))
+        local meshes = 0
+        for _, p in ipairs(rig.parts) do if p.meshId then meshes += 1 end end
+        debugLog(fmt("ENSURE uid=%d name=%s display=%s rigType=%s parts=%d joints=%d meshes=%d",
+            uid, player.Name, player.DisplayName, rig.rigType,
+            #rig.parts, #rig.joints, meshes))
         local lines = {}
         for i, p in ipairs(rig.parts) do
-            lines[#lines+1] = fmt("  [%d] %s shape=%s transparency=%.3f size=(%.2f,%.2f,%.2f)",
+            lines[#lines+1] = fmt(
+                "  [%d] %s shape=%s transparency=%.3f size=(%.2f,%.2f,%.2f)%s%s",
                 i-1, p.name, p.shape or "?", p.transparency or 0,
-                p.size[1], p.size[2], p.size[3])
+                p.size[1], p.size[2], p.size[3],
+                p.meshId and (" mesh=" .. p.meshId) or "",
+                p.textureId and (" tex=" .. p.textureId) or "")
         end
         debugLog("  parts:\n" .. table.concat(lines, "\n"))
-        local jl = {}
-        for _, j in ipairs(rig.joints) do
-            jl[#jl+1] = fmt("    %s: %s -> %s", j.name, j.part0, j.part1)
-        end
-        debugLog("  joints:\n" .. table.concat(jl, "\n"))
     end
     return entry
 end
@@ -384,6 +503,7 @@ function Tracker:snapshot(cfg, encode, debugLog)
     if cam then cameraPos = cam.CFrame.Position end
     local maxDistSq = cfg.MAX_DISTANCE > 0 and (cfg.MAX_DISTANCE * cfg.MAX_DISTANCE) or nil
     local localPlayer = Players.LocalPlayer
+    local now = os.clock()
 
     for _, p in ipairs(Players:GetPlayers()) do
         if cfg.INCLUDE_LOCAL or p ~= localPlayer then
@@ -391,10 +511,22 @@ function Tracker:snapshot(cfg, encode, debugLog)
             if entry then
                 local char = p.Character
                 local hasChar = char ~= nil
-                if hasChar ~= entry.hadChar and debugLog then
-                    debugLog(fmt("uid=%d character %s", p.UserId,
-                        hasChar and "REGAINED" or "LOST"))
+                if hasChar ~= entry.hadChar then
+                    if debugLog then
+                        debugLog(fmt("uid=%d character %s", p.UserId,
+                            hasChar and "REGAINED" or "LOST"))
+                    end
                     entry.hadChar = hasChar
+                end
+
+                -- respawn / avatar swap: Character identity changed -> rebuild refs
+                if hasChar and char ~= entry.char then
+                    self:_rebuildRefs(entry, p, encode, debugLog)
+                end
+                -- mid-recording equip: throttled append-scan (~1/s)
+                if hasChar and now - entry.lastScanClock >= 1.0 then
+                    entry.lastScanClock = now
+                    self:_appendNewParts(entry, char, encode, debugLog)
                 end
 
                 local inRange = true
@@ -413,15 +545,18 @@ function Tracker:snapshot(cfg, encode, debugLog)
 
                 if inRange then
                     local parts = {}
-                    for i, raw in ipairs(entry.order) do
+                    for i, r in ipairs(entry.refs) do
                         local s
-                        local pt = char and char:FindFirstChild(raw)
-                        local lost = not (pt and pt:IsA("BasePart"))
-                        if not lost then s = encode(pt.CFrame); entry.last[i] = s
-                        else s = entry.last[i] end
+                        local pt = r.inst
+                        local lost = not (pt and pt.Parent and pt:IsA("BasePart"))
+                        if not lost then
+                            s = encode(pt.CFrame); entry.last[i] = s
+                        else
+                            s = entry.last[i] or "0,0,0,0,0,0,1"
+                        end
                         if lost ~= entry.partLost[i] and debugLog then
                             debugLog(fmt("uid=%d part[%d] %s %s", p.UserId, i-1,
-                                entry.rig.parts[i].name,
+                                (entry.rig.parts[i] and entry.rig.parts[i].name) or "?",
                                 lost and "LOST (using cache)" or "REGAINED"))
                             entry.partLost[i] = lost
                         end

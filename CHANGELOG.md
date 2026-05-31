@@ -9,6 +9,38 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.4.0-alpha — 2026-05-31
+
+Real meshes + textures + accessories/tools. This is the big one: the Blender
+scene now reflects what you actually see in-game, not colored boxes. Formats
+stay `ROCORDER/3` / `ROCORDER-RIG/2` (rig gains backward-compatible fields), so
+older recordings still import and pre-1.4 importers still read 1.4 recordings.
+
+- **Whole-character capture (recorder)** — the recorder now deep-scans the
+  entire character, not just direct body parts. Accessories, hats, and
+  **held tools / equipped items** are all captured and animated. Each part
+  keeps a live Instance reference (so duplicate-named accessory parts resolve
+  correctly), and a throttled re-scan picks up items equipped mid-recording.
+  For every part it records `MeshId`, `TextureID`, `SurfaceAppearance.ColorMap`,
+  and legacy `SpecialMesh` MeshId/TextureId/Scale.
+- **Mesh + texture import (importer)** — new **"Import meshes & textures"**
+  option (default on). For each part the importer downloads the real Roblox
+  mesh and texture from the CDN, builds proper UV-mapped geometry scaled to the
+  part's size, and binds it to the bone exactly like the box version. Works for
+  any game — it's all driven by the asset IDs in the recording.
+  - Supports Roblox mesh formats v1.x (text), v2.x, v3.x; v4+/skinned are
+    best-effort. Anything that can't be fetched or parsed falls back to a box
+    and is logged.
+  - Assets are cached on disk (`rocorder_assets/` next to the .rec by default,
+    or a folder you choose) so re-imports are instant and assets shared across
+    players download once.
+  - Optional **.ROBLOSECURITY** field for gated assets (blank by default;
+    public assets cover almost everything). Stored as a password field with a
+    security note.
+- **Diagnostics** — the import log now reports per-player real-mesh / box /
+  textured counts, every asset fetch, mesh versions encountered, and
+  download / cache-hit / fail tallies, so mismatches are easy to trace.
+
 ## 1.3.2-alpha — 2026-05-30
 
 - **Fix**: importing a recording that includes camera data crashed with
