@@ -9,6 +9,24 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.7.1-alpha — 2026-05-31
+
+1.7.0 added `getcustomasset` support but the next log showed `via
+getcustomasset` never appearing — Xeno returns a path my `readfile` shapes
+didn't match, and I was guessing without proof. This release stops guessing.
+
+- **Diagnose what `getcustomasset` actually returns.** The recorder now logs
+  the FIRST `getcustomasset`/`getsynasset` return value verbatim (`DIAG: ...`)
+  so we can see exactly what path Xeno hands back, and tries every common
+  shape (`rbxasset://...` as-is, prefix-stripped, `asset_<id>.bin`, bare id)
+  before giving up.
+- **Probe more readers.** Added `readasset` and an `Xeno.getAssetBytes`
+  hook; the startup line now reports availability of every reader name so
+  we know what this executor exposes.
+
+Patch bump 1.7.0 → 1.7.1-alpha (diagnostics + extra probes, same external
+behavior).
+
 ## 1.7.0-alpha — 2026-05-31
 
 The 1.6.3 log showed the validator + 4-endpoint fallback got 13/25 assets
