@@ -12,11 +12,14 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.7.1-alpha"
+local ROCORDER_VERSION = "1.7.2-alpha"
 
 if _G.ROCORDER then
+    print("[ROCORDER] reload guard: tearing down previous instance v"
+        .. tostring(_G.ROCORDER.version or "?"))
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
     if _G.ROCORDER._destroy then pcall(function() _G.ROCORDER:_destroy() end) end
+    _G.ROCORDER = nil
 end
 
 local Players            = game:GetService("Players")
@@ -74,42 +77,62 @@ local readAsset       = readasset           -- some forks
 local getAssetBytes   = (Xeno and Xeno.getAssetBytes) or get_asset_bytes
 local _diagPrinted    = false
 
--- Try every in-memory path we know about. dbg() the first response so the
--- next debug log shows EXACTLY what the executor returned — this is the
--- info we need to map the path correctly per executor.
+-- Try every in-memory path we know about. The DIAG on first call now ALWAYS
+-- prints — success, error, or wrong type — so we can see what the executor
+-- actually does. The previous version hid failures, which is why the log
+-- showed no DIAG line at all even though getcustomasset=yes.
 local function readFromContentProvider(assetId, dbg)
     local rbxUrl = "rbxassetid://" .. assetId
-    -- 1) Direct bytes getter.
+
+    -- 1) Direct bytes getters.
     for fname, fn in pairs({
         readcustomasset = readCustomAsset, readasset = readAsset,
         getAssetBytes   = getAssetBytes,
     }) do
         if fn then
             local ok, data = pcall(fn, rbxUrl)
+            if not _diagPrinted and dbg then
+                _diagPrinted = true
+                if ok then
+                    dbg(fmt("  DIAG: %s(%s) -> type=%s len=%s",
+                        fname, rbxUrl, type(data),
+                        tostring(type(data) == "string" and #data)))
+                else
+                    dbg(fmt("  DIAG: %s(%s) -> ERRORED: %s",
+                        fname, rbxUrl, tostring(data)))
+                end
+            end
             if ok and type(data) == "string" and #data > 0 then
                 return data, fname
             end
         end
     end
 
-    -- 2) Path-returning forms. Diagnose the FIRST one so we can see what
-    --    the returned path actually looks like on this executor.
+    -- 2) Path-returning forms.
     for fname, fn in pairs({
         getcustomasset = getCustomAsset, getsynasset = getSynAsset,
     }) do
         if fn then
             local ok, localPath = pcall(fn, rbxUrl)
-            if ok and type(localPath) == "string" and #localPath > 0 then
-                if not _diagPrinted and dbg then
-                    _diagPrinted = true
-                    dbg(fmt("  DIAG: %s('rbxassetid://%s') -> %s",
-                        fname, assetId, localPath:sub(1, 200)))
+            if not _diagPrinted and dbg then
+                _diagPrinted = true
+                if ok then
+                    local typ = type(localPath)
+                    local sample = (typ == "string") and localPath:sub(1, 200) or "<not string>"
+                    dbg(fmt("  DIAG: %s(%s) -> type=%s value='%s'",
+                        fname, rbxUrl, typ, sample))
+                else
+                    dbg(fmt("  DIAG: %s(%s) -> ERRORED: %s",
+                        fname, rbxUrl, tostring(localPath)))
                 end
+            end
+            if ok and type(localPath) == "string" and #localPath > 0 then
                 if readfile then
-                    -- The returned path can be:
+                    -- The returned path could be:
                     --   "rbxasset://Xeno/asset_<id>.bin"
                     --   "rbxasset://temp/<file>"
                     --   "rbxasset://<file>"
+                    --   "content://..."
                     --   raw filesystem path
                     -- Try all common shapes — first reader to succeed wins.
                     local candidates = { localPath }
@@ -117,20 +140,22 @@ local function readFromContentProvider(assetId, dbg)
                     if stripped ~= localPath then
                         candidates[#candidates + 1] = stripped
                     end
-                    -- Xeno wraps via getcustomasset by copying into the workspace
-                    -- under a name like "asset_<id>.bin" — try that explicit name.
                     candidates[#candidates + 1] = "asset_" .. assetId .. ".bin"
                     candidates[#candidates + 1] = assetId
                     for _, p in ipairs(candidates) do
                         local okr, data = pcall(readfile, p)
                         if okr and type(data) == "string" and #data > 0 then
+                            if dbg then
+                                dbg(fmt("  DIAG: SUCCESS via %s using readfile('%s') %d bytes",
+                                    fname, p:sub(1, 80), #data))
+                            end
                             return data, fname .. ":" .. p:sub(1, 60)
                         end
                     end
-                    if not _diagPrinted and dbg then
-                        dbg(fmt("  DIAG: readfile failed for every candidate "
-                            .. "of %s — tried %d shapes",
-                            localPath:sub(1, 80), #candidates))
+                    if dbg then
+                        dbg(fmt("  DIAG: %s returned '%s' but readfile failed "
+                            .. "for all %d candidate shapes for asset %s",
+                            fname, localPath:sub(1, 80), #candidates, assetId))
                     end
                 end
             end
@@ -1143,6 +1168,18 @@ end
 -- anonymous CDN. `logSink` is the just-finished session (for its debug log).
 function rec:_downloadAssets(logSink)
     if not self.cfg.DOWNLOAD_ASSETS then return end
+    -- Concurrency guard: prevent the dual-download bug where a re-loaded
+    -- recorder's reload-guard Stop() races the user's F8 Stop() and both
+    -- kick off this function in parallel (you'd see every asset downloaded
+    -- twice in the log and "ASSET DOWNLOAD start/done" appearing twice).
+    if _G.ROCORDER_ASSETS_RUNNING then
+        if logSink and logSink.debugEnabled then
+            logSink:debugLog("ASSET DOWNLOAD already running — skipping duplicate call")
+            logSink:flushDebug()
+        end
+        return
+    end
+    _G.ROCORDER_ASSETS_RUNNING = true
 
     local ids = {}
     for _, e in pairs(self.tracker.tracked) do collectAssetIds(e.rig, ids) end
@@ -1311,6 +1348,7 @@ function rec:_downloadAssets(logSink)
         notify("ROCORDER",
             fmt("Assets: %d saved, %d cached, %d failed%s", okc, skipc, failc,
                 #missing > 0 and "\nSee ROCORDER/assets/_missing.txt" or ""), 6)
+        _G.ROCORDER_ASSETS_RUNNING = nil
     end)
 end
 
