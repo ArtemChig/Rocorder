@@ -9,6 +9,29 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.7.2-alpha — 2026-05-31
+
+Three real bugs caught from a single debug log.
+
+- **Fix: dual asset download.** The log showed `ASSET DOWNLOAD start` twice
+  with two different message formats (one 1.7.0 wording, one 1.7.1) and
+  every asset downloaded twice. A re-loaded recorder's reload-guard
+  `Stop()` was racing the user's F8 Stop, both kicking off the asset
+  coroutine in parallel. `_downloadAssets` now uses a `_G` flag as a
+  concurrency guard and refuses to start while one is already running.
+- **Fix: `DIAG:` was invisible on failure.** The 1.7.1 diagnostic was
+  nested inside the success branch, so when `getcustomasset` returned
+  `nil` / wrong type / errored, the log showed nothing — defeating the
+  whole point. The DIAG now ALWAYS prints on the first call (success,
+  empty, wrong-type, or `pcall` error) so we can finally see what the
+  executor does. A `SUCCESS via ... readfile('...')` line also prints
+  when a candidate path works, so the winning shape is auditable.
+- **Reload-guard visibility.** The reload guard now prints which
+  previous-version instance it tore down, so "did the new version load?"
+  is answerable from the system console without guessing.
+
+Patch bump 1.7.1 → 1.7.2-alpha.
+
 ## 1.7.1-alpha — 2026-05-31
 
 1.7.0 added `getcustomasset` support but the next log showed `via
