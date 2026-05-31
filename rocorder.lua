@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.6.1-alpha"
+local ROCORDER_VERSION = "1.6.2-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -645,6 +645,7 @@ function Tracker:snapshot(cfg, encode, debugLog)
                     end
                     entries[#entries+1] = tostring(p.UserId) .. ":" .. table.concat(parts, "|")
                     entry.ticks += 1
+                    entry.lastSeenClock = now  -- for per-session rig filtering
                 else
                     entry.culledTicks += 1
                 end
@@ -654,7 +655,12 @@ function Tracker:snapshot(cfg, encode, debugLog)
     return entries
 end
 
-function Tracker:rigData(filenameForRef)
+-- Build the rig payload. `sinceClock` (optional) excludes players not seen
+-- since that clock time — the tracker persists across recordings (for Instant
+-- Replay), so without this filter a recording's rig would include stale players
+-- from earlier sessions who have NO frames in this .rec (they import as a
+-- frozen pile of boxes at the origin).
+function Tracker:rigData(filenameForRef, sinceClock)
     local data = {
         format = "ROCORDER-RIG/2",
         recFile = filenameForRef,
@@ -663,8 +669,10 @@ function Tracker:rigData(filenameForRef)
     }
     local n = 0
     for uid, e in pairs(self.tracked) do
-        data.players[tostring(uid)] = e.rig
-        n += 1
+        if (not sinceClock) or (e.lastSeenClock and e.lastSeenClock >= sinceClock) then
+            data.players[tostring(uid)] = e.rig
+            n += 1
+        end
     end
     return data, n
 end
@@ -1073,6 +1081,29 @@ function rec:_downloadAssets(logSink)
         end
     end
 
+    -- Reject error-page bodies. game:HttpGet (and some request impls) return
+    -- the 401/403 error TEXT as a normal string for non-2xx responses; saving
+    -- that as the asset file produced "meshes" that silently fell back to a box
+    -- on import. A real mesh starts with "version "; images start with a binary
+    -- magic. Anything that looks like JSON/HTML/an error message is rejected.
+    local function looksLikeAsset(b)
+        if type(b) ~= "string" or #b < 64 then return false end
+        local head = b:sub(1, 8)
+        if head:sub(1, 8) == "version " then return true end          -- Roblox mesh
+        local b0, b1 = string.byte(b, 1, 2)
+        if b0 == 0x89 or b0 == 0xFF or b0 == 0x47 or b0 == 0x42 then    -- PNG/JPG/GIF/BMP/DDS
+            return true
+        end
+        local first = b:sub(1, 1)
+        if first == "{" or first == "<" then return false end          -- JSON / XML / HTML
+        local probe = b:sub(1, 256)
+        if probe:find("Unauthorized") or probe:find("Forbidden")
+            or probe:find("InsufficientPermission") or probe:find("\"errors\"") then
+            return false
+        end
+        return true  -- unknown-but-binary; let the importer decide
+    end
+
     task.spawn(function()
         if not isfolder(ASSETS_FOLDER) then pcall(makefolder, ASSETS_FOLDER) end
         local okc, failc, skipc = 0, 0, 0
@@ -1082,7 +1113,24 @@ function rec:_downloadAssets(logSink)
 
         for _, id in ipairs(list) do
             local path = ASSETS_FOLDER .. "/" .. id
+
+            -- treat an existing file as cached ONLY if it's a real asset;
+            -- error-page files saved by older versions get re-downloaded.
+            local cached = false
             if isfile and isfile(path) then
+                if readfile then
+                    local okr, existing = pcall(readfile, path)
+                    if okr and looksLikeAsset(existing) then
+                        cached = true
+                    elseif delfile then
+                        pcall(delfile, path)  -- stale 401 body; replace it
+                    end
+                else
+                    cached = true  -- can't validate; trust it
+                end
+            end
+
+            if cached then
                 skipc += 1
             else
                 local url = "https://assetdelivery.roblox.com/v1/asset/?id=" .. id
@@ -1106,10 +1154,15 @@ function rec:_downloadAssets(logSink)
                     end
                 end
 
-                if body then
+                if body and looksLikeAsset(body) then
                     local okw = pcall(writefile, path, body)
                     if okw then okc += 1 else failc += 1 end
                 else
+                    -- don't save an error page as if it were the asset
+                    if body then
+                        dbg(fmt("  asset %s rejected (not a mesh/image — likely "
+                            .. "401/403 error body, %d bytes)", id, #body))
+                    end
                     failc += 1
                 end
             end
@@ -1128,16 +1181,20 @@ function rec:Stop()
     local s = self.session
     self.session = nil
     s:flush()
-    local data = self.tracker:rigData(s.filename)
+    -- only include players actually seen during THIS recording (the tracker
+    -- persists across sessions for Instant Replay)
+    local data, nPlayers = self.tracker:rigData(s.filename, s.startClock)
     s:writeRig(data)
     s:writeMeta()
     self:_invalidateRecordingsCache()
     if s.debugEnabled then
-        s:debugLog(fmt("STOP after %.2fs: ticks=%d stalls=%d gaps=%d",
-            s:elapsed(), s.tickCount, s.stallCount, s.gapCount))
+        s:debugLog(fmt("STOP after %.2fs: ticks=%d stalls=%d gaps=%d rigPlayers=%d",
+            s:elapsed(), s.tickCount, s.stallCount, s.gapCount, nPlayers))
         for uid, e in pairs(self.tracker.tracked) do
-            s:debugLog(fmt("  uid=%d (%s) ticks=%d culled=%d parts=%d joints=%d",
-                uid, e.rig.name, e.ticks, e.culledTicks, #e.rig.parts, #e.rig.joints))
+            if e.lastSeenClock and e.lastSeenClock >= s.startClock then
+                s:debugLog(fmt("  uid=%d (%s) ticks=%d culled=%d parts=%d joints=%d",
+                    uid, e.rig.name, e.ticks, e.culledTicks, #e.rig.parts, #e.rig.joints))
+            end
         end
         s:flushDebug()
     end
@@ -1159,7 +1216,8 @@ function rec:SaveReplay(seconds)
         return nil, "empty"
     end
     seconds = seconds or self.cfg.IR_BUFFER_SEC
-    local rigData = self.tracker:rigData("")
+    -- only players seen within the buffered window
+    local rigData = self.tracker:rigData("", os.clock() - (self.cfg.IR_BUFFER_SEC + 2))
     local saved, frames, secsOut = self.replay:save(FOLDER, self.cfg, rigData, seconds)
     if not saved then
         notify("ROCORDER", "Replay save failed: " .. tostring(frames), 5)
