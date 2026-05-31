@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.7.2-alpha"
+local ROCORDER_VERSION = "1.8.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -29,6 +29,7 @@ local StarterGui         = game:GetService("StarterGui")
 local HttpService        = game:GetService("HttpService")
 local TweenService       = game:GetService("TweenService")
 local MarketplaceService = game:GetService("MarketplaceService")
+local AssetService       = game:GetService("AssetService")
 
 local fmt = string.format
 
@@ -366,6 +367,210 @@ local function captureCameraStr(encode, posPrec)
 end
 
 ----------------------------------------------------------------
+-- Asset extractor — pull mesh/image bytes from the engine's loaded copy
+-- (EditableMesh / EditableImage) instead of asking the CDN. This works for
+-- any asset currently rendering in-game, including UGC the CDN refuses.
+----------------------------------------------------------------
+local EXTRACT_OK = typeof(AssetService.CreateEditableMeshAsync) == "function"
+              and typeof(AssetService.CreateEditableImageAsync) == "function"
+
+-- Asset IDs we've already attempted to extract this session (success or fail).
+-- Persisted in _G so it survives reloads.
+_G.ROCORDER_EXTRACTED = _G.ROCORDER_EXTRACTED or {}
+local EXTRACTED = _G.ROCORDER_EXTRACTED
+
+local function _assetIdFromRef(ref)
+    if not ref then return nil end
+    local s = tostring(ref)
+    return s:match("(%d%d%d%d+)")
+end
+
+local function _geomPath(id) return ASSETS_FOLDER .. "/" .. id .. ".geom.json" end
+local function _imgPath(id)  return ASSETS_FOLDER .. "/" .. id .. ".rgba"      end
+local function _binPath(id)  return ASSETS_FOLDER .. "/" .. id              end
+
+-- True if any form of this asset is already cached on disk.
+local function _isCached(id)
+    if not (isfile and id) then return false end
+    return isfile(_geomPath(id)) or isfile(_imgPath(id)) or isfile(_binPath(id))
+end
+
+-- Roblox sometimes hands us a Content userdata and sometimes a URL string.
+-- Normalize to whatever CreateEditable*Async accepts on this client version.
+local function _toContent(ref)
+    if typeof(ref) == "Content" then return ref end
+    if type(ref) == "string" then
+        if typeof(Content) == "table" or typeof(Content) == "userdata" then
+            -- Modern API: Content.fromUri(<rbxassetid://N>)
+            local ok, c = pcall(function() return Content.fromUri(ref) end)
+            if ok and c then return c end
+        end
+        return ref  -- last resort: pass the URL through
+    end
+    return ref
+end
+
+-- Extract mesh geometry from a BasePart that has a mesh (MeshPart or a Part
+-- with a SpecialMesh child). Returns a JSON-encodable table:
+--   { verts = {x,y,z, ...}, uvs = {u,v, ...},
+--     normals = {x,y,z, ...}, faces = {a,b,c, ...} }   (0-indexed)
+-- Or returns nil + reason string.
+local function extractMeshFromPart(part)
+    if not EXTRACT_OK then return nil, "EditableMesh API unavailable" end
+    local content
+    if part:IsA("MeshPart") then
+        local ok, mc = pcall(function() return part.MeshContent end)
+        if ok and mc then content = mc end
+        if not content then
+            local ok2, mid = pcall(function() return part.MeshId end)
+            if ok2 and mid and mid ~= "" then content = _toContent(mid) end
+        end
+    else
+        local sm = part:FindFirstChildOfClass("SpecialMesh")
+        if sm then
+            local ok, mid = pcall(function() return sm.MeshId end)
+            if ok and mid and mid ~= "" then content = _toContent(mid) end
+        end
+    end
+    if not content then return nil, "no mesh content on part" end
+
+    local okem, em = pcall(function()
+        return AssetService:CreateEditableMeshAsync(content)
+    end)
+    if not okem or not em then return nil, "CreateEditableMeshAsync: " .. tostring(em) end
+
+    local vids = em:GetVertices()
+    if not vids or #vids == 0 then return nil, "no vertices" end
+    local verts, uvs, normals = {}, {}, {}
+    local idMap = {}    -- engine-vertex-id -> 0-indexed slot
+    for i, vid in ipairs(vids) do
+        idMap[vid] = i - 1
+        local p = em:GetPosition(vid)
+        verts[#verts+1] = p.X; verts[#verts+1] = p.Y; verts[#verts+1] = p.Z
+        local okUV, uv = pcall(em.GetUV, em, vid)
+        if okUV and uv then
+            uvs[#uvs+1] = uv.X; uvs[#uvs+1] = uv.Y
+        else
+            uvs[#uvs+1] = 0; uvs[#uvs+1] = 0
+        end
+        local okN, n = pcall(em.GetNormal, em, vid)
+        if okN and n then
+            normals[#normals+1] = n.X; normals[#normals+1] = n.Y; normals[#normals+1] = n.Z
+        end
+    end
+
+    -- Faces (triangles). Method name varies by Roblox API revision.
+    local faces = {}
+    local fids
+    local okF = pcall(function() fids = em:GetFaces() end)
+    if not okF or not fids then
+        okF = pcall(function() fids = em:GetTriangles() end)
+    end
+    if okF and fids then
+        for _, fid in ipairs(fids) do
+            local fv
+            local okFV = pcall(function() fv = em:GetFaceVertices(fid) end)
+            if not okFV or not fv then
+                okFV = pcall(function() fv = { em:GetTriangleVertices(fid) } end)
+            end
+            if okFV and fv and #fv >= 3 then
+                local a, b, c = idMap[fv[1]], idMap[fv[2]], idMap[fv[3]]
+                if a and b and c then
+                    faces[#faces+1] = a; faces[#faces+1] = b; faces[#faces+1] = c
+                end
+            end
+        end
+    end
+    if #faces == 0 then return nil, "no faces produced" end
+
+    return {
+        format = "ROCORDER-GEOM/1",
+        verts = verts, uvs = uvs, normals = normals, faces = faces,
+    }
+end
+
+-- Extract an image to raw RGBA8 bytes + a small text header. Filename ends in
+-- .rgba so the importer reads it without sniffing. Returns header+bytes string
+-- or nil + reason.
+local function extractImageFromContent(ref)
+    if not EXTRACT_OK then return nil, "EditableImage API unavailable" end
+    local content = _toContent(ref)
+    if not content then return nil, "no content" end
+    local ok, ei = pcall(function()
+        return AssetService:CreateEditableImageAsync(content)
+    end)
+    if not ok or not ei then return nil, "CreateEditableImageAsync: " .. tostring(ei) end
+    local sz = ei.Size
+    local w, h = math.floor(sz.X), math.floor(sz.Y)
+    if w <= 0 or h <= 0 then return nil, "zero-size image" end
+    local okBuf, buf = pcall(function()
+        return ei:ReadPixelsBuffer(Vector2.new(0, 0), sz)
+    end)
+    if not okBuf or not buf then return nil, "ReadPixelsBuffer: " .. tostring(buf) end
+    local data
+    local okStr = pcall(function() data = buffer.tostring(buf) end)
+    if not okStr or not data then return nil, "buffer.tostring failed" end
+    local expected = w * h * 4
+    if #data ~= expected then
+        return nil, fmt("size mismatch: got %d expected %d (w=%d h=%d)",
+            #data, expected, w, h)
+    end
+    -- Header: "ROCORDER-RGBA8\n<w>\n<h>\n" then raw RGBA bytes
+    return fmt("ROCORDER-RGBA8\n%d\n%d\n", w, h) .. data
+end
+
+-- Walk every asset reference on a part and try to extract via the in-engine
+-- API. Each successful extraction writes a single file in ROCORDER/assets/.
+-- Skips assets already cached (any format). dbg() is optional and gets called
+-- on success/failure for diagnostic logging.
+local function extractPartAssets(part, partInfo, dbg)
+    if not isfolder(ASSETS_FOLDER) then pcall(makefolder, ASSETS_FOLDER) end
+
+    -- Mesh
+    local meshId = _assetIdFromRef(partInfo.meshId)
+    if meshId and not EXTRACTED[meshId] and not _isCached(meshId) then
+        EXTRACTED[meshId] = true
+        local geom, err = extractMeshFromPart(part)
+        if geom then
+            local ok = pcall(writefile, _geomPath(meshId), HttpService:JSONEncode(geom))
+            if ok and dbg then
+                dbg(fmt("  EXTRACT mesh %s OK (%d verts, %d faces)",
+                    meshId, #geom.verts / 3, #geom.faces / 3))
+            end
+        elseif dbg then
+            dbg(fmt("  EXTRACT mesh %s FAILED: %s", meshId, tostring(err)))
+        end
+        task.wait()  -- yield to keep the game smooth
+    end
+
+    -- Image references on the part: textureId, colorMap, decals[]
+    local imgRefs = {}
+    if partInfo.textureId then imgRefs[#imgRefs+1] = partInfo.textureId end
+    if partInfo.colorMap  then imgRefs[#imgRefs+1] = partInfo.colorMap  end
+    if partInfo.decals then
+        for _, d in ipairs(partInfo.decals) do
+            if d.texture then imgRefs[#imgRefs+1] = d.texture end
+        end
+    end
+    for _, ref in ipairs(imgRefs) do
+        local id = _assetIdFromRef(ref)
+        if id and not EXTRACTED[id] and not _isCached(id) then
+            EXTRACTED[id] = true
+            local body, err = extractImageFromContent(ref)
+            if body then
+                local ok = pcall(writefile, _imgPath(id), body)
+                if ok and dbg then
+                    dbg(fmt("  EXTRACT image %s OK (%d bytes)", id, #body))
+                end
+            elseif dbg then
+                dbg(fmt("  EXTRACT image %s FAILED: %s", id, tostring(err)))
+            end
+            task.wait()
+        end
+    end
+end
+
+----------------------------------------------------------------
 -- Rig capture
 ----------------------------------------------------------------
 -- Pull every asset reference + geometry hint off a single BasePart so the
@@ -649,6 +854,24 @@ function Tracker:ensure(player, encode, debugLog)
         if not r.inst then entry.partLost[i] = true end
     end
     self.tracked[uid] = entry
+
+    -- Kick off background asset extraction for this player. Each unique
+    -- mesh/texture is pulled from the engine's loaded copy via EditableMesh /
+    -- EditableImage and written to ROCORDER/assets/<id>.geom.json or .rgba.
+    -- Runs in a coroutine with task.wait() between assets so the game stays
+    -- smooth, and survives Stop so late-arriving extractions still complete.
+    if EXTRACT_OK then
+        task.spawn(function()
+            for i, ref in ipairs(refs) do
+                if ref.inst and ref.inst.Parent then
+                    local pi = rig.parts[i]
+                    pcall(extractPartAssets, ref.inst, pi, debugLog)
+                end
+                task.wait()
+            end
+        end)
+    end
+
     if debugLog then
         local meshes = 0
         for _, p in ipairs(rig.parts) do if p.meshId then meshes += 1 end end
@@ -1221,9 +1444,10 @@ function rec:_downloadAssets(logSink)
         local okc, failc, skipc = 0, 0, 0
         local missing = {}  -- ids that couldn't be fetched anywhere
         dbg(fmt("ASSET DOWNLOAD start: %d unique assets — readers: "
-            .. "httpRequest=%s getcustomasset=%s getsynasset=%s "
-            .. "readcustomasset=%s readasset=%s getAssetBytes=%s",
+            .. "EditableMesh/Image=%s httpRequest=%s getcustomasset=%s "
+            .. "getsynasset=%s readcustomasset=%s readasset=%s getAssetBytes=%s",
             #list,
+            EXTRACT_OK and "yes" or "no",
             httpRequest and "yes" or "no",
             getCustomAsset and "yes" or "no",
             getSynAsset and "yes" or "no",
@@ -1237,8 +1461,12 @@ function rec:_downloadAssets(logSink)
 
             -- treat an existing file as cached ONLY if it's a real asset;
             -- error-page files saved by older versions get re-downloaded.
+            -- Also count an extracted .geom.json / .rgba as "cached" so we
+            -- don't re-download something the in-engine extractor already got.
             local cached = false
-            if isfile and isfile(path) then
+            if isfile and (isfile(_geomPath(id)) or isfile(_imgPath(id))) then
+                cached = true
+            elseif isfile and isfile(path) then
                 if readfile then
                     local okr, existing = pcall(readfile, path)
                     if okr and looksLikeAsset(existing) then
