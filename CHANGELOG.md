@@ -9,6 +9,38 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.5.0-alpha — 2026-05-31
+
+Separate per-part objects, classic faces/decals, and clothing capture —
+addressing the "merged mesh / cube heads / missing faces" feedback. Formats
+unchanged (additive rig fields only).
+
+- **No more merged mesh** — each body part, accessory, hat, and tool piece is
+  now its **own selectable object**, organized into `<player>_Body` and
+  `<player>_Accessories` sub-collections. Every object is still skinned 100%
+  to its bone via its own Armature modifier, so animation is identical — you
+  just get full control to select / hide / edit / delete each piece.
+- **Faces & decals** — the recorder now captures `Decal`/`Texture` instances
+  on parts (the classic **face** lives here, plus logos and surface images).
+  The importer applies a part's decal to the matching box face (mapped from the
+  decal's Roblox `Face`), so classic heads finally show a face instead of a
+  bare cube.
+- **Clothing capture** — `Shirt` / `Pants` / `ShirtGraphic` templates and
+  `SpecialMesh.MeshType` are now recorded (and logged). Applying classic
+  shirt/pants *wrapping* needs the classic body-UV template and is the next
+  step; for now they're captured + reported in the import log so the data's
+  there.
+- **Diagnostics** — the import log now prints, per part, `class=` (Part vs
+  MeshPart), `shape=`, `meshType=`, and whether it has a mesh / texture /
+  colorMap / decals, plus a per-player `meshes / boxes / box+decal` tally and
+  any clothing found. This makes it obvious whether a "blocky" body is a
+  classic `Part` (blocks are correct — needs clothing textures) or a
+  `MeshPart` whose mesh failed to download (a real bug to chase).
+
+Note for classic R6 avatars: the body/head ARE blocks in-game; their detail
+comes from shirt/pants/face textures, not geometry. Heads now get their face;
+full shirt/pants wrapping is the remaining piece.
+
 ## 1.4.0-alpha — 2026-05-31
 
 Real meshes + textures + accessories/tools. This is the big one: the Blender

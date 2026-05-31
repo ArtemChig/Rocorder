@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.4.0-alpha"
+ROCORDER_VERSION = "1.5.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -599,6 +599,131 @@ def _image_material(name, image_path, color, transparency, log):
     return mat
 
 
+# Roblox NormalId -> the Blender-local axis a decal faces, after the
+# (x, y, z) -> (x, -z, y) swap:  +X->+X, +Y->+Z, +Z->-Y.
+_DECAL_AXIS = {
+    "Front":  Vector((0.0,  1.0,  0.0)),   # Roblox -Z
+    "Back":   Vector((0.0, -1.0,  0.0)),   # Roblox +Z
+    "Top":    Vector((0.0,  0.0,  1.0)),   # Roblox +Y
+    "Bottom": Vector((0.0,  0.0, -1.0)),   # Roblox -Y
+    "Right":  Vector((1.0,  0.0,  0.0)),   # Roblox +X
+    "Left":   Vector((-1.0, 0.0,  0.0)),   # Roblox -X
+}
+
+
+def _add_primitive_local(bm, uv_layer, part, scale, decal_axis=None):
+    """Build a box / ball / wedge for a classic Part at the origin in
+    Blender-local coords (NOT yet placed). If decal_axis is given, the face
+    pointing that way gets material slot 1 and a planar 0..1 UV (so a face
+    decal / logo shows on the right side). Returns the new BMVerts."""
+    shape = part.get("shape") or "Block"
+    sx, sy, sz = (float(s) for s in part.get("size", [1.0, 1.0, 1.0]))
+
+    if shape == "Ball":
+        ret = bmesh.ops.create_uvsphere(
+            bm, u_segments=20, v_segments=12,
+            radius=max(min(sx, sy, sz) * 0.5 * scale, 1e-4))
+        return ret["verts"]
+
+    ret = bmesh.ops.create_cube(bm, size=1.0)
+    verts = ret["verts"]
+    bmesh.ops.scale(
+        bm,
+        vec=(max(sx * scale, 1e-4), max(sz * scale, 1e-4), max(sy * scale, 1e-4)),
+        verts=verts)
+
+    if decal_axis is not None:
+        bm.normal_update()
+        faces = set()
+        for v in verts:
+            faces.update(v.link_faces)
+        best, best_dot = None, 0.5
+        for f in faces:
+            d = f.normal.normalized().dot(decal_axis)
+            if d > best_dot:
+                best, best_dot = f, d
+        if best is not None:
+            best.material_index = 1
+            # planar UV: corners 0..1 around the quad loop
+            corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+            for i, loop in enumerate(best.loops):
+                loop[uv_layer].uv = corners[i % 4]
+    return verts
+
+
+def _build_part_object(part, name, place, scale, assets, import_meshes,
+                       arm_obj, collection, log):
+    """Build ONE Blender object for a single part (body part, accessory, hat,
+    or tool piece), skinned 100% to its bone via an Armature modifier. Keeping
+    parts as separate objects (instead of one merged mesh) lets you select /
+    hide / edit each one. Returns (obj, kind) where kind is 'mesh'|'box'|
+    'box+decal' for stats, or (None, 'skip')."""
+    color = part.get("color", [0.7, 0.7, 0.7])
+    transp = float(part.get("transparency", 0.0))
+    decals = part.get("decals") or []
+
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    bm = bmesh.new()
+    uv_layer = bm.loops.layers.uv.verify()
+    materials = []
+    kind = "box"
+
+    mesh_data = None
+    body_tex = None
+    if import_meshes and assets is not None:
+        if part.get("meshId"):
+            mesh_data = assets.get_mesh(part.get("meshId"))
+        tref = part.get("textureId") or part.get("colorMap")
+        if tref:
+            body_tex = assets.get_image_path(tref)
+
+    verts = None
+    if mesh_data:
+        verts = _add_mesh_geometry(bm, uv_layer, mesh_data, place, part, scale)
+    if verts:
+        kind = "mesh"
+        materials.append(_image_material(name, body_tex, color, transp, log)
+                         if body_tex else _color_material(color, transp))
+    else:
+        # primitive; optionally with a decal (face / logo) on one side
+        decal_tex, decal_axis = None, None
+        if import_meshes and assets is not None and decals:
+            for d in decals:
+                tex = assets.get_image_path(d.get("texture"))
+                if tex:
+                    decal_tex = tex
+                    decal_axis = _DECAL_AXIS.get(d.get("face", "Front"))
+                    break
+        verts = _add_primitive_local(bm, uv_layer, part, scale, decal_axis)
+        materials.append(_color_material(color, transp))   # slot 0
+        if decal_tex:
+            materials.append(_image_material(            # slot 1
+                name + "_decal", decal_tex, color, transp, log))
+            kind = "box+decal"
+        bmesh.ops.transform(bm, matrix=place, verts=verts)
+
+    if not verts:
+        bm.free()
+        return None, "skip"
+
+    bm.to_mesh(mesh)
+    bm.free()
+    for m in materials:
+        mesh.materials.append(m)
+
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+    vg = obj.vertex_groups.new(name=name)
+    vg.add(list(range(len(mesh.vertices))), 1.0, "REPLACE")
+    obj.parent = arm_obj
+    obj.matrix_parent_inverse = arm_obj.matrix_world.inverted()
+    mod = obj.modifiers.new("Armature", "ARMATURE")
+    mod.object = arm_obj
+    mod.use_vertex_groups = True
+    obj["rocorder_bone"] = name
+    return obj, kind
+
+
 # ----------------------------------------------------------------------------
 # Rig file
 # ----------------------------------------------------------------------------
@@ -864,109 +989,80 @@ def build_player(player_rig, label, scale, collection, log, force_standard_r6=Tr
     log("  bones requested={} created={} in R={}".format(
         len(requested_names), len(created_names), len(R)))
 
-    # ---- combined skinned mesh ----
-    mesh = bpy.data.meshes.new(label + "_mesh")
-    bm = bmesh.new()
-    uv_layer = bm.loops.layers.uv.verify()
-    groups = []
-    mat_index = {}
-    materials = []
+    # ---- one object per part (NOT merged) so each body part / accessory /
+    # tool is independently selectable, hideable and editable ----
+    # Split into Body vs Accessories sub-collections for tidiness. A part is
+    # "body" if a Motor6D joint references it (or it's the root).
+    jointed = set()
+    for j in player_rig.get("joints", []):
+        if j.get("part0"):
+            jointed.add(j["part0"])
+        if j.get("part1"):
+            jointed.add(j["part1"])
+
+    body_coll = bpy.data.collections.new(label + "_Body")
+    acc_coll = bpy.data.collections.new(label + "_Accessories")
+    collection.children.link(body_coll)
+    collection.children.link(acc_coll)
+
+    mesh_stats = {"mesh": 0, "box": 0, "box+decal": 0}
     skipped_parts = []
-    mesh_stats = {"real": 0, "box": 0, "tex": 0}
+    part_objs = []
 
     for p in parts:
         name = p["name"]
         if name not in R:
             skipped_parts.append((name, "bone missing from R"))
             continue
-        # Fully-transparent parts that carry NO mesh (e.g. HumanoidRootPart) are
-        # geometry-skipped but keep their bone. A transparent part that DOES
-        # carry a mesh (some accessories) is still drawn — its texture decides
-        # visibility.
-        if float(p.get("transparency", 0.0)) >= 0.999 and not p.get("meshId"):
-            skipped_parts.append((name, "transparency>=0.999, no mesh (bone kept)"))
+        # Fully-transparent parts with NO mesh/decal (e.g. HumanoidRootPart) get
+        # no geometry but keep their bone. Anything carrying a mesh or decal is
+        # still drawn — its texture/alpha decides final visibility.
+        if (float(p.get("transparency", 0.0)) >= 0.999
+                and not p.get("meshId") and not p.get("decals")):
+            skipped_parts.append((name, "transparency>=0.999, no mesh/decal (bone kept)"))
             continue
+
         place = D.get(name, Matrix.Identity(4))
-
-        # try real mesh + texture, fall back to box
-        mesh_data = None
-        img_path = None
-        if import_meshes and assets is not None:
-            if p.get("meshId"):
-                mesh_data = assets.get_mesh(p.get("meshId"))
-            tex_ref = p.get("textureId") or p.get("colorMap")
-            if tex_ref:
-                img_path = assets.get_image_path(tex_ref)
-
-        verts = None
-        if mesh_data:
-            verts = _add_mesh_geometry(bm, uv_layer, mesh_data, place, p, scale)
-        if verts:
-            mesh_stats["real"] += 1
-        else:
-            verts = _add_part_geometry(bm, p, place, scale)
-            mesh_stats["box"] += 1
-        if not verts:
-            skipped_parts.append((name, "no verts produced"))
+        target = body_coll if name in jointed else acc_coll
+        obj, kind = _build_part_object(p, name, place, scale, assets,
+                                       import_meshes, arm_obj, target, log)
+        if obj is None:
+            skipped_parts.append((name, "no geometry produced"))
             continue
-        groups.append((name, verts))
-
-        # material: textured if we have an image, else flat color
-        if img_path:
-            key = "tex|" + os.path.basename(img_path)
-            mesh_stats["tex"] += 1
-        else:
-            key = "{}|{}".format(p.get("color", [0.7, 0.7, 0.7]),
-                                 p.get("transparency", 0.0))
-        if key not in mat_index:
-            mat_index[key] = len(materials)
-            if img_path:
-                materials.append(_image_material(
-                    name, img_path, p.get("color", [0.7, 0.7, 0.7]),
-                    float(p.get("transparency", 0.0)), log))
-            else:
-                materials.append(_color_material(
-                    p.get("color", [0.7, 0.7, 0.7]),
-                    float(p.get("transparency", 0.0))))
-        idx = mat_index[key]
-        faces = set()
-        for v in verts:
-            faces.update(v.link_faces)
-        for fc in faces:
-            fc.material_index = idx
-
-    bm.verts.index_update()
-    group_indices = [(name, [v.index for v in verts]) for name, verts in groups]
-    bm.to_mesh(mesh)
-    bm.free()
-
-    for m in materials:
-        mesh.materials.append(m)
-
-    mesh_obj = bpy.data.objects.new(label + "_skin", mesh)
-    collection.objects.link(mesh_obj)
-    for name, idxs in group_indices:
-        vg = mesh_obj.vertex_groups.new(name=name)
-        vg.add(idxs, 1.0, "REPLACE")
-
-    mesh_obj.parent = arm_obj
-    mesh_obj.matrix_parent_inverse = arm_obj.matrix_world.inverted()
-    mod = mesh_obj.modifiers.new("Armature", "ARMATURE")
-    mod.object = arm_obj
-    mod.use_vertex_groups = True
+        obj["rocorder_user_id"] = arm_obj.get("rocorder_user_id", "")
+        part_objs.append(obj)
+        mesh_stats[kind] = mesh_stats.get(kind, 0) + 1
 
     if skipped_parts:
-        log("  mesh build — skipped {} parts:".format(len(skipped_parts)))
+        log("  parts skipped (no geometry):")
         for name, reason in skipped_parts:
             log("    {}: {}".format(name, reason))
-    log("  mesh build — verts={} mats={} vertex_groups={}".format(
-        len(mesh.vertices), len(materials), len(mesh_obj.vertex_groups)))
-    log("  geometry — real meshes={} boxes={} textured={}".format(
-        mesh_stats["real"], mesh_stats["box"], mesh_stats["tex"]))
+    log("  built {} part objects — meshes={} boxes={} box+decal={}".format(
+        len(part_objs), mesh_stats.get("mesh", 0), mesh_stats.get("box", 0),
+        mesh_stats.get("box+decal", 0)))
+
+    # per-part detail so we can see WHY each part is a mesh vs a box
+    log("  part detail:")
+    for p in parts:
+        nm = p["name"]
+        bits = ["class=" + str(p.get("className", "?")),
+                "shape=" + str(p.get("shape", "?"))]
+        if p.get("meshId"): bits.append("meshId")
+        if p.get("meshType"): bits.append("meshType=" + str(p.get("meshType")))
+        if p.get("textureId"): bits.append("textureId")
+        if p.get("colorMap"): bits.append("colorMap")
+        if p.get("decals"): bits.append("decals={}".format(len(p["decals"])))
+        log("    {:24s} {}".format(nm, " ".join(bits)))
+    clothing = player_rig.get("clothing")
+    if clothing:
+        log("  clothing on character: {}".format(clothing))
+        log("  NOTE: classic Shirt/Pants wrapping isn't applied yet (needs the "
+            "classic body UV template) — bodies will show as flat-colored "
+            "parts until that lands.")
 
     return {
         "arm": arm_obj,
-        "mesh": mesh_obj,
+        "part_objs": part_objs,
         "parent_of": parent_of,
         "D": D,
         "R": R,

@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.4.0-alpha"
+local ROCORDER_VERSION = "1.5.0-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -280,7 +280,8 @@ local function partInfo(part, boneName)
         info.shape = "Block"
     end
 
-    -- legacy SpecialMesh (Part-based hats/tools): MeshId/TextureId/Scale
+    -- legacy SpecialMesh (Part-based hats/tools/classic heads):
+    -- MeshId/TextureId/Scale + MeshType (Head/Sphere/Cylinder/FileMesh/...)
     local sm = part:FindFirstChildOfClass("SpecialMesh")
         or part:FindFirstChildOfClass("FileMesh")
     if sm then
@@ -290,6 +291,8 @@ local function partInfo(part, boneName)
         if ok2 and tid and tid ~= "" then info.textureId = tid end
         local oksc, sc = pcall(function() return sm.Scale end)
         if oksc and sc then info.meshScale = { sc.X, sc.Y, sc.Z } end
+        local okmt, mt = pcall(function() return sm.MeshType end)
+        if okmt and mt then info.meshType = mt.Name end
     end
 
     -- SurfaceAppearance PBR color map (modern layered clothing / accessories)
@@ -298,6 +301,26 @@ local function partInfo(part, boneName)
         local ok, cm = pcall(function() return sa.ColorMap end)
         if ok and cm and cm ~= "" then info.colorMap = cm end
     end
+
+    -- Decals / Textures on the part (the classic FACE lives here, plus logos
+    -- and surface images). Texture is a subclass of Decal, so this catches both.
+    local decals = {}
+    for _, d in ipairs(part:GetChildren()) do
+        if d:IsA("Decal") then
+            local okt, tx = pcall(function() return d.Texture end)
+            if okt and tx and tx ~= "" then
+                local face = "Front"
+                local okf, fc = pcall(function() return d.Face end)
+                if okf and fc then face = fc.Name end
+                decals[#decals + 1] = {
+                    name = d.Name, texture = tx, face = face,
+                    isTexture = d:IsA("Texture"),
+                }
+            end
+        end
+    end
+    if #decals > 0 then info.decals = decals end
+
     return info
 end
 
@@ -323,6 +346,25 @@ local function captureRig(player)
         if humanoid.RigType == Enum.HumanoidRigType.R15 then rig.rigType = "R15"
         elseif humanoid.RigType == Enum.HumanoidRigType.R6 then rig.rigType = "R6" end
     end
+
+    -- classic clothing (wraps the blocky body via Roblox's UV template)
+    local clothing = {}
+    local shirt = char:FindFirstChildOfClass("Shirt")
+    if shirt then
+        local ok, t = pcall(function() return shirt.ShirtTemplate end)
+        if ok and t and t ~= "" then clothing.shirt = t end
+    end
+    local pants = char:FindFirstChildOfClass("Pants")
+    if pants then
+        local ok, t = pcall(function() return pants.PantsTemplate end)
+        if ok and t and t ~= "" then clothing.pants = t end
+    end
+    local tshirt = char:FindFirstChildOfClass("ShirtGraphic")
+    if tshirt then
+        local ok, t = pcall(function() return tshirt.Graphic end)
+        if ok and t and t ~= "" then clothing.tshirt = t end
+    end
+    if next(clothing) then rig.clothing = clothing end
 
     local refs = {}
     local used = {}
@@ -485,13 +527,21 @@ function Tracker:ensure(player, encode, debugLog)
         local lines = {}
         for i, p in ipairs(rig.parts) do
             lines[#lines+1] = fmt(
-                "  [%d] %s shape=%s transparency=%.3f size=(%.2f,%.2f,%.2f)%s%s",
-                i-1, p.name, p.shape or "?", p.transparency or 0,
-                p.size[1], p.size[2], p.size[3],
+                "  [%d] %s class=%s shape=%s%s transparency=%.3f%s%s%s%s",
+                i-1, p.name, p.className or "?", p.shape or "?",
+                p.meshType and ("(" .. p.meshType .. ")") or "",
+                p.transparency or 0,
                 p.meshId and (" mesh=" .. p.meshId) or "",
-                p.textureId and (" tex=" .. p.textureId) or "")
+                p.textureId and (" tex=" .. p.textureId) or "",
+                p.colorMap and (" colorMap=" .. p.colorMap) or "",
+                p.decals and (" decals=" .. #p.decals) or "")
         end
         debugLog("  parts:\n" .. table.concat(lines, "\n"))
+        if rig.clothing then
+            debugLog(fmt("  clothing: shirt=%s pants=%s tshirt=%s",
+                tostring(rig.clothing.shirt), tostring(rig.clothing.pants),
+                tostring(rig.clothing.tshirt)))
+        end
     end
     return entry
 end
