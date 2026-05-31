@@ -9,6 +9,32 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.3-alpha — 2026-05-31
+
+The "stuck at 31/39" report turned out to be a **UI bug**, not a worker bug.
+Disk had 37 .geom.json + 31 .rgba files; the worker had drained the queue
+just fine. 31 succeeded + 8 failed (player-left-before-extraction) = 39 seen.
+The old headline "31 / 39 extracted" implied 8 were pending; really they were
+already finished-but-failed.
+
+- **Headline now distinguishes states explicitly**:
+  - `extracting <kind> <id> (player)   (N done · N failed · N queued)` when
+    actively processing
+  - `N in queue (N done · N failed)` when waiting for the worker
+  - `complete: N extracted · N couldn't be fetched (player left or asset
+    permission-locked)` when totally finished with some failures
+  - `complete: all N extracted` when totally finished with no failures
+- **Progress bar now fills to `(done + failed) / total`** instead of just
+  `done / total`. A failed item isn't pending — we won't try it again — so
+  it should count toward the bar.
+- **Stats line spells out the failure type**: `done N · failed N (of which M
+  missed: player left) · queued N · worker tick K (Xs ago)`. The "missed"
+  count is the subset of failures specifically caused by the player leaving
+  before extraction, which is the most common cause and worth flagging.
+
+Worker behavior unchanged. The watchdog and outer-pcall robustness from
+1.9.2 stay in place.
+
 ## 1.9.2-alpha — 2026-05-31
 
 User reported the worker still stalling at 144 fps, ruling out my frame-

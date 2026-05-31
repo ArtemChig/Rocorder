@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.2-alpha"
+local ROCORDER_VERSION = "1.9.3-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -3318,12 +3318,13 @@ function UI:_refreshStatus()
     if ctl.assetHeadline then
         local snap = queueSnapshot()
         local total = snap.totalSeen
-        local pct = total > 0 and (snap.done / total) or 0
+        -- Progress bar = (done + failed) / total. Both done and failed are
+        -- "finished" states — we're not waiting on them. Splitting them
+        -- prevents the "stuck at 31/39" misread when 8 actually failed.
+        local finished = snap.done + snap.failed
+        local pct = total > 0 and (finished / total) or 0
         ctl.assetBarFill.Size = UDim2.new(pct, 0, 1, 0)
 
-        -- Worker health indicator: if the queue is non-empty but the worker
-        -- hasn't ticked recently, surface it loudly so we can see the problem
-        -- without digging through a debug log.
         local workerHealth = ""
         if snap.workerAgeSec > 5 and snap.queued > 0 then
             workerHealth = fmt(" — WORKER SILENT %.0fs", snap.workerAgeSec)
@@ -3331,18 +3332,27 @@ function UI:_refreshStatus()
 
         if total == 0 then
             ctl.assetHeadline.Text = "extractor ready · waiting for players"
+        elseif snap.activeId then
+            ctl.assetHeadline.Text = fmt(
+                "extracting %s %s%s   (%d done · %d failed · %d queued)",
+                snap.activeKind or "?", snap.activeId,
+                snap.activePlayer and ("  (" .. snap.activePlayer .. ")") or "",
+                snap.done, snap.failed, snap.queued)
+        elseif snap.queued > 0 then
+            ctl.assetHeadline.Text = fmt(
+                "%d in queue (%d done · %d failed)%s",
+                snap.queued, snap.done, snap.failed, workerHealth)
+        elseif snap.failed > 0 then
+            ctl.assetHeadline.Text = fmt(
+                "complete: %d extracted · %d couldn't be fetched (player left "
+                .. "or asset permission-locked)", snap.done, snap.failed)
         else
-            local activity = snap.activeId
-                and fmt(" — extracting %s %s%s",
-                    snap.activeKind or "?", snap.activeId,
-                    snap.activePlayer and ("  (" .. snap.activePlayer .. ")") or "")
-                or ""
-            ctl.assetHeadline.Text = fmt("%d / %d extracted%s%s",
-                snap.done, total, activity, workerHealth)
+            ctl.assetHeadline.Text = fmt("complete: all %d extracted", snap.done)
         end
         ctl.assetStats.Text = fmt(
-            "queued %d  ·  done %d  ·  failed %d  ·  missed %d  ·  worker tick %d (%.1fs ago)",
-            snap.queued, snap.done, snap.failed, snap.missed,
+            "done %d · failed %d (of which %d missed: player left) · queued %d · "
+            .. "worker tick %d (%.1fs ago)",
+            snap.done, snap.failed, snap.missed, snap.queued,
             snap.iterations, snap.workerAgeSec)
 
         -- per-player rows: rebuild from sorted snapshot
