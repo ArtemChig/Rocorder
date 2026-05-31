@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.8.0-alpha"
+local ROCORDER_VERSION = "1.8.1-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -519,6 +519,27 @@ local function extractImageFromContent(ref)
     return fmt("ROCORDER-RGBA8\n%d\n%d\n", w, h) .. data
 end
 
+-- One-shot helper: try to extract `ref` as an image (texture / decal / clothing
+-- template) and write to ROCORDER/assets/<id>.rgba. Returns true if the file
+-- ended up on disk by any means.
+local function _extractImageRef(ref, dbg)
+    local id = _assetIdFromRef(ref)
+    if not id then return false end
+    if EXTRACTED[id] or _isCached(id) then return true end
+    EXTRACTED[id] = true
+    local body, err = extractImageFromContent(ref)
+    if body then
+        local ok = pcall(writefile, _imgPath(id), body)
+        if ok and dbg then
+            dbg(fmt("  EXTRACT image %s OK (%d bytes)", id, #body))
+        end
+        return ok
+    elseif dbg then
+        dbg(fmt("  EXTRACT image %s FAILED: %s", id, tostring(err)))
+    end
+    return false
+end
+
 -- Walk every asset reference on a part and try to extract via the in-engine
 -- API. Each successful extraction writes a single file in ROCORDER/assets/.
 -- Skips assets already cached (any format). dbg() is optional and gets called
@@ -540,34 +561,32 @@ local function extractPartAssets(part, partInfo, dbg)
         elseif dbg then
             dbg(fmt("  EXTRACT mesh %s FAILED: %s", meshId, tostring(err)))
         end
-        task.wait()  -- yield to keep the game smooth
+        task.wait()
     end
 
     -- Image references on the part: textureId, colorMap, decals[]
-    local imgRefs = {}
-    if partInfo.textureId then imgRefs[#imgRefs+1] = partInfo.textureId end
-    if partInfo.colorMap  then imgRefs[#imgRefs+1] = partInfo.colorMap  end
+    if partInfo.textureId then
+        _extractImageRef(partInfo.textureId, dbg); task.wait()
+    end
+    if partInfo.colorMap then
+        _extractImageRef(partInfo.colorMap, dbg); task.wait()
+    end
     if partInfo.decals then
         for _, d in ipairs(partInfo.decals) do
-            if d.texture then imgRefs[#imgRefs+1] = d.texture end
+            if d.texture then _extractImageRef(d.texture, dbg); task.wait() end
         end
     end
-    for _, ref in ipairs(imgRefs) do
-        local id = _assetIdFromRef(ref)
-        if id and not EXTRACTED[id] and not _isCached(id) then
-            EXTRACTED[id] = true
-            local body, err = extractImageFromContent(ref)
-            if body then
-                local ok = pcall(writefile, _imgPath(id), body)
-                if ok and dbg then
-                    dbg(fmt("  EXTRACT image %s OK (%d bytes)", id, #body))
-                end
-            elseif dbg then
-                dbg(fmt("  EXTRACT image %s FAILED: %s", id, tostring(err)))
-            end
-            task.wait()
-        end
-    end
+end
+
+-- Extract a player's clothing textures (Shirt.ShirtTemplate, Pants.PantsTemplate,
+-- ShirtGraphic.Graphic). These live on the Shirt/Pants instances, not on parts,
+-- so extractPartAssets misses them entirely. EditableImage works for clothing
+-- the engine has loaded — same permission rules as accessories.
+local function extractClothingAssets(clothing, dbg)
+    if not clothing then return end
+    if clothing.shirt  then _extractImageRef(clothing.shirt, dbg);  task.wait() end
+    if clothing.pants  then _extractImageRef(clothing.pants, dbg);  task.wait() end
+    if clothing.tshirt then _extractImageRef(clothing.tshirt, dbg); task.wait() end
 end
 
 ----------------------------------------------------------------
@@ -869,6 +888,9 @@ function Tracker:ensure(player, encode, debugLog)
                 end
                 task.wait()
             end
+            -- Clothing templates live on Shirt/Pants instances, not parts;
+            -- extract them separately so shirts/pants come through too.
+            pcall(extractClothingAssets, rig.clothing, debugLog)
         end)
     end
 
