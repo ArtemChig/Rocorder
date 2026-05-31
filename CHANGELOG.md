@@ -9,6 +9,31 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.8-alpha — 2026-05-31
+
+Late-joining players and mid-recording equips are now visible to the live
+extractor + UI.
+
+- **Mid-recording equips enqueue assets.** When a tool/accessory is equipped
+  mid-recording, `Tracker:_appendNewParts` correctly appended the new part
+  to the rig but never called `enqueuePartAssets` for it. Its mesh/texture
+  had to be rescued by the end-of-recording legacy HTTP pass — which meant
+  the live extractor UI showed no activity for the new accessory until
+  recording stopped. Fixed by enqueuing inline when the part is appended.
+- **Late-arriving mesh content is now caught.** Roblox streams an avatar
+  in stages: skeleton + Motor6Ds first, mesh content second (SpecialMesh
+  children attach, MeshPart fields populate). A player joining
+  mid-recording would often capture with `shape=Block` parts and no
+  `meshId` — then ~1 second later the engine fills in the FileMesh. The
+  initial `partInfo` snapshot was frozen, so nothing noticed and no assets
+  ever queued. New `Tracker:_rescanExistingAssets` reruns `partInfo` on
+  each ref during the throttled (~1 Hz) sweep and enqueues any newly
+  available asset ids. `_enqueueAsset` already dedupes by `EXTRACTED` +
+  `Q.byId`, so the rescan is a no-op for assets we've already seen.
+- **`entry.displayName` is now stored on Tracker entry** so `_appendNewParts`
+  and `_rescanExistingAssets` can label per-player stats without re-looking-
+  up the player.
+
 ## 1.9.7-alpha — 2026-05-31
 
 Instant Replay no longer fills disk with assets from people who joined,
