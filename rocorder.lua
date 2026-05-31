@@ -12,19 +12,20 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.1.2-alpha"
+local ROCORDER_VERSION = "1.2.0-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
     if _G.ROCORDER._destroy then pcall(function() _G.ROCORDER:_destroy() end) end
 end
 
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local StarterGui       = game:GetService("StarterGui")
-local HttpService      = game:GetService("HttpService")
-local TweenService     = game:GetService("TweenService")
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local StarterGui         = game:GetService("StarterGui")
+local HttpService        = game:GetService("HttpService")
+local TweenService       = game:GetService("TweenService")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local fmt = string.format
 
@@ -100,7 +101,18 @@ local SETTING_DEFS = {
       desc="Shows / hides this window.",                          group="Hotkeys" },
     { key="HOTKEY_SAVE_REPLAY",  type="key", default="F7",        label="Save Instant Replay",
       desc="Dumps the rolling buffer (when Instant Replay is on).",group="Hotkeys" },
+
+    -- Sources (managed via the Sources tab, not the Settings tab)
+    { key="SRC_PLAYER_PARTS", type="bool", default=true,  label="Player parts",
+      desc="Per-tick world position + quaternion of every BasePart in each character.",
+      group="Sources" },
+    { key="SRC_CAMERA",       type="bool", default=false, label="Player camera",
+      desc="Per-tick CFrame + FOV of the local camera. Imports as a Blender camera.",
+      group="Sources" },
 }
+
+-- Groups that do NOT belong on the Settings tab (managed elsewhere).
+local SETTINGS_TAB_OMIT = { Sources = true }
 
 local SETTINGS_PATH = FOLDER .. "/settings.json"
 
@@ -132,17 +144,28 @@ local function defByKey(key)
     for _, d in ipairs(SETTING_DEFS) do if d.key == key then return d end end
 end
 
-local function settingsByGroup()
+local function settingsByGroup(omit)
+    omit = omit or {}
     local groups = {}
     local order = {}
     for _, d in ipairs(SETTING_DEFS) do
-        if not groups[d.group] then
-            groups[d.group] = {}
-            order[#order + 1] = d.group
+        if not omit[d.group] then
+            if not groups[d.group] then
+                groups[d.group] = {}
+                order[#order + 1] = d.group
+            end
+            table.insert(groups[d.group], d)
         end
-        table.insert(groups[d.group], d)
     end
     return order, groups
+end
+
+local function settingsForGroup(name)
+    local list = {}
+    for _, d in ipairs(SETTING_DEFS) do
+        if d.group == name then list[#list + 1] = d end
+    end
+    return list
 end
 
 ----------------------------------------------------------------
@@ -150,6 +173,26 @@ end
 ----------------------------------------------------------------
 local function sanitizeName(s)
     return (s:gsub("[;:=,|]", "_"))
+end
+
+-- MarketplaceService:GetProductInfo yields and makes an HTTP call. Cache the
+-- result so we don't refetch on every recording, replay save, or Files refresh.
+local gameNameCache = {}
+local function lookupGameName(placeId)
+    if gameNameCache[placeId] ~= nil then
+        local v = gameNameCache[placeId]
+        if v == false then return nil end
+        return v
+    end
+    local ok, info = pcall(function()
+        return MarketplaceService:GetProductInfo(placeId)
+    end)
+    if ok and type(info) == "table" and info.Name and info.Name ~= "" then
+        gameNameCache[placeId] = info.Name
+        return info.Name
+    end
+    gameNameCache[placeId] = false  -- negative cache (don't keep retrying)
+    return nil
 end
 
 local function matrixToQuat(m00,m01,m02,m10,m11,m12,m20,m21,m22)
@@ -169,6 +212,16 @@ local function matrixToQuat(m00,m01,m02,m10,m11,m12,m20,m21,m22)
         qw = (m10-m01)/s; qx = (m02+m20)/s; qy = (m12+m21)/s; qz = 0.25*s
     end
     return qx,qy,qz,qw
+end
+
+-- Camera source: encodes workspace.CurrentCamera as a single 'cam:' chunk
+-- appended to a frame line. Backward compatible — old importers (and the
+-- 1.0 importer) skip unknown chunks silently.
+local function captureCameraStr(encode, posPrec)
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+    local cfStr = encode(cam.CFrame)
+    return fmt("cam:%s,%." .. posPrec .. "f", cfStr, cam.FieldOfView)
 end
 
 ----------------------------------------------------------------
@@ -387,6 +440,7 @@ function Session.new(folder, cfg, debugEnabled)
         filename      = base .. ".rec",
         rigFilename   = base .. ".rig.json",
         debugFilename = base .. ".debug.log",
+        metaFilename  = base .. ".meta.json",
         debugEnabled  = debugEnabled,
         buffer        = {},
         debugBuffer   = {},
@@ -397,6 +451,8 @@ function Session.new(folder, cfg, debugEnabled)
         startClock    = os.clock(),
         cfg           = cfg,
         bytesWritten  = 0,
+        placeId       = game.PlaceId,
+        placeName     = lookupGameName(game.PlaceId),
     }, Session)
     return self
 end
@@ -407,7 +463,8 @@ function Session:writeHeader(roster)
     local header = {
         format       = "ROCORDER/3",
         recorder     = ROCORDER_VERSION,
-        placeId      = game.PlaceId,
+        placeId      = self.placeId,
+        placeName    = self.placeName,
         jobId        = game.JobId,
         startedAt    = self.startedAt,
         tickRate     = self.cfg.TICK_RATE,
@@ -415,9 +472,15 @@ function Session:writeHeader(roster)
         rotPrecision = self.cfg.ROT_PRECISION,
         captureMode  = "parts-posquat",
         rigFile      = self.rigFilename,
+        metaFile     = self.metaFilename,
         debugFile    = self.debugEnabled and self.debugFilename or nil,
-        columns      = { "px","py","pz","qx","qy","qz","qw" },
-        roster       = roster,
+        sources      = {
+            playerParts = self.cfg.SRC_PLAYER_PARTS and true or false,
+            camera      = self.cfg.SRC_CAMERA      and true or false,
+        },
+        columns       = { "px","py","pz","qx","qy","qz","qw" },
+        cameraColumns = { "px","py","pz","qx","qy","qz","qw","fov" },
+        roster        = roster,
     }
     local s = HttpService:JSONEncode(header) .. "\n"
     self.bytesWritten = #s
@@ -473,6 +536,31 @@ function Session:writeRig(rigData)
     local ok = pcall(writefile, self:_path(self.rigFilename),
         HttpService:JSONEncode(rigData))
     return ok
+end
+
+-- Sidecar meta file written at Stop. Holds the things the Files-tab UI wants
+-- without needing to scan the (possibly huge) .rec for them.
+function Session:writeMeta()
+    local meta = {
+        format      = "ROCORDER-META/1",
+        recFile     = self.filename,
+        recorder    = ROCORDER_VERSION,
+        placeId     = self.placeId,
+        placeName   = self.placeName,
+        jobId       = game.JobId,
+        startedAt   = self.startedAt,
+        endedAt     = os.time(),
+        durationSec = self:elapsed(),
+        frameCount  = self.tickCount,
+        byteCount   = self.bytesWritten,
+        tickRate    = self.cfg.TICK_RATE,
+        sources     = {
+            playerParts = self.cfg.SRC_PLAYER_PARTS and true or false,
+            camera      = self.cfg.SRC_CAMERA      and true or false,
+        },
+    }
+    pcall(writefile, self:_path(self.metaFilename),
+        HttpService:JSONEncode(meta))
 end
 
 function Session:elapsed() return os.clock() - self.startClock end
@@ -566,21 +654,27 @@ function Replay:save(folder, cfg, rigData, lastSeconds)
         }
     end
 
+    local placeName = lookupGameName(game.PlaceId)
+    local metaName  = base .. ".meta.json"
+    local duration  = newestT - t0
     local header = {
-        format       = "ROCORDER/3",
-        recorder     = ROCORDER_VERSION,
-        placeId      = game.PlaceId,
-        jobId        = game.JobId,
-        startedAt    = os.time(),
-        tickRate     = cfg.TICK_RATE,
-        posPrecision = cfg.POS_PRECISION,
-        rotPrecision = cfg.ROT_PRECISION,
-        captureMode  = "parts-posquat",
-        rigFile      = rigName,
-        source       = "instant-replay",
-        clipSeconds  = newestT - t0,
-        columns      = { "px","py","pz","qx","qy","qz","qw" },
-        roster       = roster,
+        format        = "ROCORDER/3",
+        recorder      = ROCORDER_VERSION,
+        placeId       = game.PlaceId,
+        placeName     = placeName,
+        jobId         = game.JobId,
+        startedAt     = os.time(),
+        tickRate      = cfg.TICK_RATE,
+        posPrecision  = cfg.POS_PRECISION,
+        rotPrecision  = cfg.ROT_PRECISION,
+        captureMode   = "parts-posquat",
+        rigFile       = rigName,
+        metaFile      = metaName,
+        source        = "instant-replay",
+        clipSeconds   = duration,
+        columns       = { "px","py","pz","qx","qy","qz","qw" },
+        cameraColumns = { "px","py","pz","qx","qy","qz","qw","fov" },
+        roster        = roster,
     }
 
     local lines = { HttpService:JSONEncode(header) }
@@ -597,7 +691,30 @@ function Replay:save(folder, cfg, rigData, lastSeconds)
     local ok2, err2 = pcall(writefile, folder .. "/" .. rigName,
         HttpService:JSONEncode(rigData))
     if not ok2 then return nil, "writefile .rig failed: " .. tostring(err2) end
-    return recName, #kept, newestT - t0
+
+    -- meta sidecar (so the clip appears with full info in the Files tab)
+    local meta = {
+        format      = "ROCORDER-META/1",
+        recFile     = recName,
+        recorder    = ROCORDER_VERSION,
+        placeId     = game.PlaceId,
+        placeName   = placeName,
+        jobId       = game.JobId,
+        startedAt   = header.startedAt,
+        endedAt     = header.startedAt,
+        durationSec = duration,
+        frameCount  = #kept,
+        byteCount   = #body,
+        tickRate    = cfg.TICK_RATE,
+        source      = "instant-replay",
+        sources     = {
+            playerParts = cfg.SRC_PLAYER_PARTS and true or false,
+            camera      = cfg.SRC_CAMERA      and true or false,
+        },
+    }
+    pcall(writefile, folder .. "/" .. metaName, HttpService:JSONEncode(meta))
+
+    return recName, #kept, duration
 end
 
 ----------------------------------------------------------------
@@ -684,6 +801,8 @@ function rec:Stop()
     s:flush()
     local data = self.tracker:rigData(s.filename)
     s:writeRig(data)
+    s:writeMeta()
+    self:_invalidateRecordingsCache()
     if s.debugEnabled then
         s:debugLog(fmt("STOP after %.2fs: ticks=%d stalls=%d gaps=%d",
             s:elapsed(), s.tickCount, s.stallCount, s.gapCount))
@@ -718,8 +837,36 @@ function rec:SaveReplay(seconds)
     end
     notify("ROCORDER",
         fmt("Saved %.1fs clip (%d frames) -> %s", secsOut, frames, saved), 5)
+    self:_invalidateRecordingsCache()
     self:_signalUI()
     return saved
+end
+
+-- name -> { size, meta?, header?, mtime? }
+rec._recordingsCache = {}
+
+function rec:_invalidateRecordingsCache(name)
+    if name then self._recordingsCache[name] = nil
+    else self._recordingsCache = {} end
+end
+
+local function _readJSONFile(path)
+    if not (readfile and isfile and isfile(path)) then return nil end
+    local ok, body = pcall(readfile, path)
+    if not ok or type(body) ~= "string" then return nil end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if ok2 then return data end
+    return nil
+end
+
+local function _readHeaderFromRec(path)
+    if not readfile then return nil end
+    local ok, body = pcall(readfile, path)
+    if not ok or type(body) ~= "string" then return nil, 0 end
+    local firstLine = body:match("^([^\n]+)")
+    if not firstLine then return nil, #body end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(firstLine) end)
+    return ok2 and data or nil, #body
 end
 
 function rec:GetRecordings()
@@ -727,16 +874,52 @@ function rec:GetRecordings()
     local out = {}
     local ok, files = pcall(listfiles, FOLDER)
     if not ok or type(files) ~= "table" then return out end
+
     for _, path in ipairs(files) do
         local norm = path:gsub("\\", "/")
         local name = norm:match("([^/]+)$") or norm
         if name:sub(-4) == ".rec" then
-            local size = 0
-            if readfile then
-                local ok2, body = pcall(readfile, path)
-                if ok2 and type(body) == "string" then size = #body end
+            local base = name:gsub("%.rec$", "")
+            local metaPath = FOLDER .. "/" .. base .. ".meta.json"
+
+            -- prefer the small meta sidecar for almost everything; only fall
+            -- back to scanning the (potentially huge) .rec header when the
+            -- meta file is missing (in-progress recording or pre-1.2 file).
+            local meta = _readJSONFile(metaPath)
+            local size = meta and meta.byteCount or 0
+            local header = nil
+            if not meta then
+                local h, sz = _readHeaderFromRec(path)
+                header = h
+                size = sz
+            else
+                -- size from meta is the bytes-at-stop; check live file size if
+                -- a session is still appending. We don't trust meta size for
+                -- in-progress recordings, but we don't have a cheap stat call;
+                -- the cache below picks up changes between refreshes.
             end
-            out[#out + 1] = { name = name, path = path, size = size }
+
+            -- info row used by the Files tab
+            local info = {
+                name        = name,
+                path        = path,
+                size        = size,
+                startedAt   = (meta and meta.startedAt) or (header and header.startedAt),
+                durationSec = meta and meta.durationSec or nil,
+                frameCount  = meta and meta.frameCount  or nil,
+                placeId     = (meta and meta.placeId)   or (header and header.placeId),
+                placeName   = (meta and meta.placeName) or (header and header.placeName),
+                sources     = (meta and meta.sources)   or (header and header.sources),
+                isClip      = header and header.source == "instant-replay"
+                            or (meta and meta.source == "instant-replay") or false,
+                hasMeta     = meta ~= nil,
+            }
+            -- if we don't know the place name but have the id, try to look it
+            -- up (cheap if cached, async-ish if not — pcall keeps yields safe)
+            if not info.placeName and info.placeId then
+                info.placeName = lookupGameName(info.placeId)
+            end
+            out[#out + 1] = info
         end
     end
     table.sort(out, function(a, b) return a.name > b.name end)
@@ -746,10 +929,11 @@ end
 function rec:DeleteRecording(name)
     if not delfile then return false, "executor lacks delfile" end
     local sister = name:gsub("%.rec$", "")
-    local rec_  = FOLDER .. "/" .. name
-    local rig_  = FOLDER .. "/" .. sister .. ".rig.json"
-    local dbg_  = FOLDER .. "/" .. sister .. ".debug.log"
-    pcall(delfile, rec_); pcall(delfile, rig_); pcall(delfile, dbg_)
+    pcall(delfile, FOLDER .. "/" .. name)
+    pcall(delfile, FOLDER .. "/" .. sister .. ".rig.json")
+    pcall(delfile, FOLDER .. "/" .. sister .. ".debug.log")
+    pcall(delfile, FOLDER .. "/" .. sister .. ".meta.json")
+    self:_invalidateRecordingsCache(name)
     return true
 end
 
@@ -801,7 +985,16 @@ rec.conns.heartbeat = RunService.Heartbeat:Connect(function()
 
     if now >= rec.nextTickAt then
         local debugLog = s and s.debugEnabled and function(m) s:debugLog(m) end or nil
-        local snapshot = rec.tracker:snapshot(cfg, rec.encode, debugLog)
+        -- assemble snapshot from each enabled source
+        local snapshot = {}
+        if cfg.SRC_PLAYER_PARTS then
+            local players = rec.tracker:snapshot(cfg, rec.encode, debugLog)
+            for i = 1, #players do snapshot[#snapshot + 1] = players[i] end
+        end
+        if cfg.SRC_CAMERA then
+            local camStr = captureCameraStr(rec.encode, cfg.POS_PRECISION)
+            if camStr then snapshot[#snapshot + 1] = camStr end
+        end
         local maxCatchup = math.ceil(cfg.MAX_CATCHUP_SEC / rec.tickInterval)
         local filled = 0
         while now >= rec.nextTickAt and filled < maxCatchup do
@@ -1109,7 +1302,7 @@ local function buildSettingsView(parent)
         ScrollBarImageColor3 = THEME.border, BorderSizePixel = 0 }, parent)
     pad(view, 16); vlist(view, 14)
 
-    local order, groups = settingsByGroup()
+    local order, groups = settingsByGroup(SETTINGS_TAB_OMIT)
     local controls = {}
     for gi, gname in ipairs(order) do
         local groupBox = mk("Frame", { BackgroundColor3 = THEME.panel,
@@ -1241,25 +1434,67 @@ local function buildFilesView(parent)
         end
         for _, f in ipairs(files) do
             local row = mk("Frame", { BackgroundColor3 = THEME.panel,
-                BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 54) }, scroll)
-            corner(row, 6); pad(row, 12, 10, 12, 10)
+                BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 78) }, scroll)
+            corner(row, 6); pad(row, 14, 10, 14, 10)
+
+            -- top row: filename + delete button
             mk("TextLabel", { Text = f.name, Font = THEME.fontBold, TextSize = 13,
                 TextColor3 = THEME.text, BackgroundTransparency = 1,
-                Size = UDim2.new(1, -90, 0, 18),
+                Size = UDim2.new(1, -88, 0, 18),
                 TextXAlignment = Enum.TextXAlignment.Left,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
-            mk("TextLabel", { Text = humanBytes(f.size),
+            -- a subtle "CLIP" pill on instant-replay clips so they're identifiable
+            if f.isClip then
+                local clipPill = mk("TextLabel", { Text = "CLIP",
+                    Font = THEME.fontBold, TextSize = 10,
+                    TextColor3 = THEME.accent, BackgroundColor3 = THEME.bg,
+                    BorderSizePixel = 0,
+                    Position = UDim2.new(1, -130, 0, 0),
+                    Size = UDim2.fromOffset(40, 16) }, row)
+                corner(clipPill, 3); stroke(clipPill, THEME.accent, 1)
+            end
+
+            -- middle row: duration · date
+            local duration = f.durationSec and humanDuration(f.durationSec)
+                          or (f.hasMeta and "0s" or "?")
+            local dateStr  = f.startedAt and os.date("%Y-%m-%d %H:%M", f.startedAt)
+                          or "unknown date"
+            mk("TextLabel", {
+                Text = duration .. "  ·  " .. dateStr,
                 Font = THEME.fontMono, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(0, 20),
-                Size = UDim2.new(1, -90, 0, 14),
+                Position = UDim2.fromOffset(0, 22),
+                Size = UDim2.new(1, -88, 0, 16),
                 TextXAlignment = Enum.TextXAlignment.Left }, row)
+
+            -- bottom row: game name · size
+            local gameStr = f.placeName
+                         or (f.placeId and fmt("placeId %d", f.placeId))
+                         or "unknown place"
+            mk("TextLabel", {
+                Text = gameStr .. "  ·  " .. humanBytes(f.size or 0),
+                Font = THEME.fontReg, TextSize = 12,
+                TextColor3 = THEME.subtext, BackgroundTransparency = 1,
+                Position = UDim2.fromOffset(0, 42),
+                Size = UDim2.new(1, -88, 0, 16),
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd }, row)
+
+            -- delete button (anchored right, centered vertically)
             local del = mk("TextButton", { Text = "Delete",
                 Font = THEME.fontBold, TextSize = 12, TextColor3 = Color3.new(1,1,1),
                 BackgroundColor3 = THEME.danger, BorderSizePixel = 0,
                 AutoButtonColor = false,
-                Position = UDim2.new(1, -78, 0.5, -12),
-                Size = UDim2.fromOffset(72, 26) }, row); corner(del, 4)
+                Position = UDim2.new(1, -82, 1, -34),
+                Size = UDim2.fromOffset(76, 26) }, row); corner(del, 4)
+            del.MouseEnter:Connect(function()
+                TweenService:Create(del, HOVER_TWEEN,
+                    { BackgroundColor3 = THEME.dangerHi }):Play()
+            end)
+            del.MouseLeave:Connect(function()
+                TweenService:Create(del, HOVER_TWEEN,
+                    { BackgroundColor3 = THEME.danger }):Play()
+            end)
             del.MouseButton1Click:Connect(function()
                 rec:DeleteRecording(f.name); populate()
             end)
@@ -1274,50 +1509,94 @@ local function buildSourcesView(parent)
     local view = mk("Frame", { BackgroundTransparency = 1,
         Size = UDim2.fromScale(1, 1) }, parent)
     pad(view, 16); vlist(view, 10)
+
     mk("TextLabel", { Text = "Capture Sources", Font = THEME.fontBold,
         TextSize = 16, TextColor3 = THEME.text, BackgroundTransparency = 1,
         Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1,
         TextXAlignment = Enum.TextXAlignment.Left }, view)
     mk("TextLabel", {
-        Text = "Modules that contribute data to a recording. More to come.",
+        Text = "Toggle what each tick captures. Changes save instantly and "
+            .. "apply to both full recordings and the Instant Replay buffer.",
         Font = THEME.fontReg, TextSize = 12, TextColor3 = THEME.subtext,
-        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18),
-        LayoutOrder = 2, TextXAlignment = Enum.TextXAlignment.Left }, view)
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 32),
+        TextWrapped = true,
+        LayoutOrder = 2,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextXAlignment = Enum.TextXAlignment.Left }, view)
 
-    local function sourceRow(name, status, enabled, order)
+    local controls = {}  -- key -> { btn, refresh }   (for cross-tab sync)
+
+    local function plannedRow(name, desc, order)
         local row = mk("Frame", { BackgroundColor3 = THEME.panel,
-            BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 56),
+            BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 60),
             LayoutOrder = order }, view)
-        corner(row, 6); pad(row, 14, 10)
+        corner(row, 6); pad(row, 14, 12, 14, 12)
         mk("TextLabel", { Text = name, Font = THEME.fontBold, TextSize = 14,
             TextColor3 = THEME.text, BackgroundTransparency = 1,
-            Size = UDim2.new(1, -100, 0, 20),
+            Size = UDim2.new(1, -110, 0, 18),
             TextXAlignment = Enum.TextXAlignment.Left }, row)
-        mk("TextLabel", { Text = status, Font = THEME.fontReg, TextSize = 12,
+        mk("TextLabel", { Text = desc, Font = THEME.fontReg, TextSize = 12,
             TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-            Position = UDim2.fromOffset(0, 22),
-            Size = UDim2.new(1, -100, 0, 16),
-            TextXAlignment = Enum.TextXAlignment.Left }, row)
-        local pill = mk("TextLabel", {
-            Text = enabled and "ENABLED" or "PLANNED",
+            Position = UDim2.fromOffset(0, 20),
+            Size = UDim2.new(1, -110, 0, 18),
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd }, row)
+        local pill = mk("TextLabel", { Text = "PLANNED",
             Font = THEME.fontBold, TextSize = 11,
-            TextColor3 = Color3.new(1,1,1),
-            BackgroundColor3 = enabled and THEME.success or THEME.standby,
-            BorderSizePixel = 0,
-            Position = UDim2.new(1, -86, 0.5, -10),
-            Size = UDim2.fromOffset(80, 20),
+            TextColor3 = Color3.new(1, 1, 1),
+            BackgroundColor3 = THEME.standby, BorderSizePixel = 0,
+            Position = UDim2.new(1, -98, 0.5, -11),
+            Size = UDim2.fromOffset(90, 22),
         }, row); corner(pill, 4)
     end
-    sourceRow("Player parts",
-        "Per-tick world position + quaternion of every BasePart in each character.",
-        true, 3)
-    sourceRow("Player cameras",
-        "Camera CFrame + FOV per tick. Imports as a Blender camera.",
-        false, 4)
-    sourceRow("Audio events",
-        "SoundService cues with timestamps for post-sync.",
-        false, 5)
-    return { view = view }
+
+    local function sourceRow(d, order)
+        local row = mk("Frame", { BackgroundColor3 = THEME.panel,
+            BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 60),
+            LayoutOrder = order }, view)
+        corner(row, 6); pad(row, 14, 12, 14, 12)
+        mk("TextLabel", { Text = d.label, Font = THEME.fontBold, TextSize = 14,
+            TextColor3 = THEME.text, BackgroundTransparency = 1,
+            Size = UDim2.new(1, -110, 0, 18),
+            TextXAlignment = Enum.TextXAlignment.Left }, row)
+        mk("TextLabel", { Text = d.desc, Font = THEME.fontReg, TextSize = 12,
+            TextColor3 = THEME.subtext, BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(0, 20),
+            Size = UDim2.new(1, -110, 0, 18),
+            TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+            TextXAlignment = Enum.TextXAlignment.Left }, row)
+
+        local btn = mk("TextButton", { Text = "OFF",
+            Font = THEME.fontBold, TextSize = 12, TextColor3 = Color3.new(1,1,1),
+            BackgroundColor3 = THEME.standby, BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Position = UDim2.new(1, -98, 0.5, -13),
+            Size = UDim2.fromOffset(90, 26) }, row); corner(btn, 4)
+        local function refresh()
+            if rec.cfg[d.key] then
+                btn.Text = "ON"
+                btn.BackgroundColor3 = THEME.accent
+            else
+                btn.Text = "OFF"
+                btn.BackgroundColor3 = THEME.standby
+            end
+        end
+        btn.MouseButton1Click:Connect(function()
+            rec:SetSetting(d.key, not rec.cfg[d.key])
+            refresh()
+        end)
+        refresh()
+        controls[d.key] = { btn = btn, refresh = refresh }
+    end
+
+    local order = 3
+    for _, d in ipairs(settingsForGroup("Sources")) do
+        sourceRow(d, order); order = order + 1
+    end
+    plannedRow("Audio events",
+        "SoundService cues with timestamps for post-sync.", order)
+
+    return { view = view, controls = controls }
 end
 
 ----------------------------------------------------------------
@@ -1593,6 +1872,11 @@ function UI:_refreshStatus()
                 and c:IsA("TextButton") and (not UI.keyBindBtn or UI.keyBindBtn.key ~= key) then
                 c.Text = tostring(rec.cfg[key])
             end
+        end
+    end
+    if self.sourcesCtl and self.sourcesCtl.controls then
+        for _, c in pairs(self.sourcesCtl.controls) do
+            if c.refresh then c.refresh() end
         end
     end
 

@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 1, 2),
+    "version": (1, 2, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.1.2-alpha"
+ROCORDER_VERSION = "1.2.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -23,6 +23,7 @@ ROCORDER_VERSION = "1.1.2-alpha"
 # ============================================================================
 
 import json
+import math
 import os
 import time
 import bpy
@@ -107,29 +108,63 @@ def roblox_posquat_to_blender(px, py, pz, qx, qy, qz, qw, scale):
     return _conjugate(rob, scale)
 
 
+def roblox_cam_posquat_to_blender(px, py, pz, qx, qy, qz, qw, scale):
+    """Camera conversion: only LEFT-multiply by the axis swap, no right
+    multiplication. Body parts conjugate (R_swap @ M @ R_swap^-1) because we
+    want their LOCAL frame's axes to line up between Roblox and Blender for
+    vertex coordinates. Cameras instead need Blender's camera convention (view
+    along local -Z, up = +Y) to map onto Roblox's (view along local -Z, up =
+    +Y) after the world-space axis swap — and that requires skipping the right
+    multiplication. The result is a 4x4 such that the Blender camera's
+    lookVector in world space equals R_swap applied to Roblox's lookVector."""
+    rot = Quaternion((qw, qx, qy, qz))
+    n = rot.magnitude
+    rot = rot * (1.0 / n) if n > 1e-12 else Quaternion((1.0, 0.0, 0.0, 0.0))
+    rob = rot.to_matrix().to_4x4()
+    rob.translation = Vector((px, py, pz))
+    mat = ROBLOX_TO_BLENDER @ rob
+    mat.translation = mat.translation * scale
+    return mat
+
+
 # ----------------------------------------------------------------------------
 # Frame parsing
 # ----------------------------------------------------------------------------
 def parse_frame_line_v3(line):
-    """'t=1.23;uid:p0|p1|...;uid:...' -> (t, { uid: [ (7 floats), ... ] })"""
+    """'t=1.23;uid:p0|p1|...;cam:px,py,pz,qx,qy,qz,qw,fov;...'
+       -> (t, { uid: [ (7 floats), ... ] }, camera_tuple_or_None)
+
+    Camera chunks (prefix 'cam:') are parsed into an 8-float tuple. Unknown
+    prefixes are skipped so future sources don't break the importer.
+    """
     line = line.strip()
     if not line:
-        return None, None
+        return None, None, None
     parts = line.split(";")
     if not parts[0].startswith("t="):
-        return None, None
+        return None, None, None
     try:
         t = float(parts[0][2:])
     except ValueError:
-        return None, None
+        return None, None, None
 
-    out = {}
+    players = {}
+    camera = None
     for chunk in parts[1:]:
         if ":" not in chunk:
             continue
-        uid_str, blob = chunk.split(":", 1)
+        prefix, blob = chunk.split(":", 1)
+        if prefix == "cam":
+            vals = blob.split(",")
+            if len(vals) == 8:
+                try:
+                    camera = tuple(float(v) for v in vals)
+                except ValueError:
+                    pass
+            continue
+        # otherwise treat as a player uid
         try:
-            uid = int(uid_str)
+            uid = int(prefix)
         except ValueError:
             continue
         part_vals = []
@@ -142,8 +177,8 @@ def parse_frame_line_v3(line):
             except ValueError:
                 continue
         if part_vals:
-            out[uid] = part_vals
-    return t, out
+            players[uid] = part_vals
+    return t, players, camera
 
 
 # ----------------------------------------------------------------------------
@@ -605,14 +640,18 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
 
         frames = []
         bad_lines = 0
+        has_camera = False
         for raw in fh:
-            t, data = parse_frame_line_v3(raw)
+            t, players, camera = parse_frame_line_v3(raw)
             if t is None:
                 bad_lines += 1
                 continue
-            frames.append((t, data))
+            if camera is not None:
+                has_camera = True
+            frames.append((t, players, camera))
         if bad_lines:
             log("WARN {} unparseable lines skipped".format(bad_lines))
+        log("camera frames: {}".format("present" if has_camera else "none"))
 
     log("frames parsed: {}".format(len(frames)))
     if not frames:
@@ -640,6 +679,26 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     fallback_objs = {}
     fallback_quat = {}
     player_colls = {}
+
+    # Lazy: only create a camera object when we actually see camera data.
+    camera_obj  = None
+    camera_data = None
+    camera_last_quat = None
+
+    def ensure_camera():
+        nonlocal camera_obj, camera_data
+        if camera_obj is not None:
+            return camera_obj
+        camera_data = bpy.data.cameras.new(base_name + "_camera")
+        # Vertical fit so cam_data.angle == Roblox's FieldOfView (vertical FOV)
+        camera_data.sensor_fit = "VERTICAL"
+        camera_data.lens_unit = "FOV"
+        camera_obj = bpy.data.objects.new(base_name + "_camera", camera_data)
+        camera_obj.rotation_mode = "QUATERNION"
+        root_coll.objects.link(camera_obj)
+        log("created camera object: {} (sensor_fit=VERTICAL, FOV-driven)".format(
+            camera_obj.name))
+        return camera_obj
 
     # per-uid stats for end-of-import diagnostics
     bone_keycount = {}    # uid -> { bone: int }
@@ -689,9 +748,31 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     keyframes = 0
     bone_keys = 0
 
-    for t, data in frames:
+    camera_keys = 0
+    for t, data, camera in frames:
         frame_num = int(round(t * fps)) + 1
         last_frame = max(last_frame, frame_num)
+
+        if camera is not None:
+            ensure_camera()
+            px, py, pz, qx, qy, qz, qw, fov = camera
+            cam_mat = roblox_cam_posquat_to_blender(
+                px, py, pz, qx, qy, qz, qw, scale)
+            loc, rot, _ = cam_mat.decompose()
+            if camera_last_quat is not None and camera_last_quat.dot(rot) < 0.0:
+                rot = Quaternion((-rot.w, -rot.x, -rot.y, -rot.z))
+            camera_last_quat = rot
+            camera_obj.location = loc
+            camera_obj.rotation_quaternion = rot
+            camera_obj.keyframe_insert(data_path="location", frame=frame_num)
+            camera_obj.keyframe_insert(data_path="rotation_quaternion",
+                                       frame=frame_num)
+            # FOV: Roblox stores vertical FOV in degrees; Blender's
+            # cam_data.angle is in radians. With sensor_fit=VERTICAL the
+            # mapping is exact.
+            camera_data.angle = math.radians(max(1e-3, float(fov)))
+            camera_data.keyframe_insert(data_path="angle", frame=frame_num)
+            camera_keys += 3
 
         for uid, part_list in data.items():
             built = ensure_player(uid) if use_armatures else None
@@ -786,6 +867,13 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
         set_linear(built["arm"])
     for obj in fallback_objs.values():
         set_linear(obj)
+    if camera_obj is not None:
+        set_linear(camera_obj)
+        if camera_data is not None and camera_data.animation_data \
+                and camera_data.animation_data.action:
+            for fc in camera_data.animation_data.action.fcurves:
+                for kp in fc.keyframe_points:
+                    kp.interpolation = "LINEAR"
 
     scene.frame_start = 1
     scene.frame_end = last_frame
@@ -840,8 +928,10 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
             log("    {}: {}".format(b, c))
 
     log("")
-    log("totals: armatures={} fallback_objs={} frames={} keyframes={} bone_keys={}".format(
-        len(players), len(fallback_objs), len(frames), keyframes, bone_keys))
+    log("totals: armatures={} fallback_objs={} cameras={} frames={} "
+        "keyframes={} bone_keys={} camera_keys={}".format(
+            len(players), len(fallback_objs), camera_obj and 1 or 0,
+            len(frames), keyframes + camera_keys, bone_keys, camera_keys))
     log("=" * 76)
     flush_log()
     if log_path:
