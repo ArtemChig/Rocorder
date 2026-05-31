@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 5, 1),
+    "version": (1, 6, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.5.1-alpha"
+ROCORDER_VERSION = "1.6.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -259,19 +259,42 @@ def _asset_id(ref):
 
 
 class AssetFetcher:
-    def __init__(self, cache_dir, cookie, log, throttle=0.05):
+    def __init__(self, cache_dir, cookie, log, throttle=0.05, local_dirs=None):
         self.cache_dir = cache_dir
         self.cookie = (cookie or "").strip()
         self.log = log
         self.throttle = throttle
+        # Folders the recorder pre-downloaded assets into (named just '<id>').
+        # Checked BEFORE the network — this is the reliable path, since the
+        # executor downloads with a real authenticated session.
+        self.local_dirs = [d for d in (local_dirs or []) if d and os.path.isdir(d)]
         self._mesh_cache = {}     # id -> parsed mesh dict (or False on failure)
         self._image_cache = {}    # id -> local image path (or False)
         self._last_request = 0.0
-        self.stats = {"downloads": 0, "cache_hits": 0, "fails": 0, "auth_fails": 0}
+        self._auth_body_logged = False
+        self.stats = {"downloads": 0, "cache_hits": 0, "fails": 0,
+                      "auth_fails": 0, "local_hits": 0}
         try:
             os.makedirs(cache_dir, exist_ok=True)
         except OSError as e:
             self.log("WARN could not create asset cache dir {}: {}".format(cache_dir, e))
+
+    def _find_local(self, asset_id):
+        """Return a path to a recorder-downloaded asset file for this id, if any
+        (file named exactly '<id>' or '<id>.<ext>')."""
+        for d in self.local_dirs:
+            exact = os.path.join(d, asset_id)
+            if os.path.isfile(exact) and os.path.getsize(exact) > 0:
+                return exact
+            try:
+                for fn in os.listdir(d):
+                    if fn == asset_id or fn.startswith(asset_id + "."):
+                        p = os.path.join(d, fn)
+                        if os.path.isfile(p) and os.path.getsize(p) > 0:
+                            return p
+            except OSError:
+                pass
+        return None
 
     def _headers(self):
         h = {"User-Agent": "Roblox/WinInet", "Accept": "*/*"}
@@ -300,6 +323,13 @@ class AssetFetcher:
                 return (data if data else None), 200
             except urllib.error.HTTPError as e:
                 self._last_request = _t.monotonic()
+                if e.code in (401, 403) and not self._auth_body_logged:
+                    self._auth_body_logged = True
+                    try:
+                        body = e.read()[:300].decode("utf-8", "ignore")
+                    except Exception:
+                        body = "<unreadable>"
+                    self.log("    (first auth error {} body: {})".format(e.code, body))
                 if e.code in (401, 403, 404):
                     return None, e.code          # no point retrying
                 if e.code == 429 or 500 <= e.code < 600:
@@ -318,6 +348,12 @@ class AssetFetcher:
         """Return the local cached file path for an asset id, downloading if
         needed. Tries the v1 endpoint, then the authenticated v2 CDN-location
         flow. ext is a hint for the cache filename only."""
+        # 0) recorder-downloaded local asset (preferred — no network, no 401)
+        local = self._find_local(asset_id)
+        if local:
+            self.stats["local_hits"] += 1
+            return local
+
         cache_path = os.path.join(self.cache_dir, "{}{}".format(asset_id, ext))
         if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
             self.stats["cache_hits"] += 1
@@ -1232,8 +1268,20 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     if import_meshes:
         if not cache_dir or not cache_dir.strip():
             cache_dir = os.path.join(os.path.dirname(filepath), "rocorder_assets")
+        rec_dir = os.path.dirname(filepath)
+        # the recorder pre-downloads assets into ROCORDER/assets — look there
+        # (and one level up, in case the .rec is inside ROCORDER/) before the net
+        local_dirs = [
+            os.path.join(rec_dir, "assets"),
+            os.path.join(rec_dir, "rocorder_assets"),
+            os.path.join(os.path.dirname(rec_dir), "assets"),
+        ]
+        found = [d for d in local_dirs if os.path.isdir(d)]
         log("asset cache dir: {}".format(cache_dir))
-        assets = AssetFetcher(cache_dir, roblosecurity, log)
+        log("local asset dirs found: {}".format(found or "none "
+            "(Blender will try the network — expect 401s for modern assets "
+            "unless you enabled 'Download Assets' in the recorder)"))
+        assets = AssetFetcher(cache_dir, roblosecurity, log, local_dirs=local_dirs)
 
     scene = context.scene
     if set_fps:
@@ -1510,17 +1558,19 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     cookie_hint = False
     if assets is not None:
         log("")
-        log("assets: {} downloaded, {} cache hits, {} fails ({} auth/401)".format(
-            assets.stats["downloads"], assets.stats["cache_hits"],
-            assets.stats["fails"], assets.stats["auth_fails"]))
-        if assets.stats["auth_fails"] > 0 and not (roblosecurity or "").strip():
+        log("assets: {} local (recorder), {} downloaded, {} cache hits, "
+            "{} fails ({} auth/401)".format(
+                assets.stats["local_hits"], assets.stats["downloads"],
+                assets.stats["cache_hits"], assets.stats["fails"],
+                assets.stats["auth_fails"]))
+        if assets.stats["auth_fails"] > 0:
             cookie_hint = True
-            log("  *** {} assets returned 401 Unauthorized. Roblox no longer "
-                "serves most modern meshes/textures anonymously.".format(
-                    assets.stats["auth_fails"]))
-            log("  *** Paste your .ROBLOSECURITY cookie into the import dialog "
-                "and re-import to fetch them. Old/public assets still work "
-                "without it.")
+            log("  *** {} assets returned 401 and weren't found locally.".format(
+                assets.stats["auth_fails"]))
+            log("  *** BEST FIX: enable 'Download Assets' in the recorder "
+                "(Settings tab), re-record, and keep the ROCORDER/assets folder "
+                "next to the .rec. The executor downloads them with a real "
+                "session, which Blender can't do anonymously.")
 
     log("")
     log("totals: armatures={} fallback_objs={} cameras={} frames={} "
@@ -1531,9 +1581,9 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     flush_log()
     if cookie_hint:
         report({"WARNING"},
-               "ROCORDER: {} assets needed auth (401). Paste your "
-               ".ROBLOSECURITY cookie in the import options and re-import "
-               "for full meshes/textures. See the .import.log.".format(
+               "ROCORDER: {} assets couldn't be fetched (401). Enable "
+               "'Download Assets' in the recorder and keep the ROCORDER/assets "
+               "folder next to the .rec. See the .import.log.".format(
                    assets.stats["auth_fails"]))
     elif log_path:
         report({"INFO"}, "ROCORDER imported. Debug log: {}".format(log_path))

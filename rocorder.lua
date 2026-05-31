@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.5.1-alpha"
+local ROCORDER_VERSION = "1.6.0-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -52,7 +52,17 @@ if not ioOK(writefile, appendfile, makefolder, isfolder) then
 end
 
 local FOLDER = "ROCORDER"
+local ASSETS_FOLDER = FOLDER .. "/assets"
 if not isfolder(FOLDER) then makefolder(FOLDER) end
+
+-- Executor HTTP request function (for authenticated asset downloads). These
+-- run in the real client session, so they reach assets Blender's anonymous
+-- urllib can't (it gets 401). Names vary across executors.
+local httpRequest = (syn and syn.request)
+    or (http and http.request)
+    or http_request
+    or request
+    or (fluxus and fluxus.request)
 
 -- Forward-declared so rec methods (defined before the UI section) can call
 -- Indicator:refresh() — the actual table is assigned later in the UI section.
@@ -78,6 +88,12 @@ local SETTING_DEFS = {
       desc="Record yourself too.",                                 group="Capture" },
     { key="DEBUG",           type="bool",   default=true, label="Write Debug Log",
       desc="Write a verbose .debug.log next to each recording.",   group="Capture" },
+    { key="DOWNLOAD_ASSETS", type="bool",   default=true, label="Download Assets",
+      desc="At Stop, download every mesh/texture the characters use into "
+        .. "ROCORDER/assets so Blender can build real models offline. Uses "
+        .. "the executor's authenticated session (works where Blender's "
+        .. "anonymous downloads get 401'd).",
+      group="Capture" },
     { key="POS_PRECISION",   type="number", default=3,    label="Position Decimals",
       desc="Decimal places for positions (studs).",                group="Capture",
       min=0,   max=6,   int=true, advanced=true },
@@ -1020,6 +1036,93 @@ function rec:Start()
     self:_signalUI()
 end
 
+-- Gather every unique Roblox asset id referenced by a rig (meshes, textures,
+-- color maps, decals, clothing) into `set`.
+local function collectAssetIds(rig, set)
+    local function add(ref)
+        if type(ref) == "string" then
+            local id = ref:match("(%d%d%d%d+)")
+            if id then set[id] = true end
+        end
+    end
+    for _, p in ipairs(rig.parts) do
+        add(p.meshId); add(p.textureId); add(p.colorMap)
+        if p.decals then for _, d in ipairs(p.decals) do add(d.texture) end end
+    end
+    if rig.clothing then
+        add(rig.clothing.shirt); add(rig.clothing.pants); add(rig.clothing.tshirt)
+    end
+end
+
+-- Download every asset the tracked characters use, into ROCORDER/assets/<id>,
+-- using the executor's authenticated session. Runs in a coroutine so it never
+-- blocks. Blender then reads these local files instead of hitting the (401'd)
+-- anonymous CDN. `logSink` is the just-finished session (for its debug log).
+function rec:_downloadAssets(logSink)
+    if not self.cfg.DOWNLOAD_ASSETS then return end
+
+    local ids = {}
+    for _, e in pairs(self.tracker.tracked) do collectAssetIds(e.rig, ids) end
+    local list = {}
+    for id in pairs(ids) do list[#list + 1] = id end
+    if #list == 0 then return end
+
+    local function dbg(msg)
+        if logSink and logSink.debugEnabled then
+            logSink:debugLog(msg); logSink:flushDebug()
+        end
+    end
+
+    task.spawn(function()
+        if not isfolder(ASSETS_FOLDER) then pcall(makefolder, ASSETS_FOLDER) end
+        local okc, failc, skipc = 0, 0, 0
+        dbg(fmt("ASSET DOWNLOAD start: %d unique assets (httpRequest=%s)",
+            #list, httpRequest and "yes" or "no (game:HttpGet only)"))
+        notify("ROCORDER", fmt("Downloading %d assets…", #list), 3)
+
+        for _, id in ipairs(list) do
+            local path = ASSETS_FOLDER .. "/" .. id
+            if isfile and isfile(path) then
+                skipc += 1
+            else
+                local url = "https://assetdelivery.roblox.com/v1/asset/?id=" .. id
+                local body
+
+                if httpRequest then
+                    local okr, resp = pcall(httpRequest, { Url = url, Method = "GET" })
+                    if okr and type(resp) == "table" then
+                        local code = resp.StatusCode or resp.Status or 200
+                        if resp.Body and #resp.Body > 0 and code >= 200 and code < 300 then
+                            body = resp.Body
+                        else
+                            dbg(fmt("  asset %s http status=%s", id, tostring(code)))
+                        end
+                    end
+                end
+                if not body then
+                    local okg, b = pcall(function() return game:HttpGet(url, true) end)
+                    if okg and type(b) == "string" and #b > 0 and b:sub(1, 3) ~= "404" then
+                        body = b
+                    end
+                end
+
+                if body then
+                    local okw = pcall(writefile, path, body)
+                    if okw then okc += 1 else failc += 1 end
+                else
+                    failc += 1
+                end
+            end
+            task.wait()  -- yield between downloads so we never hitch the client
+        end
+
+        dbg(fmt("ASSET DOWNLOAD done: %d saved, %d already cached, %d failed -> %s",
+            okc, skipc, failc, ASSETS_FOLDER))
+        notify("ROCORDER",
+            fmt("Assets: %d saved, %d cached, %d failed", okc, skipc, failc), 5)
+    end)
+end
+
 function rec:Stop()
     if not self.session then return end
     local s = self.session
@@ -1039,6 +1142,7 @@ function rec:Stop()
         s:flushDebug()
     end
     notify("ROCORDER", fmt("Saved %d ticks -> %s", s.tickCount, s.filename), 4)
+    self:_downloadAssets(s)
     self:_signalUI()
 end
 
@@ -1064,6 +1168,7 @@ function rec:SaveReplay(seconds)
     notify("ROCORDER",
         fmt("Saved %.1fs clip (%d frames) -> %s", secsOut, frames, saved), 5)
     self:_invalidateRecordingsCache()
+    self:_downloadAssets(nil)
     self:_signalUI()
     return saved
 end
