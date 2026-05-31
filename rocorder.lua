@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.8.1-alpha"
+local ROCORDER_VERSION = "1.9.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -443,6 +443,8 @@ local function extractMeshFromPart(part)
     if not vids or #vids == 0 then return nil, "no vertices" end
     local verts, uvs, normals = {}, {}, {}
     local idMap = {}    -- engine-vertex-id -> 0-indexed slot
+    -- Yield every 500 vertices so a 5000-vertex mesh becomes ~10 frame-spread
+    -- chunks instead of one 250ms stall.
     for i, vid in ipairs(vids) do
         idMap[vid] = i - 1
         local p = em:GetPosition(vid)
@@ -457,6 +459,7 @@ local function extractMeshFromPart(part)
         if okN and n then
             normals[#normals+1] = n.X; normals[#normals+1] = n.Y; normals[#normals+1] = n.Z
         end
+        if i % 500 == 0 then task.wait() end
     end
 
     -- Faces (triangles). Method name varies by Roblox API revision.
@@ -467,7 +470,7 @@ local function extractMeshFromPart(part)
         okF = pcall(function() fids = em:GetTriangles() end)
     end
     if okF and fids then
-        for _, fid in ipairs(fids) do
+        for i, fid in ipairs(fids) do
             local fv
             local okFV = pcall(function() fv = em:GetFaceVertices(fid) end)
             if not okFV or not fv then
@@ -479,6 +482,7 @@ local function extractMeshFromPart(part)
                     faces[#faces+1] = a; faces[#faces+1] = b; faces[#faces+1] = c
                 end
             end
+            if i % 500 == 0 then task.wait() end
         end
     end
     if #faces == 0 then return nil, "no faces produced" end
@@ -579,14 +583,298 @@ local function extractPartAssets(part, partInfo, dbg)
 end
 
 -- Extract a player's clothing textures (Shirt.ShirtTemplate, Pants.PantsTemplate,
--- ShirtGraphic.Graphic). These live on the Shirt/Pants instances, not on parts,
--- so extractPartAssets misses them entirely. EditableImage works for clothing
--- the engine has loaded — same permission rules as accessories.
+-- ShirtGraphic.Graphic). These live on the Shirt/Pants instances, not on parts.
+-- (Used as a fallback when not using the queue.)
 local function extractClothingAssets(clothing, dbg)
     if not clothing then return end
     if clothing.shirt  then _extractImageRef(clothing.shirt, dbg);  task.wait() end
     if clothing.pants  then _extractImageRef(clothing.pants, dbg);  task.wait() end
     if clothing.tshirt then _extractImageRef(clothing.tshirt, dbg); task.wait() end
+end
+
+----------------------------------------------------------------
+-- Asset extraction queue — one global worker, frame-health-aware. Designed
+-- so an hour-long Instant Replay session with players coming and going doesn't
+-- produce constant lag spikes. Processes one asset at a time, only when the
+-- last heartbeat dt was healthy. Persistent across reloads.
+----------------------------------------------------------------
+_G.ROCORDER_EXTRACT_QUEUE = _G.ROCORDER_EXTRACT_QUEUE or {
+    queue         = {},      -- ordered list of pending entries
+    byId          = {},      -- id -> entry (dedup; entries removed on pop)
+    perPlayer     = {},      -- uid -> { name, total, done, failed, missed, ... }
+    workerVersion = 0,       -- bumped per reload so stale workers self-exit
+    stats         = { totalSeen = 0, done = 0, failed = 0, missed = 0 },
+    -- last item we picked up — surfaced in the UI so the user sees activity
+    activeKind    = nil,     -- "mesh" / "image"
+    activeId      = nil,
+    activePlayer  = nil,
+}
+local Q = _G.ROCORDER_EXTRACT_QUEUE
+
+local function _ensurePlayerStats(uid, displayName)
+    if not uid then return nil end
+    local ps = Q.perPlayer[uid]
+    if not ps then
+        ps = {
+            uid = uid, name = displayName or ("uid " .. tostring(uid)),
+            total = 0, done = 0, failed = 0, missed = 0,
+            seenAt = os.clock(), leftAt = nil, lastActivityAt = os.clock(),
+        }
+        Q.perPlayer[uid] = ps
+    elseif displayName then
+        ps.name = displayName
+    end
+    return ps
+end
+
+local function _markPlayerLeft(uid)
+    local ps = Q.perPlayer[uid]
+    if ps and not ps.leftAt then ps.leftAt = os.clock() end
+end
+
+local function _enqueueAsset(id, kind, partInst, partInfo, uid, displayName)
+    if not id then return end
+    local ps = uid and _ensurePlayerStats(uid, displayName) or nil
+
+    -- already on disk (any format) → count as done and skip
+    if EXTRACTED[id] or _isCached(id) then
+        if ps then ps.total = ps.total + 1; ps.done = ps.done + 1
+            ps.lastActivityAt = os.clock() end
+        return
+    end
+
+    local entry = Q.byId[id]
+    if entry then
+        -- already queued — register this part as a backup ref and this player
+        -- as an owner. If the first player leaves, we'll use the backup.
+        entry.partRefs[#entry.partRefs + 1] = { inst = partInst, info = partInfo }
+        if uid then
+            if not entry.owners[uid] then
+                entry.owners[uid] = true
+                if ps then ps.total = ps.total + 1
+                    ps.lastActivityAt = os.clock() end
+            end
+        end
+        return
+    end
+
+    entry = {
+        id = id, kind = kind,
+        partRefs = { { inst = partInst, info = partInfo } },
+        owners = uid and { [uid] = true } or {},
+        enqueuedAt = os.clock(),
+    }
+    Q.byId[id] = entry
+    Q.queue[#Q.queue + 1] = entry
+    Q.stats.totalSeen = Q.stats.totalSeen + 1
+    if ps then ps.total = ps.total + 1; ps.lastActivityAt = os.clock() end
+end
+
+local function _findLivePartRef(entry)
+    for _, r in ipairs(entry.partRefs) do
+        if r.inst and r.inst.Parent then return r end
+    end
+    return nil
+end
+
+local function _imgRefFromPartInfo(info, entryId)
+    if not info then return "rbxassetid://" .. entryId end
+    if info.textureId then return info.textureId end
+    if info.colorMap  then return info.colorMap  end
+    if info.decals then
+        for _, d in ipairs(info.decals) do
+            if d.texture then
+                -- match the decal whose texture corresponds to this id
+                if d.texture:find(entryId, 1, true) then return d.texture end
+            end
+        end
+    end
+    return "rbxassetid://" .. entryId
+end
+
+local function _markEntryDone(entry, dbg)
+    EXTRACTED[entry.id] = true
+    Q.stats.done = Q.stats.done + 1
+    for uid in pairs(entry.owners) do
+        local ps = Q.perPlayer[uid]
+        if ps then ps.done = ps.done + 1; ps.lastActivityAt = os.clock() end
+    end
+end
+
+local function _markEntryFailed(entry, wasMissed, dbg)
+    Q.stats.failed = Q.stats.failed + 1
+    if wasMissed then Q.stats.missed = Q.stats.missed + 1 end
+    for uid in pairs(entry.owners) do
+        local ps = Q.perPlayer[uid]
+        if ps then
+            ps.failed = ps.failed + 1
+            if wasMissed then ps.missed = ps.missed + 1 end
+            ps.lastActivityAt = os.clock()
+        end
+    end
+end
+
+-- Try the extractor path; if it fails or no live part remains, try a one-shot
+-- authenticated HTTP fetch. Returns true if the asset ended up on disk.
+local function _processOne(entry, dbg)
+    local ref = _findLivePartRef(entry)
+    local body, err
+
+    if ref then
+        if entry.kind == "mesh" then
+            local geom
+            geom, err = extractMeshFromPart(ref.inst)
+            if geom then body = HttpService:JSONEncode(geom) end
+        else
+            local imgRef = _imgRefFromPartInfo(ref.info, entry.id)
+            body, err = extractImageFromContent(imgRef)
+        end
+    end
+
+    if body then
+        local path = (entry.kind == "mesh") and _geomPath(entry.id) or _imgPath(entry.id)
+        if pcall(writefile, path, body) then
+            _markEntryDone(entry, dbg)
+            if dbg then
+                dbg(fmt("  EXTRACT %s %s OK (%d bytes, queued for %.1fs)",
+                    entry.kind, entry.id, #body, os.clock() - entry.enqueuedAt))
+            end
+            return true
+        end
+    end
+
+    -- Fallback: authenticated HTTP one-shot. Re-uses the existing httpRequest
+    -- function probed at module load. This handles the case where the player
+    -- left and their parts were destroyed before we got to them.
+    if httpRequest then
+        local urls = {
+            "https://assetdelivery.roblox.com/v1/asset/?id=" .. entry.id,
+            "https://assetdelivery.roblox.com/v2/asset/?id=" .. entry.id,
+        }
+        for _, url in ipairs(urls) do
+            local okr, resp = pcall(httpRequest, {
+                Url = url, Method = "GET",
+                Headers = {
+                    ["User-Agent"]      = "Roblox/WinInet",
+                    ["Roblox-Place-Id"] = tostring(game.PlaceId),
+                },
+            })
+            if okr and type(resp) == "table" then
+                local code = resp.StatusCode or resp.Status or 200
+                if resp.Body and code >= 200 and code < 300 and looksLikeAsset(resp.Body) then
+                    if pcall(writefile, _binPath(entry.id), resp.Body) then
+                        _markEntryDone(entry, dbg)
+                        if dbg then
+                            dbg(fmt("  EXTRACT %s %s OK via HTTP fallback (%d bytes)",
+                                entry.kind, entry.id, #resp.Body))
+                        end
+                        return true
+                    end
+                end
+            end
+        end
+    end
+
+    _markEntryFailed(entry, ref == nil, dbg)
+    if dbg then
+        dbg(fmt("  EXTRACT %s %s FAILED%s — %s",
+            entry.kind, entry.id,
+            (ref == nil) and " (player left before extraction)" or "",
+            tostring(err or "no path produced bytes")))
+    end
+    return false
+end
+
+-- Worker — single global coroutine. Polls the queue, processes one entry at a
+-- time when the game is idle. Survives reloads via workerVersion check.
+local function _startExtractorWorker()
+    if not EXTRACT_OK then return end
+    Q.workerVersion = (Q.workerVersion or 0) + 1
+    local myVersion = Q.workerVersion
+    task.spawn(function()
+        local FRAME_BUDGET = 0.040  -- 40ms = ~25fps; skip work when slower
+        while Q.workerVersion == myVersion do
+            -- back off if queue is empty
+            if #Q.queue == 0 then
+                Q.activeId = nil; Q.activeKind = nil; Q.activePlayer = nil
+                task.wait(0.1)
+            else
+                -- wait for next frame and read its delta as a freshness signal
+                local dt = RunService.Heartbeat:Wait()
+                if dt > FRAME_BUDGET then
+                    -- game is busy; back off proportionally
+                    task.wait(0.15)
+                else
+                    local entry = table.remove(Q.queue, 1)
+                    if entry then
+                        Q.byId[entry.id] = nil
+                        Q.activeId = entry.id
+                        Q.activeKind = entry.kind
+                        -- surface first owner for UI
+                        for uid in pairs(entry.owners) do
+                            local ps = Q.perPlayer[uid]
+                            if ps then Q.activePlayer = ps.name; break end
+                        end
+                        -- ROCORDER_CURRENT_DBG is set during a recording so the
+                        -- session debug log captures extraction lines too
+                        _processOne(entry, _G.ROCORDER_CURRENT_DBG)
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- Public enqueue helper used by Tracker:ensure. Walks a single (part, partInfo)
+-- and enqueues every asset reference. Cheap — no yields, just bookkeeping.
+local function enqueuePartAssets(part, partInfo, uid, displayName)
+    if not isfolder(ASSETS_FOLDER) then pcall(makefolder, ASSETS_FOLDER) end
+    local meshId = _assetIdFromRef(partInfo.meshId)
+    if meshId then
+        _enqueueAsset(meshId, "mesh", part, partInfo, uid, displayName)
+    end
+    local imgs = {}
+    if partInfo.textureId then imgs[#imgs+1] = partInfo.textureId end
+    if partInfo.colorMap  then imgs[#imgs+1] = partInfo.colorMap  end
+    if partInfo.decals then
+        for _, d in ipairs(partInfo.decals) do
+            if d.texture then imgs[#imgs+1] = d.texture end
+        end
+    end
+    for _, ref in ipairs(imgs) do
+        local id = _assetIdFromRef(ref)
+        if id then
+            _enqueueAsset(id, "image", part, partInfo, uid, displayName)
+        end
+    end
+end
+
+local function enqueueClothing(clothing, uid, displayName)
+    if not clothing then return end
+    for _, key in ipairs({ "shirt", "pants", "tshirt" }) do
+        local ref = clothing[key]
+        local id = _assetIdFromRef(ref)
+        if id then
+            -- partInst is nil — these aren't a single Instance. The extractor
+            -- will use the rbxassetid URL directly via Content.fromUri.
+            _enqueueAsset(id, "image", nil, { textureId = ref }, uid, displayName)
+        end
+    end
+end
+
+-- Public read-only snapshot for the UI status loop.
+local function queueSnapshot()
+    return {
+        queued     = #Q.queue,
+        done       = Q.stats.done,
+        failed     = Q.stats.failed,
+        missed     = Q.stats.missed,
+        totalSeen  = Q.stats.totalSeen,
+        activeId   = Q.activeId,
+        activeKind = Q.activeKind,
+        activePlayer = Q.activePlayer,
+        perPlayer  = Q.perPlayer,
+    }
 end
 
 ----------------------------------------------------------------
@@ -874,24 +1162,17 @@ function Tracker:ensure(player, encode, debugLog)
     end
     self.tracked[uid] = entry
 
-    -- Kick off background asset extraction for this player. Each unique
-    -- mesh/texture is pulled from the engine's loaded copy via EditableMesh /
-    -- EditableImage and written to ROCORDER/assets/<id>.geom.json or .rgba.
-    -- Runs in a coroutine with task.wait() between assets so the game stays
-    -- smooth, and survives Stop so late-arriving extractions still complete.
+    -- Enqueue every asset for the global extractor worker. The worker pops
+    -- one at a time when frame health is good, so there are no spikes from
+    -- a flood of player joins (e.g. during a long Instant Replay session).
     if EXTRACT_OK then
-        task.spawn(function()
-            for i, ref in ipairs(refs) do
-                if ref.inst and ref.inst.Parent then
-                    local pi = rig.parts[i]
-                    pcall(extractPartAssets, ref.inst, pi, debugLog)
-                end
-                task.wait()
+        local displayName = player.DisplayName or player.Name
+        for i, r in ipairs(refs) do
+            if r.inst then
+                enqueuePartAssets(r.inst, rig.parts[i], uid, displayName)
             end
-            -- Clothing templates live on Shirt/Pants instances, not parts;
-            -- extract them separately so shirts/pants come through too.
-            pcall(extractClothingAssets, rig.clothing, debugLog)
-        end)
+        end
+        enqueueClothing(rig.clothing, uid, displayName)
     end
 
     if debugLog then
@@ -1386,6 +1667,11 @@ function rec:Start()
         self.session:debugLog("roster: " .. table.concat(rs, ", "))
     end
     notify("ROCORDER", "Recording -> " .. self.session.filename, 3)
+    -- Surface the session's debug log to the global extractor worker so
+    -- per-asset OK/FAILED lines land in this recording's .debug.log.
+    _G.ROCORDER_CURRENT_DBG = self.session.debugEnabled
+        and function(m) self.session:debugLog(m); self.session:flushDebug() end
+        or nil
     self:_signalUI()
 end
 
@@ -1625,6 +1911,7 @@ function rec:Stop()
         s:flushDebug()
     end
     notify("ROCORDER", fmt("Saved %d ticks -> %s", s.tickCount, s.filename), 4)
+    _G.ROCORDER_CURRENT_DBG = nil
     self:_downloadAssets(s)
     self:_signalUI()
 end
@@ -2230,10 +2517,61 @@ local function buildRecordView(parent)
     recordBtn.MouseButton1Click:Connect(function() rec:Toggle() end)
     replayBtn.MouseButton1Click:Connect(function() rec:SaveReplay() end)
 
+    ---- Assets panel: aggregate progress + per-player breakdown ----
+    local assetPanel = mk("Frame", {
+        BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        LayoutOrder = 5,
+    }, view)
+    corner(assetPanel, 8); pad(assetPanel, 14, 12, 14, 12); vlist(assetPanel, 8)
+
+    mk("TextLabel", { Text = "Assets",
+        Font = THEME.fontBold, TextSize = 13, TextColor3 = THEME.accent,
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16),
+        TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 1 }, assetPanel)
+
+    local assetHeadline = mk("TextLabel", {
+        Text = "extractor idle — no players tracked yet",
+        Font = THEME.fontMono, TextSize = 12, TextColor3 = THEME.text,
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16),
+        TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 2 }, assetPanel)
+
+    -- progress bar
+    local barBg = mk("Frame", { BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 6), LayoutOrder = 3 }, assetPanel)
+    corner(barBg, 3)
+    local barFill = mk("Frame", { BackgroundColor3 = THEME.accent,
+        BorderSizePixel = 0, Size = UDim2.new(0, 0, 1, 0) }, barBg)
+    corner(barFill, 3)
+
+    local assetStats = mk("TextLabel", {
+        Text = "", Font = THEME.fontMono, TextSize = 11,
+        TextColor3 = THEME.subtext, BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 14),
+        TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 4 }, assetPanel)
+
+    -- separator
+    mk("Frame", { BackgroundColor3 = THEME.border, BorderSizePixel = 0,
+        BackgroundTransparency = 0.5,
+        Size = UDim2.new(1, 0, 0, 1), LayoutOrder = 5 }, assetPanel)
+
+    -- per-player rows (rebuilt each refresh)
+    local playerList = mk("Frame", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 6 }, assetPanel)
+    vlist(playerList, 2)
+
     return {
         view = view, status = status,
         recordBtn = recordBtn, replayBtn = replayBtn,
         irToggle = irToggle, refreshIrToggle = refreshIrToggle,
+        assetPanel = assetPanel,
+        assetHeadline = assetHeadline,
+        assetStats = assetStats,
+        assetBarFill = barFill,
+        assetPlayerList = playerList,
     }
 end
 
@@ -2933,6 +3271,83 @@ function UI:_refreshStatus()
             "%s record  ·  %s save replay  ·  %s toggle window",
             rec.cfg.HOTKEY_RECORD, rec.cfg.HOTKEY_SAVE_REPLAY, rec.cfg.HOTKEY_UI)
     end
+
+    -- Assets panel: aggregate progress + per-player rows
+    if ctl.assetHeadline then
+        local snap = queueSnapshot()
+        local total = snap.totalSeen
+        local pct = total > 0 and (snap.done / total) or 0
+        ctl.assetBarFill.Size = UDim2.new(pct, 0, 1, 0)
+
+        if total == 0 then
+            ctl.assetHeadline.Text = "extractor ready · waiting for players"
+        else
+            local activity = snap.activeId
+                and fmt(" — extracting %s %s%s",
+                    snap.activeKind or "?", snap.activeId,
+                    snap.activePlayer and ("  (" .. snap.activePlayer .. ")") or "")
+                or ""
+            ctl.assetHeadline.Text = fmt("%d / %d extracted%s",
+                snap.done, total, activity)
+        end
+        ctl.assetStats.Text = fmt("queued %d  ·  done %d  ·  failed %d  ·  missed %d",
+            snap.queued, snap.done, snap.failed, snap.missed)
+
+        -- per-player rows: rebuild from sorted snapshot
+        local list = ctl.assetPlayerList
+        list:ClearAllChildren()
+        vlist(list, 2)
+        local rows = {}
+        for _, ps in pairs(snap.perPlayer) do rows[#rows + 1] = ps end
+        table.sort(rows, function(a, b)
+            return (a.lastActivityAt or 0) > (b.lastActivityAt or 0)
+        end)
+        for i = 1, math.min(8, #rows) do
+            local ps = rows[i]
+            local pending = math.max(0, ps.total - ps.done - ps.failed)
+            local icon, color
+            if ps.leftAt and ps.missed > 0 then
+                icon = "\xE2\x9A\xA0"; color = THEME.danger   -- ⚠
+            elseif ps.leftAt then
+                icon = "\xE2\x86\x90"; color = THEME.subtext  -- ←
+            elseif pending == 0 and ps.failed == 0 then
+                icon = "\xE2\x9C\x93"; color = THEME.success  -- ✓
+            elseif pending > 0 then
+                icon = "\xE2\x80\xA6"; color = THEME.accent   -- …
+            else
+                icon = "\xE2\x97\x8B"; color = THEME.subtext  -- ○
+            end
+            local row = mk("Frame", { BackgroundTransparency = 1,
+                Size = UDim2.new(1, 0, 0, 14) }, list)
+            mk("TextLabel", { Text = icon, Font = THEME.fontBold, TextSize = 11,
+                TextColor3 = color, BackgroundTransparency = 1,
+                Size = UDim2.fromOffset(14, 14),
+                TextXAlignment = Enum.TextXAlignment.Left }, row)
+            mk("TextLabel", { Text = ps.name,
+                Font = THEME.fontReg, TextSize = 11, TextColor3 = THEME.text,
+                BackgroundTransparency = 1,
+                Position = UDim2.fromOffset(18, 0),
+                Size = UDim2.new(0.55, -18, 1, 0),
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd }, row)
+            local detail
+            if ps.leftAt and ps.missed > 0 then
+                detail = fmt("left — %d missed", ps.missed)
+            elseif ps.leftAt then
+                detail = fmt("left — %d/%d", ps.done, ps.total)
+            elseif pending > 0 then
+                detail = fmt("%d/%d  (%d pending)", ps.done, ps.total, pending)
+            else
+                detail = fmt("%d/%d", ps.done, ps.total)
+            end
+            mk("TextLabel", { Text = detail,
+                Font = THEME.fontMono, TextSize = 11, TextColor3 = THEME.subtext,
+                BackgroundTransparency = 1,
+                Position = UDim2.new(0.55, 0, 0, 0),
+                Size = UDim2.new(0.45, 0, 1, 0),
+                TextXAlignment = Enum.TextXAlignment.Right }, row)
+        end
+    end
 end
 
 function UI:_startStatusLoop()
@@ -2954,6 +3369,16 @@ rec.onStateChange = function() if UI.gui then UI:_refreshStatus() end end
 ----------------------------------------------------------------
 buildUI()
 Indicator:refresh()  -- pick up persisted state (e.g. IR_ENABLED) on script load
+
+-- Asset extractor worker: a single global coroutine that drains the queue
+-- when the game is idle. Survives Stop and reloads.
+_startExtractorWorker()
+
+-- Mark a player as "left" so the UI can show "X assets missed" for them. The
+-- extractor's own fallback already tries HTTP when no live partRef remains.
+rec.conns.playerLeaving = Players.PlayerRemoving:Connect(function(p)
+    _markPlayerLeft(p.UserId)
+end)
 
 rec.conns.input = UserInputService.InputBegan:Connect(function(input, processed)
     -- key-bind picker captures the next key regardless of processed flag

@@ -9,6 +9,46 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.0-alpha — 2026-05-31
+
+Reworked extractor for sustained Instant Replay sessions + new Assets status
+panel in the Record tab. The 1.8.x extractor spawned a coroutine per player
+that did all of their assets in a burst, producing 0.4–1.5s stutters every
+time someone joined. Bad for hour-long IR. Now there's a single global
+queue-driven worker that paces itself by frame health.
+
+- **One global extractor coroutine.** Per-player `Tracker:ensure` no longer
+  spawns its own coroutine — it just enqueues asset IDs. The single worker
+  pops one entry at a time and only proceeds when the last heartbeat dt
+  was healthy (< 40ms ≈ 25fps). On a busy frame it backs off 150ms and
+  retries. Result: extraction work fills the idle time the game wasn't
+  using, instead of competing with rendering.
+- **Mid-mesh yielding.** `extractMeshFromPart` now `task.wait()`s every 500
+  vertices and every 500 faces, so a 5000-vertex Rthro mesh becomes ten
+  ~16ms chunks instead of one ~250ms stall.
+- **Multi-partRef per asset for resilience.** If 3 players have the same
+  hat, we still extract once but remember all 3 part instances. If player A
+  leaves before we get to it, we use B's or C's. If everyone with that
+  asset has left, the worker falls back to an authenticated HTTP fetch.
+- **Player-left handling.** `Players.PlayerRemoving` flags the player's
+  perPlayer stats with `leftAt` so the UI can show "left — N missed" for
+  anyone whose assets we couldn't catch in time.
+- **Assets status panel in the Record tab.** New section under the IR row,
+  always visible. Shows:
+  - Headline: `47 / 53 extracted — extracting mesh 12345 (lilia)`
+  - Progress bar
+  - Stats line: `queued N · done N · failed N · missed N`
+  - Per-player list (sorted by most recent activity, top 8): name +
+    `done/total` + status icon (✓ complete, … in progress, ← left,
+    ⚠ left with misses)
+  Updates every 200ms via the existing status loop.
+- Extraction events still log to the active session's `.debug.log` (via
+  `_G.ROCORDER_CURRENT_DBG` set in Start, cleared in Stop), so the per-
+  asset `EXTRACT mesh X OK` lines you've seen still land in the right file.
+
+The Blender importer still doesn't read `.geom.json` / `.rgba`. That's the
+next big commit (1.10.0).
+
 ## 1.8.1-alpha — 2026-05-31
 
 The 1.8.0 log showed the extractor catching essentially everything except
