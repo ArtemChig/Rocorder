@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 6, 1),
+    "version": (1, 6, 2),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.6.1-alpha"
+ROCORDER_VERSION = "1.6.2-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -432,11 +432,28 @@ class AssetFetcher:
             return c or None
         path = self._download(aid, ".mesh")
         if not path:
+            self.log("    mesh {} unavailable (no local file + network "
+                     "refused) -> box".format(aid))
             self._mesh_cache[aid] = False
             return None
         try:
             with open(path, "rb") as fh:
                 data = fh.read()
+        except OSError as e:
+            self.log("    mesh {} read error: {} -> box".format(aid, e))
+            self._mesh_cache[aid] = False
+            return None
+        # A saved 401/403 error page is NOT a mesh. Detect and report it instead
+        # of silently falling back to a box (this was the "girly limbs / held
+        # item are boxes" bug — the recorder had saved error bodies as assets).
+        if data[:8] != b"version ":
+            head = data[:80].decode("utf-8", "ignore").replace("\n", " ")
+            self.log("    mesh {} local file is NOT a mesh (likely a saved "
+                     "401/403 error page): '{}' -> box. Re-record with the "
+                     "1.6.2+ recorder.".format(aid, head))
+            self._mesh_cache[aid] = False
+            return None
+        try:
             mesh = parse_roblox_mesh(data, self.log)
         except Exception as e:
             self.log("    mesh parse error for asset {}: {}".format(aid, e))

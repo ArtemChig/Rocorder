@@ -9,6 +9,30 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.6.2-alpha — 2026-05-31
+
+Two bugs found from field logs — both made characters import wrong.
+
+- **Fix: error pages saved as assets.** When `syn.request` returned 401 for a
+  restricted asset, the recorder fell back to `game:HttpGet`, which returns the
+  401 error *text* as a normal string — and the recorder saved that as the mesh
+  file. The importer then "found" the local file, saw it wasn't a mesh, and
+  *silently* fell back to a box (this is why girly mesh limbs / held items came
+  in as boxes). The recorder now **validates** downloaded bytes (real meshes
+  start with `version `, images have a known magic) and rejects error pages,
+  and it **re-validates already-cached files** so the garbage saved by 1.6.0/
+  1.6.1 gets replaced. The importer now **logs** a non-mesh local file instead
+  of silently boxing it.
+- **Fix: stale players in the rig.** The tracker persists across recordings
+  (for Instant Replay), so a recording's `.rig.json` could include a player
+  from an earlier session who has no frames in this `.rec` — importing as a
+  frozen pile of boxes at the origin. The rig is now filtered to players
+  actually seen during this recording (and clips to players in the buffered
+  window).
+
+After updating: re-record so the recorder re-downloads the real meshes (it
+self-heals the stale `ROCORDER/assets` files), then re-import.
+
 ## 1.6.1-alpha — 2026-05-31
 
 Executor asset download confirmed working (0 auth fails, all assets fetched
