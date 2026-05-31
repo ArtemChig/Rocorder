@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.2.0-alpha"
+local ROCORDER_VERSION = "1.2.1-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -1256,8 +1256,10 @@ local function buildRecordView(parent)
     recordBtn.Size = UDim2.new(1, 0, 0, 44)
     recordBtn.TextSize = 16
 
-    local replayBtn = buildButton(view, "Save Last N Seconds", "secondary", 3)
+    local replayBtn = buildButton(view, "Save Last 30 Seconds", "secondary", 3)
     replayBtn.Size = UDim2.new(1, 0, 0, 38)
+    -- the literal "30" is just an initial placeholder; _refreshStatus
+    -- rewrites it from rec.cfg.IR_BUFFER_SEC on the first paint.
 
     local irRow = mk("Frame", { BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
         Size = UDim2.new(1, 0, 0, 40), LayoutOrder = 4 }, view)
@@ -1449,9 +1451,11 @@ local function buildFilesView(parent)
                     Font = THEME.fontBold, TextSize = 10,
                     TextColor3 = THEME.accent, BackgroundColor3 = THEME.bg,
                     BorderSizePixel = 0,
-                    Position = UDim2.new(1, -130, 0, 0),
-                    Size = UDim2.fromOffset(40, 16) }, row)
-                corner(clipPill, 3); stroke(clipPill, THEME.accent, 1)
+                    TextXAlignment = Enum.TextXAlignment.Center,
+                    TextYAlignment = Enum.TextYAlignment.Center,
+                    Position = UDim2.new(1, -134, 0, 0),
+                    Size = UDim2.fromOffset(46, 18) }, row)
+                corner(clipPill, 4); stroke(clipPill, THEME.accent, 1)
             end
 
             -- middle row: duration · date
@@ -1496,7 +1500,16 @@ local function buildFilesView(parent)
                     { BackgroundColor3 = THEME.danger }):Play()
             end)
             del.MouseButton1Click:Connect(function()
-                rec:DeleteRecording(f.name); populate()
+                rec:DeleteRecording(f.name)
+                -- Optimistic UI update: drop just this row instead of
+                -- re-populating the whole list (which made every other
+                -- recording flicker out + back in).
+                row:Destroy()
+                local any = false
+                for _, c in ipairs(scroll:GetChildren()) do
+                    if c:IsA("Frame") then any = true; break end
+                end
+                if not any then populate() end  -- show empty state
             end)
         end
     end
@@ -1860,6 +1873,7 @@ function UI:_refreshStatus()
     local nt = 0; for _ in pairs(rec.tracker.tracked) do nt = nt + 1 end
     s.fields.tracked.Text = tostring(nt)
     ctl.replayBtn.Active = rec.cfg.IR_ENABLED
+    ctl.replayBtn.Text = fmt("Save Last %d Seconds", rec.cfg.IR_BUFFER_SEC)
     ctl.refreshIrToggle()
 
     -- cross-tab: keep settings boolean toggles + key-binding labels in sync
@@ -1917,8 +1931,14 @@ rec.conns.input = UserInputService.InputBegan:Connect(function(input, processed)
         UI.keyBindBtn = nil
         return
     end
-    if processed then return end
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    -- Don't fire hotkeys while the user is editing a setting's TextBox.
+    if UserInputService:GetFocusedTextBox() then return end
+    -- We intentionally ignore the `processed` flag here: Roblox itself
+    -- consumes some keys (e.g. F7 toggles built-in performance stats) and
+    -- marks them processed before our handler runs, which used to silently
+    -- swallow Save-Replay. The focused-TextBox check above is enough to
+    -- prevent shortcuts firing while typing.
     local kc = input.KeyCode
     if kc == keyFromName(rec.cfg.HOTKEY_RECORD) then rec:Toggle()
     elseif kc == keyFromName(rec.cfg.HOTKEY_UI)     then UI:toggle()
