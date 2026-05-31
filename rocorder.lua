@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.6-alpha"
+local ROCORDER_VERSION = "1.9.7-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -715,9 +715,25 @@ local function _markPlayerLeft(uid)
     if ps and not ps.leftAt then ps.leftAt = os.clock() end
 end
 
+-- Persistent ownership map: which players have this asset id in their kit.
+-- Survives extraction (Q.byId[id] is removed when the entry finishes; this
+-- table sticks around so the IR eviction scanner can decide whether anyone
+-- in the live buffer still needs the asset). Lives in _G so script reloads
+-- inherit the existing-on-disk attribution.
+_G.ROCORDER_ASSET_OWNERS = _G.ROCORDER_ASSET_OWNERS or {}
+local ASSET_OWNERS = _G.ROCORDER_ASSET_OWNERS
+
+local function _registerOwner(id, uid)
+    if not (id and uid) then return end
+    local owners = ASSET_OWNERS[id]
+    if not owners then owners = {}; ASSET_OWNERS[id] = owners end
+    owners[uid] = true
+end
+
 local function _enqueueAsset(id, kind, partInst, partInfo, uid, displayName)
     if not id then return end
     local ps = uid and _ensurePlayerStats(uid, displayName) or nil
+    _registerOwner(id, uid)
 
     -- already on disk (any format) → count as done and skip
     if EXTRACTED[id] or _isCached(id) then
@@ -994,6 +1010,115 @@ local function _startWatchdog()
                     .. "%d items queued — respawning", age, #Q.queue))
                 _startExtractorWorker()
             end
+        end
+    end)
+end
+
+-- ============================================================================
+-- Instant-Replay cache pruning.
+--
+-- IR keeps an N-second rolling buffer. Players who join and leave outside
+-- that window are deadweight — their assets will never be referenced by any
+-- saveable replay. Without pruning, an hour-long IR session in a busy game
+-- can accumulate hundreds of MB of meshes/textures from people who came,
+-- left, and never made it into a saved clip.
+--
+-- The scanner:
+--   1. Runs only when IR is on AND no normal recording session is active.
+--   2. For each known asset id, checks whether any owning player was seen
+--      within (IR_BUFFER_SEC + 5s) on the recording side. If not, deletes
+--      every form of the file (.geom.json / .rgba / bare) and forgets it.
+--   3. Skips if a save is in progress (set by SaveReplay).
+-- ============================================================================
+_G.ROCORDER_SAVE_IN_PROGRESS = _G.ROCORDER_SAVE_IN_PROGRESS or false
+
+-- Collect every asset id that any saved .rig.json on disk references. The
+-- ROCORDER/assets/ folder is SHARED across all recordings on disk — evicting
+-- an id that an older saved .rec still references would silently corrupt
+-- that recording on import. Cheap regex scrape (avoids full JSONDecode) of
+-- the long numeric ids out of each .rig.json body.
+local function _collectKeptAssetIds()
+    local kept = {}
+    if not (listfiles and readfile) then return kept end
+    local ok, files = pcall(listfiles, FOLDER)
+    if not ok or type(files) ~= "table" then return kept end
+    for _, path in ipairs(files) do
+        local norm = path:gsub("\\", "/")
+        if norm:sub(-9) == ".rig.json" then
+            local okR, body = pcall(readfile, path)
+            if okR and type(body) == "string" then
+                for id in body:gmatch("(%d%d%d%d%d+)") do
+                    kept[id] = true
+                end
+            end
+        end
+    end
+    return kept
+end
+
+local function _evictStaleIRAssets(rec)
+    if not rec or not rec.cfg then return end
+    if not rec.cfg.IR_ENABLED then return end
+    if rec.session then return end  -- normal recording running -> never evict
+    if _G.ROCORDER_SAVE_IN_PROGRESS then return end
+    if not (delfile and isfile) then return end
+
+    local tracker = rec.tracker
+    if not tracker then return end
+    local now = os.clock()
+    local windowSec = (rec.cfg.IR_BUFFER_SEC or 30) + 5.0
+    local kept = _collectKeptAssetIds()
+    local evicted = 0
+    local keptCount = 0
+    local filesDeleted = 0
+
+    for id, owners in pairs(ASSET_OWNERS) do
+        if kept[id] then
+            -- Referenced by a saved recording — must not delete.
+            keptCount = keptCount + 1
+        else
+            local anyLive = false
+            for uid in pairs(owners) do
+                local e = tracker.tracked[uid]
+                if e and e.lastSeenClock and (now - e.lastSeenClock) <= windowSec then
+                    anyLive = true
+                    break
+                end
+            end
+            if not anyLive then
+                for _, path in ipairs({_geomPath(id), _imgPath(id), _binPath(id)}) do
+                    if isfile(path) then
+                        if pcall(delfile, path) then
+                            filesDeleted = filesDeleted + 1
+                        end
+                    end
+                end
+                ASSET_OWNERS[id] = nil
+                EXTRACTED[id] = nil
+                evicted = evicted + 1
+            end
+        end
+    end
+
+    if evicted > 0 and _G.ROCORDER_CURRENT_DBG then
+        pcall(_G.ROCORDER_CURRENT_DBG, fmt(
+            "IR cache: evicted %d stale asset(s) (%d files deleted, %d kept "
+            .. "by saved recordings) — buffer window %.0fs",
+            evicted, filesDeleted, keptCount, windowSec))
+    end
+end
+
+local function _startEvictionScanner(rec)
+    if not EXTRACT_OK then return end
+    Q.evictVersion = (Q.evictVersion or 0) + 1
+    local myV = Q.evictVersion
+    task.spawn(function()
+        -- Initial 10s grace so a freshly-joined player isn't evicted before
+        -- their first tick lands in the buffer.
+        task.wait(10.0)
+        while Q.evictVersion == myV do
+            pcall(_evictStaleIRAssets, rec)
+            task.wait(3.0)
         end
     end)
 end
@@ -2086,10 +2211,21 @@ function rec:SaveReplay(seconds)
         notify("ROCORDER", "Replay buffer is empty.", 3)
         return nil, "empty"
     end
-    seconds = seconds or self.cfg.IR_BUFFER_SEC
-    -- only players seen within the buffered window
-    local rigData = self.tracker:rigData("", os.clock() - (self.cfg.IR_BUFFER_SEC + 2))
-    local saved, frames, secsOut = self.replay:save(FOLDER, self.cfg, rigData, seconds)
+    -- Take the save lock: blocks the IR eviction scanner from deleting any
+    -- asset for the duration of this save. Cleared in finally-style at exit.
+    _G.ROCORDER_SAVE_IN_PROGRESS = true
+    local ok, saved, frames, secsOut = pcall(function()
+        seconds = seconds or self.cfg.IR_BUFFER_SEC
+        -- only players seen within the buffered window
+        local rigData = self.tracker:rigData("",
+            os.clock() - (self.cfg.IR_BUFFER_SEC + 2))
+        return self.replay:save(FOLDER, self.cfg, rigData, seconds)
+    end)
+    _G.ROCORDER_SAVE_IN_PROGRESS = false
+    if not ok then
+        notify("ROCORDER", "Replay save threw: " .. tostring(saved), 5)
+        return nil, saved
+    end
     if not saved then
         notify("ROCORDER", "Replay save failed: " .. tostring(frames), 5)
         return nil, frames
@@ -3562,6 +3698,7 @@ Indicator:refresh()  -- pick up persisted state (e.g. IR_ENABLED) on script load
 -- need to trigger, but if it does we recover automatically).
 _startExtractorWorker()
 _startWatchdog()
+_startEvictionScanner(rec)
 
 -- Mark a player as "left" so the UI can show "X assets missed" for them. The
 -- extractor's own fallback already tries HTTP when no live partRef remains.
