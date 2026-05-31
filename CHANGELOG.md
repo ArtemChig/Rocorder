@@ -9,6 +9,30 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.5.1-alpha — 2026-05-31
+
+Diagnosed from import logs: modern Roblox assets return **401 Unauthorized**
+to anonymous downloads (only old/public assets serve without auth), and a
+half-loaded character could be captured with no joints.
+
+- **Asset auth** — the importer no longer retries 3× on a 401/403 (pointless,
+  and it spammed the log). On an auth failure it now tries the authenticated
+  **v2 CDN-location** flow, and if assets still fail it prints a clear
+  one-line instruction (and a Blender popup) to paste your `.ROBLOSECURITY`
+  cookie and re-import. Old/public assets still download without a cookie.
+  The asset summary now reports an explicit `auth/401` count.
+- **Fix: half-loaded rig** — the recorder now waits until a character actually
+  has its Motor6D joints (with a 2s grace fallback) before capturing its rig.
+  Previously a player seen mid-spawn could be captured with `joints=0`, which
+  made every part pile at the origin. This also removes the early
+  "got N parts" frames from such players.
+- The "wrong part count" import-log line is reworded — parts that appear later
+  (e.g. a tool you equip mid-recording) are normal, not corruption.
+
+If a mesh/texture is a box after this, check the `.import.log`: `class=Part`
+means it's a classic block (correct — needs clothing textures, still WIP);
+`auth/401` means provide your cookie; a real parse error is logged per asset.
+
 ## 1.5.0-alpha — 2026-05-31
 
 Separate per-part objects, classic faces/decals, and clothing capture —

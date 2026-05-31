@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 5, 0),
+    "version": (1, 5, 1),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.5.0-alpha"
+ROCORDER_VERSION = "1.5.1-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -267,60 +267,114 @@ class AssetFetcher:
         self._mesh_cache = {}     # id -> parsed mesh dict (or False on failure)
         self._image_cache = {}    # id -> local image path (or False)
         self._last_request = 0.0
-        self.stats = {"downloads": 0, "cache_hits": 0, "fails": 0}
+        self.stats = {"downloads": 0, "cache_hits": 0, "fails": 0, "auth_fails": 0}
         try:
             os.makedirs(cache_dir, exist_ok=True)
         except OSError as e:
             self.log("WARN could not create asset cache dir {}: {}".format(cache_dir, e))
 
-    # ---- raw download (with on-disk cache) -------------------------------
-    def _download(self, asset_id, ext):
-        """Return the local cached file path for an asset id, downloading if
-        needed. ext is a hint for the cache filename only."""
-        cache_path = os.path.join(self.cache_dir, "{}{}".format(asset_id, ext))
-        if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
-            self.stats["cache_hits"] += 1
-            return cache_path
-
-        url = "https://assetdelivery.roblox.com/v1/asset/?id={}".format(asset_id)
-        headers = {
-            "User-Agent": "Roblox/WinInet",
-            "Accept": "*/*",
-        }
+    def _headers(self):
+        h = {"User-Agent": "Roblox/WinInet", "Accept": "*/*"}
         if self.cookie:
-            headers["Cookie"] = ".ROBLOSECURITY={}".format(self.cookie)
+            h["Cookie"] = ".ROBLOSECURITY={}".format(self.cookie)
+        return h
 
-        # be polite to the CDN — tiny gap between requests
+    def _throttle_wait(self):
         import time as _t
         dt = _t.monotonic() - self._last_request
         if dt < self.throttle:
             _t.sleep(self.throttle - dt)
 
-        for attempt in range(3):
+    def _http_get(self, url, retries=2):
+        """GET url -> (data_bytes_or_None, status_int). Retries only on
+        network / 429 / 5xx; auth errors (401/403) and 404 fail immediately
+        (retrying won't change the answer)."""
+        import time as _t
+        for attempt in range(retries + 1):
+            self._throttle_wait()
             try:
-                req = urllib.request.Request(url, headers=headers)
+                req = urllib.request.Request(url, headers=self._headers())
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     data = resp.read()
                 self._last_request = _t.monotonic()
-                if not data:
-                    raise ValueError("empty response")
-                # old "decal" assets return an XML wrapper pointing at the real
-                # image id — follow one level of indirection.
-                if data[:5] == b"<?xml" or data[:8].lstrip()[:7] == b"<roblox":
-                    inner = self._xml_inner_id(data)
-                    if inner and inner != asset_id:
-                        self.log("    asset {} is a wrapper -> {}".format(asset_id, inner))
-                        return self._download(inner, ext)
-                with open(cache_path, "wb") as fh:
-                    fh.write(data)
-                self.stats["downloads"] += 1
-                return cache_path
-            except (urllib.error.URLError, urllib.error.HTTPError,
-                    ValueError, OSError) as e:
-                self.log("    download attempt {}/3 for asset {} failed: {}".format(
-                    attempt + 1, asset_id, e))
+                return (data if data else None), 200
+            except urllib.error.HTTPError as e:
+                self._last_request = _t.monotonic()
+                if e.code in (401, 403, 404):
+                    return None, e.code          # no point retrying
+                if e.code == 429 or 500 <= e.code < 600:
+                    _t.sleep(0.5 * (attempt + 1))  # transient: back off
+                    continue
+                return None, e.code
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                self._last_request = _t.monotonic()
+                if attempt == retries:
+                    self.log("    GET {} failed: {}".format(url, e))
                 _t.sleep(0.4 * (attempt + 1))
-        self.stats["fails"] += 1
+        return None, 0
+
+    # ---- raw download (with on-disk cache) -------------------------------
+    def _download(self, asset_id, ext):
+        """Return the local cached file path for an asset id, downloading if
+        needed. Tries the v1 endpoint, then the authenticated v2 CDN-location
+        flow. ext is a hint for the cache filename only."""
+        cache_path = os.path.join(self.cache_dir, "{}{}".format(asset_id, ext))
+        if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+            self.stats["cache_hits"] += 1
+            return cache_path
+
+        # 1) v1 direct
+        data, status = self._http_get(
+            "https://assetdelivery.roblox.com/v1/asset/?id={}".format(asset_id))
+
+        # 2) on auth failure, try the v2 location flow (returns a signed CDN url)
+        if data is None and status in (401, 403):
+            data = self._fetch_via_v2(asset_id)
+            if data is None:
+                self.stats["auth_fails"] += 1
+                self.log("    asset {} -> {} Unauthorized (needs a "
+                         ".ROBLOSECURITY cookie)".format(asset_id, status))
+                self.stats["fails"] += 1
+                return None
+
+        if data is None:
+            self.log("    asset {} download failed (status {})".format(asset_id, status))
+            self.stats["fails"] += 1
+            return None
+
+        # old "decal" assets return an XML wrapper pointing at the real image id
+        if data[:5] == b"<?xml" or data.lstrip()[:7] == b"<roblox":
+            inner = self._xml_inner_id(data)
+            if inner and inner != asset_id:
+                self.log("    asset {} is a wrapper -> {}".format(asset_id, inner))
+                return self._download(inner, ext)
+
+        try:
+            with open(cache_path, "wb") as fh:
+                fh.write(data)
+        except OSError as e:
+            self.log("    could not cache asset {}: {}".format(asset_id, e))
+            return None
+        self.stats["downloads"] += 1
+        return cache_path
+
+    def _fetch_via_v2(self, asset_id):
+        """Authenticated metadata call -> signed CDN location -> bytes."""
+        meta, status = self._http_get(
+            "https://assetdelivery.roblox.com/v2/assetId/{}".format(asset_id))
+        if meta is None:
+            return None
+        try:
+            info = json.loads(meta.decode("utf-8", "ignore"))
+        except Exception:
+            return None
+        for loc in (info.get("locations") or []):
+            url = loc.get("location")
+            if not url:
+                continue
+            data, _s = self._http_get(url)
+            if data:
+                return data
         return None
 
     @staticmethod
@@ -1437,12 +1491,13 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
 
         mis = part_count_mismatch[uid]
         if mis:
-            log("  *** {} frames had wrong part count (corrupt/truncated lines):".format(
-                len(mis)))
-            for fnum, got, exp in mis[:10]:
-                log("    frame {}: got {} parts, expected {}".format(fnum, got, exp))
-            if len(mis) > 10:
-                log("    ... and {} more mismatches".format(len(mis) - 10))
+            log("  note: {} frames had fewer parts than the final count "
+                "(normal for parts that appear later — e.g. an equipped tool — "
+                "or a truncated line):".format(len(mis)))
+            for fnum, got, exp in mis[:5]:
+                log("    frame {}: {} parts (final {})".format(fnum, got, exp))
+            if len(mis) > 5:
+                log("    ... and {} more".format(len(mis) - 5))
 
         # bone keyframe distribution — useful to spot bones that animated
         # only briefly (one tally per uid; bones sorted by ascending count)
@@ -1452,11 +1507,20 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
         for b, c in sorted_kc[:5]:
             log("    {}: {}".format(b, c))
 
+    cookie_hint = False
     if assets is not None:
         log("")
-        log("assets: {} downloaded, {} cache hits, {} fails".format(
+        log("assets: {} downloaded, {} cache hits, {} fails ({} auth/401)".format(
             assets.stats["downloads"], assets.stats["cache_hits"],
-            assets.stats["fails"]))
+            assets.stats["fails"], assets.stats["auth_fails"]))
+        if assets.stats["auth_fails"] > 0 and not (roblosecurity or "").strip():
+            cookie_hint = True
+            log("  *** {} assets returned 401 Unauthorized. Roblox no longer "
+                "serves most modern meshes/textures anonymously.".format(
+                    assets.stats["auth_fails"]))
+            log("  *** Paste your .ROBLOSECURITY cookie into the import dialog "
+                "and re-import to fetch them. Old/public assets still work "
+                "without it.")
 
     log("")
     log("totals: armatures={} fallback_objs={} cameras={} frames={} "
@@ -1465,7 +1529,13 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
             len(frames), keyframes + camera_keys, bone_keys, camera_keys))
     log("=" * 76)
     flush_log()
-    if log_path:
+    if cookie_hint:
+        report({"WARNING"},
+               "ROCORDER: {} assets needed auth (401). Paste your "
+               ".ROBLOSECURITY cookie in the import options and re-import "
+               "for full meshes/textures. See the .import.log.".format(
+                   assets.stats["auth_fails"]))
+    elif log_path:
         report({"INFO"}, "ROCORDER imported. Debug log: {}".format(log_path))
     else:
         report({"INFO"},
