@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.7.0-alpha"
+local ROCORDER_VERSION = "1.7.1-alpha"
 
 if _G.ROCORDER then
     if _G.ROCORDER.Stop then pcall(function() _G.ROCORDER:Stop() end) end
@@ -65,36 +65,72 @@ local httpRequest = (syn and syn.request)
     or (fluxus and fluxus.request)
 
 -- Names of executor functions that return the bytes of an asset the client
--- already has loaded. We probe both per-id and the rbxassetid URL form.
-local getCustomAsset = getcustomasset or get_custom_asset
+-- already has loaded. Different executors expose different names; we probe all.
+local getCustomAsset  = getcustomasset or get_custom_asset
     or (syn and syn.protect_gui and syn.getcustomasset)
-local getSynAsset    = getsynasset
-local readCustomAsset = readcustomasset  -- some forks expose direct bytes
+local getSynAsset     = getsynasset
+local readCustomAsset = readcustomasset    -- direct bytes (rare)
+local readAsset       = readasset           -- some forks
+local getAssetBytes   = (Xeno and Xeno.getAssetBytes) or get_asset_bytes
+local _diagPrinted    = false
+
+-- Try every in-memory path we know about. dbg() the first response so the
+-- next debug log shows EXACTLY what the executor returned — this is the
+-- info we need to map the path correctly per executor.
 local function readFromContentProvider(assetId, dbg)
     local rbxUrl = "rbxassetid://" .. assetId
-    -- 1) Direct bytes function if exposed (cleanest path).
-    if readCustomAsset then
-        local ok, data = pcall(readCustomAsset, rbxUrl)
-        if ok and type(data) == "string" and #data > 0 then return data, "readcustomasset" end
+    -- 1) Direct bytes getter.
+    for fname, fn in pairs({
+        readcustomasset = readCustomAsset, readasset = readAsset,
+        getAssetBytes   = getAssetBytes,
+    }) do
+        if fn then
+            local ok, data = pcall(fn, rbxUrl)
+            if ok and type(data) == "string" and #data > 0 then
+                return data, fname
+            end
+        end
     end
-    -- 2) getcustomasset returns an rbxasset://temp/... or content:// path; on
-    --    Xeno/Synapse that path is readable via the executor's readfile.
-    for _, fn in ipairs({ getCustomAsset, getSynAsset }) do
+
+    -- 2) Path-returning forms. Diagnose the FIRST one so we can see what
+    --    the returned path actually looks like on this executor.
+    for fname, fn in pairs({
+        getcustomasset = getCustomAsset, getsynasset = getSynAsset,
+    }) do
         if fn then
             local ok, localPath = pcall(fn, rbxUrl)
             if ok and type(localPath) == "string" and #localPath > 0 then
+                if not _diagPrinted and dbg then
+                    _diagPrinted = true
+                    dbg(fmt("  DIAG: %s('rbxassetid://%s') -> %s",
+                        fname, assetId, localPath:sub(1, 200)))
+                end
                 if readfile then
-                    -- Try the returned path AND the workspace-relative version.
-                    -- getcustomasset paths like "rbxasset://temp/N.bin" map to
-                    -- the executor's workspace folder.
+                    -- The returned path can be:
+                    --   "rbxasset://Xeno/asset_<id>.bin"
+                    --   "rbxasset://temp/<file>"
+                    --   "rbxasset://<file>"
+                    --   raw filesystem path
+                    -- Try all common shapes — first reader to succeed wins.
                     local candidates = { localPath }
-                    local tail = localPath:match("rbxasset://(.+)$")
-                    if tail then candidates[#candidates+1] = tail end
+                    local stripped = localPath:gsub("^rbxasset://", "")
+                    if stripped ~= localPath then
+                        candidates[#candidates + 1] = stripped
+                    end
+                    -- Xeno wraps via getcustomasset by copying into the workspace
+                    -- under a name like "asset_<id>.bin" — try that explicit name.
+                    candidates[#candidates + 1] = "asset_" .. assetId .. ".bin"
+                    candidates[#candidates + 1] = assetId
                     for _, p in ipairs(candidates) do
                         local okr, data = pcall(readfile, p)
                         if okr and type(data) == "string" and #data > 0 then
-                            return data, "getcustomasset"
+                            return data, fname .. ":" .. p:sub(1, 60)
                         end
+                    end
+                    if not _diagPrinted and dbg then
+                        dbg(fmt("  DIAG: readfile failed for every candidate "
+                            .. "of %s — tried %d shapes",
+                            localPath:sub(1, 80), #candidates))
                     end
                 end
             end
@@ -1147,12 +1183,16 @@ function rec:_downloadAssets(logSink)
         if not isfolder(ASSETS_FOLDER) then pcall(makefolder, ASSETS_FOLDER) end
         local okc, failc, skipc = 0, 0, 0
         local missing = {}  -- ids that couldn't be fetched anywhere
-        dbg(fmt("ASSET DOWNLOAD start: %d unique assets (httpRequest=%s, "
-            .. "getcustomasset=%s, readcustomasset=%s)",
+        dbg(fmt("ASSET DOWNLOAD start: %d unique assets — readers: "
+            .. "httpRequest=%s getcustomasset=%s getsynasset=%s "
+            .. "readcustomasset=%s readasset=%s getAssetBytes=%s",
             #list,
-            httpRequest and "yes" or "no (game:HttpGet only)",
+            httpRequest and "yes" or "no",
             getCustomAsset and "yes" or "no",
-            readCustomAsset and "yes" or "no"))
+            getSynAsset and "yes" or "no",
+            readCustomAsset and "yes" or "no",
+            readAsset and "yes" or "no",
+            getAssetBytes and "yes" or "no"))
         notify("ROCORDER", fmt("Downloading %d assets…", #list), 3)
 
         for _, id in ipairs(list) do
