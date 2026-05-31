@@ -9,6 +9,35 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.6.0-alpha — 2026-05-31
+
+Executor-side asset download — the real fix for "everything is a box". Import
+logs proved that Roblox's CDN returns **401 even with a valid cookie** in
+Blender (it gates raw downloads to genuine client sessions). So the executor,
+which already has these assets loaded in an authenticated session, now
+downloads them itself.
+
+- **Recorder: Download Assets** (new Capture setting, default on). At Stop (and
+  after saving an instant-replay clip) the recorder collects every mesh /
+  texture / color-map / decal / clothing id the characters use and downloads
+  them into `ROCORDER/assets/<id>` using the executor's HTTP (`syn.request` /
+  `http.request` / `request` / … with a `game:HttpGet` fallback). Runs in a
+  coroutine so it never hitches the game; progress is shown via notifications
+  and logged to the `.debug.log`.
+- **Importer: local assets first.** The importer now looks for the recorder's
+  `ROCORDER/assets/` folder next to the `.rec` and uses those files directly —
+  no network, no 401. It still falls back to anonymous + v2 + cookie download
+  for anything not pre-downloaded. The asset summary now reports
+  `local / downloaded / cache / fails`.
+- **Better 401 diagnosis** — the importer logs the actual 401 response body
+  once (so we can tell "auth required" from "no permission"), and the
+  end-of-import guidance now points at the recorder's Download Assets option
+  rather than the cookie.
+
+Workflow: re-record with Download Assets on, then import the `.rec` from inside
+`ROCORDER/` (so `assets/` sits beside it). Keep that folder with the `.rec` if
+you move it.
+
 ## 1.5.1-alpha — 2026-05-31
 
 Diagnosed from import logs: modern Roblox assets return **401 Unauthorized**
