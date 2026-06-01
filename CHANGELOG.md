@@ -9,6 +9,40 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.16.0-alpha — 2026-06-02
+
+**Shirt/Pants now wrap a CharacterMesh body** the same way they wrap the
+standard R6 box body — without the 1.15.0 splatter.
+
+The right fix isn't to substitute Shirt/Pants on top of the mesh's own UVs
+(those are sculpted-anatomical for the modeler's BaseTexture and don't
+follow the R6 template), but to **overwrite** the mesh's UVs with a cube
+projection into the R6 clothing template — exactly what `_build_clothed_box`
+does for a real box, generalised for sculpted geometry.
+
+- New helper `_r6_cube_project_clothing_uvs(bm, uv_layer, regions)`: for
+  every face in the mesh, picks the dominant template face from the face
+  normal (`Front`/`Back`/`Left`/`Right`/`Top`/`Bottom`), then projects all
+  three corners into that template cell using the same `_FACE_AXES`
+  u/v axes and the mesh's own bounding box as the normalization range.
+  Vertices outside the box on any axis are clamped to the cell edge.
+- `_add_mesh_geometry` accepts an optional `r6_clothing_regions` and applies
+  the projection right after the mesh-authored UVs, before `place_mat` —
+  projection has to run in part-local space, not rest pose.
+- `_build_part_object` turns this on for a part with `charMesh=True`,
+  classic clothing enabled, and a Torso/arm/leg name. Texture used is the
+  Shirt (torso+arms) / Pants (legs) directly; the CharacterMesh's
+  `BaseTextureId` is not blended in (single-material setup). Without
+  clothing on the player, CharacterMesh body parts still render with their
+  authored UVs and `BaseTextureId` (1.15.3 path unchanged).
+- New build kind `mesh-clothed` so the per-player stats split out
+  cube-projected meshes from plain ones.
+
+Texture orientation per face inherits the table we tuned for the box
+clothing in 1.14.2 — so if any single face still reads mirrored after the
+shirt/pants come through, it's the same one-line `_FACE_AXES` flip as the
+box case.
+
 ## 1.15.3-alpha — 2026-06-02
 
 Two CharacterMesh rendering bugs the user spotted from the 1.15.2 import

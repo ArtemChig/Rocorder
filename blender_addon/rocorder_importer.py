@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 15, 3),
+    "version": (1, 16, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.15.3-alpha"
+ROCORDER_VERSION = "1.16.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -771,7 +771,65 @@ def _parse_mesh_v4plus(body, ver, log):
     return {"verts": verts, "uvs": uvs, "faces": faces, "version": ver}
 
 
-def _add_mesh_geometry(bm, uv_layer, mesh, place_mat, part, scale, flip_v=True):
+def _r6_cube_project_clothing_uvs(bm, uv_layer, regions):
+    """For every face in the mesh, cube-project its corners into the R6
+    clothing template region for that face's dominant direction. Used to
+    bring back Shirt/Pants on CharacterMesh body parts: the mesh keeps its
+    sculpted shape, but the texture is wrapped exactly like the standard
+    R6 box body would wrap it — independent of whatever UVs the modeler
+    actually authored on the mesh. Mesh verts must be in PART-LOCAL Blender
+    space when this runs (i.e. before the place_mat transform). Overwrites
+    `uv_layer` for every loop. Vertices outside the mesh's tight bbox in
+    any axis are clamped to the cell edge."""
+    if not bm.faces:
+        return
+    xs = [v.co.x for v in bm.verts]
+    ys = [v.co.y for v in bm.verts]
+    zs = [v.co.z for v in bm.verts]
+    cx = (max(xs) + min(xs)) * 0.5
+    cy = (max(ys) + min(ys)) * 0.5
+    cz = (max(zs) + min(zs)) * 0.5
+    hx = max((max(xs) - min(xs)) * 0.5, 1e-6)
+    hy = max((max(ys) - min(ys)) * 0.5, 1e-6)
+    hz = max((max(zs) - min(zs)) * 0.5, 1e-6)
+    bm.normal_update()
+    for f in bm.faces:
+        n = f.normal.normalized()
+        ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
+        if ay >= ax and ay >= az:
+            key = "Front" if n.y > 0 else "Back"
+        elif ax >= ay and ax >= az:
+            key = "Right" if n.x > 0 else "Left"
+        else:
+            key = "Top" if n.z > 0 else "Bottom"
+        reg = regions.get(key)
+        if reg is None:
+            continue
+        (u0, v0, u1, v1), uax, vax = reg
+        # Half-extent of the mesh along whichever axis u/v point at.
+        if abs(uax.x) > 0.5:   u_half = hx
+        elif abs(uax.y) > 0.5: u_half = hy
+        else:                  u_half = hz
+        if abs(vax.x) > 0.5:   v_half = hx
+        elif abs(vax.y) > 0.5: v_half = hy
+        else:                  v_half = hz
+        for loop in f.loops:
+            co = loop.vert.co
+            X, Y, Z = co.x - cx, co.y - cy, co.z - cz
+            u_coord = X * uax.x + Y * uax.y + Z * uax.z
+            v_coord = X * vax.x + Y * vax.y + Z * vax.z
+            u_norm = (u_coord + u_half) / (2.0 * u_half)
+            v_norm = (v_coord + v_half) / (2.0 * v_half)
+            if u_norm < 0.0: u_norm = 0.0
+            elif u_norm > 1.0: u_norm = 1.0
+            if v_norm < 0.0: v_norm = 0.0
+            elif v_norm > 1.0: v_norm = 1.0
+            loop[uv_layer].uv = (u0 + u_norm * (u1 - u0),
+                                 v0 + v_norm * (v1 - v0))
+
+
+def _add_mesh_geometry(bm, uv_layer, mesh, place_mat, part, scale, flip_v=True,
+                      r6_clothing_regions=None):
     """Add a parsed Roblox mesh to the shared bmesh, scaled to the part's Size,
     converted Roblox-local -> Blender-local, then placed by place_mat (the
     canonical rest). Sets per-loop UVs. Returns the new BMVerts."""
@@ -836,6 +894,13 @@ def _add_mesh_geometry(bm, uv_layer, mesh, place_mat, part, scale, flip_v=True):
             else:
                 u, v = 0.0, 0.0
             loop[uv_layer].uv = (u, (1.0 - v) if flip_v else v)
+
+    # Replace mesh-authored UVs with R6 clothing-template cube projection so
+    # Shirt/Pants wraps a CharacterMesh body the same way it wraps the
+    # standard R6 box body. Must run BEFORE place_mat — projection is in
+    # part-local space (origin at the bone), not rest pose.
+    if r6_clothing_regions is not None:
+        _r6_cube_project_clothing_uvs(bm, uv_layer, r6_clothing_regions)
 
     bmesh.ops.transform(bm, matrix=place_mat, verts=bmverts)
     return bmverts
@@ -1128,33 +1193,44 @@ def _build_part_object(part, name, place, scale, assets, import_meshes,
 
     mesh_data = None
     body_tex = None
+    r6_clothing_regions = None
     if import_meshes and assets is not None:
         if part.get("meshId"):
             mesh_data = assets.get_mesh(part.get("meshId"))
         # Texture selection for body parts.
         #
-        # Plain Block body parts (no CharacterMesh): we wrap the classic R6
-        # Shirt/Pants template onto the box via our own _clothed_box UVs in
-        # the primitive branch below — handled there, not here.
+        # Plain Block body parts (no CharacterMesh): the clothing-box path
+        # below wraps the classic R6 Shirt/Pants template onto the box.
         #
-        # CharacterMesh body parts: render the mesh with its OWN authored
-        # UVs and the texture(s) baked for those UVs (BaseTextureId /
-        # OverlayTextureId). We must NOT substitute Shirt/Pants because a
-        # game-authored CharacterMesh has sculpted-anatomical UVs that don't
-        # follow the standard R6 clothing template — painting the shirt
-        # across that UV layout splatters the texture nonsensically (the
-        # 1.15.x bug). When the CharacterMesh has no BaseTexture, falling
-        # back to plain colour is more correct than wearing the shirt over
-        # mismatched UVs.
-        tref = part.get("textureId") or part.get("colorMap")
-        if tref:
-            body_tex = assets.get_image_path(tref)
+        # CharacterMesh body parts with classic clothing: we override the
+        # mesh's authored UVs with a cube projection into the R6 template
+        # — same wrap a Block body would get, applied to the sculpted
+        # mesh. Without this, painting Shirt/Pants via the mesh's authored
+        # UVs splattered the texture (1.15.x bug — modeler-authored UVs
+        # rarely follow the R6 template layout). Texture used is the
+        # Shirt/Pants directly.
+        #
+        # CharacterMesh body part without clothing: render with the mesh's
+        # own UVs and BaseTextureId (textureId in the rig record). Falls
+        # back to plain color if neither is present.
+        if (apply_clothing and clothing and part.get("charMesh")
+                and name in ("Torso", "Left Arm", "Right Arm",
+                             "Left Leg", "Right Leg")):
+            regions, cloth_img = _clothing_for_part(name, clothing, assets)
+            if regions and cloth_img:
+                r6_clothing_regions = regions
+                body_tex = cloth_img
+        if body_tex is None:
+            tref = part.get("textureId") or part.get("colorMap")
+            if tref:
+                body_tex = assets.get_image_path(tref)
 
     verts = None
     if mesh_data:
-        verts = _add_mesh_geometry(bm, uv_layer, mesh_data, place, part, scale)
+        verts = _add_mesh_geometry(bm, uv_layer, mesh_data, place, part, scale,
+                                   r6_clothing_regions=r6_clothing_regions)
     if verts:
-        kind = "mesh"
+        kind = "mesh-clothed" if r6_clothing_regions else "mesh"
         materials.append(_image_material(name, body_tex, color, transp, log)
                          if body_tex else _color_material(color, transp))
     else:
