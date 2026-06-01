@@ -9,6 +9,42 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.19.2-alpha — 2026-06-02
+
+Two viewmodel-detection bugs from 1.19.1's first Rivals run:
+
+1. **False positive on a hidden emote-preview character.** The 1.19.1 scan
+   picked up `PlayerScripts.Assets.Misc.EmoteDummy` — a full 16-part R15
+   character used to preview emote animations. It passed every check
+   (Model, MeshParts, Motor6Ds, not anchored, not a player's Character).
+   The heuristic was too loose. Tightened:
+   - **Reject Models with a Humanoid.** Real FPS viewmodels don't have
+     one; anything with one is a character / NPC / dummy.
+   - **Reject Models whose name contains** `dummy`, `preview`, or
+     `placeholder`.
+   - **Reject Models with more than 40 BaseParts.** Hands + a gun is
+     5-20; a full character is 24-30; sniping out the >40 line cuts off
+     "looks like a whole character" while still catching weapon-heavy
+     viewmodels.
+
+2. **Stale entry blocked the diagnostic dump.** Once the EmoteDummy was
+   captured, the next recording (Tracker already had the synthetic entry)
+   never re-ran the scan-diagnostic — `elseif not entry` short-circuited.
+   Now:
+   - **Self-heal**: if the previous viewmodel Model is destroyed
+     (`entry.char.Parent == nil`), the entry is cleared. Logs
+     `viewmodel detached (previous Model gone)` so the boundary is
+     visible.
+   - **Diagnostic runs regardless of stale entry.** The one-shot gate
+     moved from `_G` (shared across recordings within a Roblox session)
+     to the Tracker instance, so each loader execute gets a fresh dump.
+
+These are detection-only changes; re-execute the loader and record
+again. Note: the bogus EmoteDummy already captured in your last
+`replay_117398147513099_1780357606` recording is stuck in that file —
+that one was a false positive. The new recording should reject it and
+log the diagnostic for the real viewmodel hunt.
+
 ## 1.19.1-alpha — 2026-06-02
 
 The user's first Rivals recording on 1.19.0 didn't pick up a viewmodel —
