@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.15-alpha"
+local ROCORDER_VERSION = "1.9.16-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -564,9 +564,15 @@ local function extractMeshFromPart(part)
     end
     if not content then return nil, "no mesh content on part" end
 
+    -- CreateEditableMeshAsync is NOT safe in parallel context. If the worker
+    -- desynced us before this call, briefly sync just for the API call, then
+    -- re-desync so the vertex/face loops below can still run in parallel.
+    -- _syncSafe / _desyncSafe are no-ops when the parallel probe failed.
+    _syncSafe()
     local okem, em = pcall(function()
         return AssetService:CreateEditableMeshAsync(content)
     end)
+    _desyncSafe()
     if not okem or not em then return nil, "CreateEditableMeshAsync: " .. tostring(em) end
 
     local vids = em:GetVertices()
@@ -675,9 +681,16 @@ local function extractImageFromContent(ref)
     if not EXTRACT_OK then return nil, "EditableImage API unavailable" end
     local content = _toContent(ref)
     if not content then return nil, "no content" end
+
+    -- CreateEditableImageAsync is NOT safe in parallel context. Sync just for
+    -- the API call, then re-desync for the strip-extract loop (which IS
+    -- parallel-safe per Roblox docs — pixel reads on an already-created
+    -- EditableImage don't require synchronization).
+    _syncSafe()
     local ok, ei = pcall(function()
         return AssetService:CreateEditableImageAsync(content)
     end)
+    _desyncSafe()
     if not ok or not ei then return nil, "CreateEditableImageAsync: " .. tostring(ei) end
     local sz = ei.Size
     local w, h = math.floor(sz.X), math.floor(sz.Y)
