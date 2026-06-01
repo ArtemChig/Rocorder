@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.12-alpha"
+local ROCORDER_VERSION = "1.9.13-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -30,6 +30,7 @@ local HttpService        = game:GetService("HttpService")
 local TweenService       = game:GetService("TweenService")
 local MarketplaceService = game:GetService("MarketplaceService")
 local AssetService       = game:GetService("AssetService")
+local ContentProvider    = game:GetService("ContentProvider")
 
 local fmt = string.format
 
@@ -665,6 +666,146 @@ local function extractImageFromContent(ref)
     return fmt("ROCORDER-RGBA8\n%d\n%d\n", w, h) .. data
 end
 
+-- ===========================================================================
+-- Experimental "Decal route" for clothing templates and other assets whose
+-- content-type causes CreateEditableImageAsync to reject the URL directly.
+--
+-- Theory: the engine already has the bytes in memory (the player is wearing
+-- the shirt — it's rendered every frame). Roblox rejects clothing IDs
+-- because the asset content-type is "ShirtTemplate", not "Image". But if we
+-- wrap the URL in a live Decal Instance and call Content.fromObject(decal),
+-- the resulting Content references the loaded bytes via the Instance, not
+-- the URL — possibly bypassing the type check on subsequent calls.
+--
+-- Procedure:
+--   1. Create a hidden anchored Part deep underground and parent a Decal
+--      to it with Texture = ref.
+--   2. ContentProvider:PreloadAsync the decal so the engine actually loads
+--      the texture (rather than waiting for first render).
+--   3. Content.fromObject(decal) -> Content userdata.
+--   4. CreateEditableImageAsync(content) -> EditableImage on success.
+--   5. Strip-extract pixels exactly like extractImageFromContent.
+--   6. Destroy the host Part (cleans up Decal too).
+--
+-- Falls back silently on any error — the caller will then try the standard
+-- HTTP route. Used as step 3 of _processOne's cascade for image entries
+-- (after direct extract, before HTTP).
+-- ===========================================================================
+local _decalHostFolder
+local function _ensureDecalHost()
+    if _decalHostFolder and _decalHostFolder.Parent then return _decalHostFolder end
+    -- Reuse a host from a prior script load (Xeno re-execute case) so we
+    -- don't accumulate orphan folders in workspace across reloads.
+    local existing = workspace:FindFirstChild("_ROCORDER_DecalHost")
+    if existing then _decalHostFolder = existing; return existing end
+    local folder = Instance.new("Folder")
+    folder.Name = "_ROCORDER_DecalHost"
+    folder.Parent = workspace
+    _decalHostFolder = folder
+    return folder
+end
+
+local function _extractImageViaDecal(ref, dbg)
+    if not EXTRACT_OK then return nil, "EditableImage API unavailable" end
+    if typeof(Content) ~= "table" and typeof(Content) ~= "userdata" then
+        return nil, "Content global unavailable"
+    end
+    -- Content.fromObject may not exist on older Roblox versions.
+    if not (Content.fromObject) then
+        return nil, "Content.fromObject not available"
+    end
+    if type(ref) ~= "string" or ref == "" then
+        return nil, "Decal route needs a URL ref"
+    end
+
+    local host = Instance.new("Part")
+    host.Anchored = true
+    host.CanCollide = false
+    host.CanTouch = false
+    host.CanQuery = false
+    host.Transparency = 1
+    host.Size = Vector3.new(1, 1, 1)
+    host.Position = Vector3.new(0, -1e5, 0)
+    host.Parent = _ensureDecalHost()
+
+    local decal = Instance.new("Decal")
+    local okSet = pcall(function() decal.Texture = ref end)
+    if not okSet then
+        host:Destroy()
+        return nil, "could not set Decal.Texture"
+    end
+    decal.Parent = host
+
+    -- Block until the engine has actually downloaded/decoded the texture.
+    -- Time-bound this: PreloadAsync can yield indefinitely on a hung CDN.
+    local preloadDone = false
+    task.spawn(function()
+        local ok = pcall(function()
+            ContentProvider:PreloadAsync({decal})
+        end)
+        preloadDone = ok or "errored"
+    end)
+    local waited = 0
+    while not preloadDone and waited < 5.0 do
+        task.wait(0.1); waited = waited + 0.1
+    end
+    if not preloadDone then
+        host:Destroy()
+        return nil, "PreloadAsync timed out (>5 s)"
+    end
+
+    local okC, content = pcall(function() return Content.fromObject(decal) end)
+    if not okC or not content then
+        host:Destroy()
+        return nil, "Content.fromObject failed: " .. tostring(content)
+    end
+
+    local okEI, ei = pcall(function()
+        return AssetService:CreateEditableImageAsync(content)
+    end)
+    if not okEI or not ei then
+        host:Destroy()
+        return nil, "CreateEditableImageAsync via Decal: " .. tostring(ei)
+    end
+
+    local sz = ei.Size
+    local w, h = math.floor(sz.X), math.floor(sz.Y)
+    if w <= 0 or h <= 0 then host:Destroy(); return nil, "zero-size image" end
+
+    -- Strip-extract loop (same shape as extractImageFromContent). Kept
+    -- inline rather than refactored so this experimental path can be
+    -- removed cleanly if it turns out not to work.
+    local STRIP_BYTES = 65536
+    local stripRows = math.max(4, math.min(h, math.floor(STRIP_BYTES / (w * 4))))
+    local rowStride = w * 4
+    local totalBytes = w * h * 4
+    local accumulated
+    local okBuf = pcall(function() accumulated = buffer.create(totalBytes) end)
+    if not okBuf or not accumulated then
+        host:Destroy(); return nil, "buffer.create failed"
+    end
+    for y = 0, h - 1, stripRows do
+        local sh = math.min(stripRows, h - y)
+        local strip
+        local okR = pcall(function()
+            strip = ei:ReadPixelsBuffer(Vector2.new(0, y), Vector2.new(w, sh))
+        end)
+        if not okR or not strip then
+            host:Destroy()
+            return nil, fmt("ReadPixelsBuffer strip y=%d failed", y)
+        end
+        pcall(function()
+            buffer.copy(accumulated, y * rowStride, strip, 0, sh * rowStride)
+        end)
+        paceExtractor()
+    end
+    local data
+    local okStr = pcall(function() data = buffer.tostring(accumulated) end)
+    host:Destroy()
+    if not okStr or not data then return nil, "buffer.tostring failed" end
+    return fmt("ROCORDER-RGBA8\n%d\n%d\n", w, h) .. data
+end
+
 -- One-shot helper: try to extract `ref` as an image (texture / decal / clothing
 -- template) and write to ROCORDER/assets/<id>.rgba. Returns true if the file
 -- ended up on disk by any means.
@@ -919,13 +1060,46 @@ local function _processOne(entry, dbg)
         end
     end
 
+    -- Step 2: experimental Decal route for image entries that the direct
+    -- path didn't handle. Clothing templates (ShirtTemplate / PantsTemplate)
+    -- always fall here because CreateEditableImageAsync rejects their IDs
+    -- by content-type — but the engine has already loaded their bytes for
+    -- rendering. Wrapping the URL in a live Decal and using
+    -- Content.fromObject MAY route around the type check. Cheap on failure
+    -- (host Part destroyed, fall through to HTTP).
+    local viaDecal = false
+    if not body and entry.kind == "image" then
+        local imgRef
+        if ref and ref.info then
+            imgRef = _imgRefFromPartInfo(ref.info, entry.id)
+        else
+            for _, r in ipairs(entry.partRefs) do
+                if r.info then
+                    imgRef = _imgRefFromPartInfo(r.info, entry.id)
+                    break
+                end
+            end
+            imgRef = imgRef or ("rbxassetid://" .. entry.id)
+        end
+        local decalBody, decalErr = _extractImageViaDecal(imgRef, dbg)
+        if decalBody then
+            body = decalBody
+            err = nil
+            viaDecal = true
+        else
+            err = err or decalErr
+        end
+    end
+
     if body then
         local path = (entry.kind == "mesh") and _geomPath(entry.id) or _imgPath(entry.id)
         if pcall(writefile, path, body) then
             _markEntryDone(entry, dbg)
             if dbg then
-                dbg(fmt("  EXTRACT %s %s OK (%d bytes, queued for %.1fs)",
-                    entry.kind, entry.id, #body, os.clock() - entry.enqueuedAt))
+                local tag = viaDecal and " via Decal route" or ""
+                dbg(fmt("  EXTRACT %s %s OK%s (%d bytes, queued for %.1fs)",
+                    entry.kind, entry.id, tag,
+                    #body, os.clock() - entry.enqueuedAt))
             end
             return true
         end

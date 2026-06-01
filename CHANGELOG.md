@@ -9,6 +9,34 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.13-alpha — 2026-06-01
+
+Experimental "Decal route" for clothing template extraction.
+
+- **The bytes ARE loaded on the client** when a player is wearing a
+  clothing template — they have to be, the engine renders them every
+  frame. The problem was never byte availability; it was that
+  `AssetService:CreateEditableImageAsync` rejects clothing asset IDs
+  by content-type ("ShirtTemplate" / "PantsTemplate", not "Image").
+- The new `_extractImageViaDecal` helper creates a hidden anchored
+  `Part` (transparency 1, well underground), parents a `Decal` to it
+  with `Texture` set to the failing URL, runs
+  `ContentProvider:PreloadAsync` to ensure the engine has loaded the
+  texture, then calls `Content.fromObject(decal)` and feeds the
+  resulting `Content` to `CreateEditableImageAsync`. Theory: the
+  content-type check fires on URL fetch, not on already-loaded engine
+  bytes wrapped via `fromObject`. **May or may not work** depending
+  on how Roblox's API revision implements the check.
+- Wired as step 2 in `_processOne`'s cascade (after direct extract,
+  before HTTP fallback). Image entries that the direct path didn't
+  handle — including every clothing template — now get one more try
+  before HTTP. On success the debug log shows `via Decal route`. On
+  any failure (PreloadAsync timeout 5 s, `Content.fromObject` not in
+  this Roblox build, CreateEditableImageAsync still rejecting) the
+  fallback to HTTP is silent and unchanged.
+- Hidden host folder `_ROCORDER_DecalHost` lives under `workspace`.
+  Reused across script reloads so we don't leak orphan folders.
+
 ## 1.9.12-alpha — 2026-06-01
 
 Three more performance/correctness fixes from the latest log analysis:
