@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.21-alpha"
+local ROCORDER_VERSION = "1.9.22-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -461,7 +461,30 @@ end
 _G.ROCORDER_ACTOR_OK = false
 _G.ROCORDER_ACTOR_ERR = nil
 _G.ROCORDER_ACTOR_DETACH = _G.ROCORDER_ACTOR_DETACH or function() end
+
+-- The Actor scaffold is CONFIRMED NON-FUNCTIONAL in Xeno: even a Script
+-- with RunContext=Client, parented to PlayerScripts, never executes its
+-- injected Source (it shows a red error in the dev console and never fires
+-- Ready). Xeno doesn't run engine-created Script instances. So the actor
+-- route to parallel extraction is a dead end here. We keep the code but
+-- gate it off — and always clean up any actor a prior version created, so
+-- the red console error goes away on next load.
+local ENABLE_ACTOR_SCAFFOLD = false
 do
+    -- Clean up any actor from a prior script load (Xeno re-execute case),
+    -- in both possible parents (workspace and PlayerScripts).
+    pcall(_G.ROCORDER_ACTOR_DETACH)
+    local function killStaleActor(parent)
+        if not parent then return end
+        local a = parent:FindFirstChild("_ROCORDER_ExtractorActor")
+        if a then pcall(function() a:Destroy() end) end
+    end
+    killStaleActor(workspace)
+    local _lp = Players and Players.LocalPlayer
+    if _lp then killStaleActor(_lp:FindFirstChild("PlayerScripts")) end
+end
+
+if ENABLE_ACTOR_SCAFFOLD then
     -- Clean up any actor from a prior script load (Xeno re-execute case).
     pcall(_G.ROCORDER_ACTOR_DETACH)
     local stale = workspace:FindFirstChild("_ROCORDER_ExtractorActor")
@@ -1442,14 +1465,71 @@ local function _processOne(entry, dbg)
         end
     end
 
-    -- Step 2 (REMOVED in 1.9.14, kept as comment for record): we briefly
-    -- tried wrapping the URL in a live Decal and using Content.fromObject
-    -- to bypass the content-type check. The Decal trick failed because
-    -- Content.fromObject only accepts EditableImage / EditableMesh, not
-    -- arbitrary Instances ("Object expected, got table" in the log).
-    -- The helper `_extractImageViaDecal` is kept above as documentation
-    -- of what we tried, but it's no longer called. Falls straight through
-    -- to HTTP fallback as in 1.9.12 and earlier.
+    -- *** Clothing / no-live-part image path (NEW in 1.9.22) ***
+    --
+    -- This is the fix for "restricted clothing won't download". Clothing
+    -- templates (Shirt.ShirtTemplate / Pants.PantsTemplate) enqueue with
+    -- partInst = nil — they're not a single BasePart. So `ref` above is
+    -- nil for them and the EditableImage path was SKIPPED ENTIRELY; they
+    -- fell straight to the HTTP fallback, which 401s on off-sale / private
+    -- UGC. We never once tried EditableImage on clothing.
+    --
+    -- But EditableImage is exactly what bypassed CDN auth for every other
+    -- asset: it reads the bytes the CLIENT already has loaded for
+    -- rendering, regardless of whether our account can fetch the asset
+    -- from the CDN. The clothing is being rendered on a present player, so
+    -- the bytes ARE in the client. Feed the asset id straight to
+    -- CreateEditableImageAsync via Content.fromUri.
+    --
+    -- We try several content-ref forms because a ShirtTemplate URL may
+    -- resolve through different shapes depending on Roblox version:
+    --   1. the exact stored ref (original URL form)
+    --   2. rbxassetid://<id>
+    --   3. the live Shirt/Pants instance's template read off the character
+    if not body and entry.kind == "image" then
+        local tried = {}
+        local function tryRef(c)
+            if not c or tried[c] then return false end
+            tried[c] = true
+            local b, e = extractImageFromContent(c)
+            if b then body = b; err = nil; return true end
+            err = e
+            return false
+        end
+
+        -- (1) and (2): stored ref forms
+        for _, r in ipairs(entry.partRefs) do
+            if r.info and r.info.textureId and tryRef(r.info.textureId) then break end
+        end
+        if not body then tryRef("rbxassetid://" .. entry.id) end
+
+        -- (3): pull the live Shirt/Pants template off any owning player's
+        -- character. This gets the exact Content the engine resolved, which
+        -- can differ from the raw stored URL.
+        if not body then
+            for uid in pairs(entry.owners) do
+                local plr = Players:GetPlayerByUserId(uid)
+                local char = plr and plr.Character
+                if char then
+                    for _, inst in ipairs(char:GetChildren()) do
+                        local tmpl
+                        if inst:IsA("Shirt") then tmpl = inst.ShirtTemplate
+                        elseif inst:IsA("Pants") then tmpl = inst.PantsTemplate
+                        elseif inst:IsA("ShirtGraphic") then tmpl = inst.Graphic end
+                        if tmpl and tmpl ~= "" and _assetIdFromRef(tmpl) == entry.id then
+                            if tryRef(tmpl) then break end
+                        end
+                    end
+                end
+                if body then break end
+            end
+        end
+
+        if body and dbg then
+            dbg(fmt("  EXTRACT image %s via EditableImage (clothing/no-part path)",
+                entry.id))
+        end
+    end
 
     if body then
         local path = (entry.kind == "mesh") and _geomPath(entry.id) or _imgPath(entry.id)
@@ -1795,8 +1875,12 @@ local function enqueueClothing(clothing, uid, displayName)
         local ref = clothing[key]
         local id = _assetIdFromRef(ref)
         if id then
-            -- partInst is nil — these aren't a single Instance. The extractor
-            -- will use the rbxassetid URL directly via Content.fromUri.
+            -- partInst is nil — clothing isn't a single BasePart. _processOne
+            -- detects the no-live-part case and routes the id through
+            -- CreateEditableImageAsync (Content.fromUri) before falling back
+            -- to HTTP. EditableImage reads the bytes the client already
+            -- rendered, so it works even for off-sale/private clothing the
+            -- CDN would 401.
             _enqueueAsset(id, "image", nil, { textureId = ref }, uid, displayName)
         end
     end
