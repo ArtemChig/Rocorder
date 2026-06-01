@@ -67,7 +67,9 @@ internal mechanics — the commit body is the place for mechanics.
 
 - `.rec` format identifier: `ROCORDER/3`. If you change the line grammar or
   remove a field, that's a **major** bump.
-- Rig JSON format identifier: `ROCORDER-RIG/2`. Same rule.
+- Rig JSON format identifier: `ROCORDER-RIG/3` (per-player `revisions[]`).
+  Importer also reads the legacy `ROCORDER-RIG/2` (flat parts/joints) as a
+  single-life record. Same rule for changes.
 - Adding a new field to either is **minor**, backward-compatible.
 
 ## Style / behavior reminders

@@ -87,6 +87,30 @@ nicer (sort columns, breadcrumbs, file-explorer jumps, the cache list).
   `replay_<id>_<ts>` names (backward compat, no breakage on existing
   files). New recordings use the new layout.
 
+## P1 — POV viewmodel capture (FPS games — Rivals etc.)
+
+When recording an FPS game, the player's first-person model (hands holding
+the gun, animated for reload/shoot) is a separate rig that lives **outside**
+`Players.LocalPlayer.Character` — usually parented to `workspace.Camera`,
+sometimes `ReplicatedFirst` or a hidden folder. Currently invisible to our
+capture (we only scan Character + welded externals).
+
+Plan: auto-detect a viewmodel by scanning known containers for a Model with
+BaseParts + Motor6Ds + at least one MeshPart that isn't anchored, isn't a
+real player's body, and is parented somewhere camera-adjacent (`Camera` or a
+descendant). Capture it as a synthetic record (uid = a negative sentinel,
+e.g. `-1`, kept distinct from real player UIDs); animate by world CFrame
+each tick. `rig.json` gets a `viewmodels` array next to `players`.
+Importer puts each viewmodel in its own `Viewmodel` top-level collection.
+
+Coupling: this is logically separate from per-life splits — viewmodels
+have their own lifetime (player death may or may not respawn the
+viewmodel, depending on the game), but the same `revisions[]` shape from
+RIG/3 works for them too if needed.
+
+Decided as the immediate-next item after per-life splits (which landed
+in 1.18.0).
+
 ## P3 — Candidates / known limitations (noticed, not yet committed)
 
 - **Hide enclosed classic base-body boxes on layered-clothing avatars.** When

@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.17.0-alpha"
+local ROCORDER_VERSION = "1.18.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2364,7 +2364,14 @@ end
 local Tracker = {}; Tracker.__index = Tracker
 
 function Tracker.new()
-    return setmetatable({ tracked = {}, pending = {} }, Tracker)
+    return setmetatable({
+        tracked  = {},
+        pending  = {},
+        currentT = 0,    -- session-relative seconds; set per tick by the
+                          -- recorder before calling :snapshot. Used to stamp
+                          -- per-life boundaries (life fromT/toT) so the
+                          -- importer can map each frame to its active life.
+    }, Tracker)
 end
 
 function Tracker:reset() self.tracked = {} end
@@ -2551,30 +2558,66 @@ end
 -- Rebuild the part references after a respawn (new Character = new Instances).
 -- Re-captures the new character, then re-points each existing index's `inst`
 -- by name so frame indices stay aligned; genuinely new parts are appended.
+-- Respawn → close current life, start a new one. Each life carries its own
+-- rig (parts, joints, clothing, charMeshes, externalParts), refs, and
+-- per-life state. The importer reads `revisions[]` from rig.json and builds
+-- ONE armature per life, each in its own sub-collection, with visibility
+-- keyframed to its [fromT, toT] window.
+--
+-- The old behaviour (re-point refs by name into the same rig) merged every
+-- life's parts into a single armature — accessories from a previous life
+-- stayed in the rig forever and the new life's accessories were appended on
+-- top, producing the "messy single rig with everything" the user reported.
 function Tracker:_rebuildRefs(entry, player, encode, debugLog)
-    local ok, _rig, refs = pcall(captureRig, player)
-    if not ok or not refs then return end
-    local byName = {}
-    for _, r in ipairs(refs) do byName[r.name] = r.inst end
-    -- re-point existing
-    for _, r in ipairs(entry.refs) do
-        r.inst = byName[r.name]  -- nil if that part no longer exists
-    end
-    -- rebuild known-set + append any new parts
-    entry.known = {}
-    for _, r in ipairs(entry.refs) do
-        if r.inst then entry.known[r.inst] = true end
-    end
-    entry.char = player.Character
-    -- New Character means content streaming starts over. Reopen the rescan
-    -- gate so newly-attached parts whose mesh content arrives late get
-    -- caught by _rescanExistingAssets again.
+    local ok, newRig, newRefs = pcall(captureRig, player)
+    if not ok or not newRig or not newRefs then return end
+
+    -- Snapshot the closing life into history.
+    local closedLife = {
+        fromT          = entry.lifeFromT or 0,
+        toT            = self.currentT or (entry.lifeFromT or 0),
+        rigType        = entry.rig.rigType,
+        parts          = entry.rig.parts,
+        joints         = entry.rig.joints,
+        clothing       = entry.rig.clothing,
+        characterMeshes = entry.rig.characterMeshes,
+        externalParts  = entry.rig.externalParts,
+    }
+    entry.lifeHistory = entry.lifeHistory or {}
+    entry.lifeHistory[#entry.lifeHistory + 1] = closedLife
+
+    -- Fresh state for the new life.
+    entry.rig         = newRig
+    entry.refs        = newRefs
+    entry.last        = {}
+    entry.known       = {}
+    entry.partLost    = {}
+    entry.char        = player.Character
+    entry.lifeFromT   = self.currentT or 0
     entry.rescanSettled = false
     entry.consecutiveEmptyRescans = 0
-    self:_appendNewParts(entry, player.Character, encode, debugLog)
+    for i, r in ipairs(newRefs) do
+        if r.inst then entry.known[r.inst] = true end
+        entry.last[i] = (r.inst and r.inst:IsA("BasePart"))
+            and encode(r.inst.CFrame) or "0,0,0,0,0,0,1"
+        if not r.inst then entry.partLost[i] = true end
+    end
+
+    -- Enqueue assets for the new life (the closed life's assets are already
+    -- extracted / cached; new life may have different mesh/clothing).
+    if EXTRACT_OK then
+        local dn = entry.displayName
+        for i, r in ipairs(newRefs) do
+            if r.inst then enqueuePartAssets(r.inst, newRig.parts[i], entry.uid, dn) end
+        end
+        enqueueClothing(newRig.clothing, entry.uid, dn)
+    end
+
     if debugLog then
-        debugLog(fmt("uid=%d refs rebuilt after respawn (%d parts)",
-            entry.uid, #entry.refs))
+        debugLog(fmt("uid=%d respawn — life %d closed at t=%.2fs, life %d "
+            .. "started (%d parts, rigType=%s)",
+            entry.uid, #entry.lifeHistory, closedLife.toT,
+            #entry.lifeHistory + 1, #newRefs, newRig.rigType))
     end
 end
 
@@ -2613,6 +2656,12 @@ function Tracker:ensure(player, encode, debugLog)
         ticks = 0, culledTicks = 0,
         hadChar = true, partLost = {}, rangeIn = true,
         lastScanClock = os.clock(),
+        -- Per-life history. Each life is a closed rig snapshot with its time
+        -- window [fromT, toT]. The CURRENT life is implicit (entry.rig is its
+        -- live state, fromT is on the entry). On respawn the live rig is
+        -- snapshotted into lifeHistory and a fresh life starts.
+        lifeFromT      = self.currentT or 0,
+        lifeHistory    = {},
     }
     for i, r in ipairs(refs) do
         if r.inst then entry.known[r.inst] = true end
@@ -2765,9 +2814,17 @@ end
 -- Replay), so without this filter a recording's rig would include stale players
 -- from earlier sessions who have NO frames in this .rec (they import as a
 -- frozen pile of boxes at the origin).
+-- ROCORDER-RIG/3: each player gets a `revisions[]` array. A revision is one
+-- "life" — a closed [fromT, toT] window with its own rig (parts/joints/
+-- clothing/charMeshes). The current life is recorded with `toT = nil` (still
+-- active at end of recording). The importer reads revisions and builds ONE
+-- armature per life in its own sub-collection, with visibility keyframed.
+-- Backward-compat note for the importer: a player record may have either
+-- `revisions = [...]` (RIG/3) or the old `{rigType, parts, joints, ...}`
+-- top-level fields (RIG/2), depending on which recorder produced it.
 function Tracker:rigData(filenameForRef, sinceClock)
     local data = {
-        format = "ROCORDER-RIG/2",
+        format = "ROCORDER-RIG/3",
         recFile = filenameForRef,
         capturedAt = os.time(),
         players = {},
@@ -2775,7 +2832,29 @@ function Tracker:rigData(filenameForRef, sinceClock)
     local n = 0
     for uid, e in pairs(self.tracked) do
         if (not sinceClock) or (e.lastSeenClock and e.lastSeenClock >= sinceClock) then
-            data.players[tostring(uid)] = e.rig
+            local revisions = {}
+            for _, life in ipairs(e.lifeHistory or {}) do
+                revisions[#revisions + 1] = life
+            end
+            -- Current still-active life snapshotted now. toT=nil means
+            -- "still alive at recording end" — importer treats it as
+            -- ending at the last frame.
+            revisions[#revisions + 1] = {
+                fromT           = e.lifeFromT or 0,
+                toT             = nil,
+                rigType         = e.rig.rigType,
+                parts           = e.rig.parts,
+                joints          = e.rig.joints,
+                clothing        = e.rig.clothing,
+                characterMeshes = e.rig.characterMeshes,
+                externalParts   = e.rig.externalParts,
+            }
+            data.players[tostring(uid)] = {
+                userId       = e.uid,
+                name         = e.rig.name,
+                displayName  = e.displayName,
+                revisions    = revisions,
+            }
             n += 1
         end
     end
@@ -3586,6 +3665,13 @@ rec.conns.heartbeat = RunService.Heartbeat:Connect(function()
         -- assemble snapshot from each enabled source
         local snapshot = {}
         if cfg.SRC_PLAYER_PARTS then
+            -- Pass the session-relative current time so _rebuildRefs can
+            -- timestamp life boundaries the same way frames are timestamped.
+            -- Without a live session (e.g. IR-only mode), fall back to
+            -- script-clock-relative so IR save can still write a sensible
+            -- toT/fromT.
+            rec.tracker.currentT = s and (now - s.startClock)
+                or (now - rec.scriptStart)
             local players = rec.tracker:snapshot(cfg, rec.encode, debugLog)
             for i = 1, #players do snapshot[#snapshot + 1] = players[i] end
         end
