@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.17-alpha"
+local ROCORDER_VERSION = "1.9.18-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -432,6 +432,283 @@ do
 end
 
 -- ============================================================================
+-- Actor-based extractor scaffolding.
+--
+-- The 1.9.15-1.9.17 saga proved a coroutine that desyncs isn't enough —
+-- Roblox's editable APIs check whether the calling Script is parented to
+-- an Actor specifically, not just whether the thread is desynchronized.
+-- So we need a real Actor + Script setup. That requires writing to
+-- `Script.Source`, which is normally read-only — but most executors
+-- (including Xeno) patch that security check.
+--
+-- This block is a STAGED PROBE (1.9.18+): it only attempts to set up the
+-- scaffold and verify communication round-trips. Actual extraction
+-- offloading happens in a follow-up version once we confirm the probe
+-- works. Probe steps:
+--   1. Create Actor + worker LocalScript + two BindableEvents (job in,
+--      result out) under it.
+--   2. Try to write a known source to Script.Source.
+--   3. Verify the write stuck by reading it back.
+--   4. Parent the script to start it.
+--   5. Send a "ping" job.
+--   6. Wait up to 2 s for a "pong" response.
+--   7. Print the result.
+--
+-- On any failure, the partial scaffold is destroyed and we fall back to
+-- serial extraction. Sets _G.ROCORDER_ACTOR_OK = true iff the round-trip
+-- worked.
+-- ============================================================================
+_G.ROCORDER_ACTOR_OK = false
+_G.ROCORDER_ACTOR_ERR = nil
+_G.ROCORDER_ACTOR_DETACH = _G.ROCORDER_ACTOR_DETACH or function() end
+do
+    -- Clean up any actor from a prior script load (Xeno re-execute case).
+    pcall(_G.ROCORDER_ACTOR_DETACH)
+    local stale = workspace:FindFirstChild("_ROCORDER_ExtractorActor")
+    if stale then pcall(function() stale:Destroy() end) end
+
+    local actor = Instance.new("Actor")
+    actor.Name = "_ROCORDER_ExtractorActor"
+
+    local jobEvent = Instance.new("BindableEvent")
+    jobEvent.Name = "Job"
+    jobEvent.Parent = actor
+
+    local resultEvent = Instance.new("BindableEvent")
+    resultEvent.Name = "Result"
+    resultEvent.Parent = actor
+
+    local readyEvent = Instance.new("BindableEvent")
+    readyEvent.Name = "Ready"
+    readyEvent.Parent = actor
+
+    actor.Parent = workspace
+
+    local workerScript = Instance.new("LocalScript")
+    workerScript.Name = "Worker"
+
+    -- Worker source. Inside an Actor's script, `task.desynchronize()` is
+    -- a legitimate parallel context — and the editable APIs accept it.
+    -- The worker:
+    --   1. Signals "ready" on first run so the main thread knows the
+    --      Source took.
+    --   2. Listens for jobs on Job event.
+    --   3. Handles ping (returns "pong" immediately) and extract jobs
+    --      (does CreateEditable*Async + reads in desync, posts result).
+    local workerSource = [==[
+        local actor = script.Parent
+        local jobEvent = actor:WaitForChild("Job")
+        local resultEvent = actor:WaitForChild("Result")
+        local readyEvent = actor:WaitForChild("Ready")
+        local AssetService = game:GetService("AssetService")
+
+        -- Signal ready BEFORE any heavy work so main thread knows the
+        -- Source successfully ran. main thread waits up to 2 s for this.
+        readyEvent:Fire("ready")
+
+        jobEvent.Event:Connect(function(jobId, kind, payload)
+            if kind == "ping" then
+                resultEvent:Fire(jobId, true, "pong")
+                return
+            end
+
+            if kind == "image" then
+                local content = payload
+                local ok, ei
+                task.desynchronize()
+                ok, ei = pcall(function()
+                    return AssetService:CreateEditableImageAsync(content)
+                end)
+                if not ok or not ei then
+                    task.synchronize()
+                    resultEvent:Fire(jobId, false,
+                        "CreateEditableImageAsync: " .. tostring(ei))
+                    return
+                end
+                local sz = ei.Size
+                local w = math.floor(sz.X); local h = math.floor(sz.Y)
+                if w <= 0 or h <= 0 then
+                    task.synchronize()
+                    resultEvent:Fire(jobId, false, "zero-size image")
+                    return
+                end
+                local buf
+                local okBuf = pcall(function()
+                    buf = ei:ReadPixelsBuffer(Vector2.new(0, 0), sz)
+                end)
+                task.synchronize()
+                if not okBuf or not buf then
+                    resultEvent:Fire(jobId, false, "ReadPixelsBuffer failed")
+                    return
+                end
+                local data
+                pcall(function() data = buffer.tostring(buf) end)
+                if not data then
+                    resultEvent:Fire(jobId, false, "buffer.tostring failed")
+                    return
+                end
+                resultEvent:Fire(jobId, true,
+                    string.format("ROCORDER-RGBA8\n%d\n%d\n", w, h) .. data)
+                return
+            end
+
+            if kind == "mesh" then
+                local content = payload
+                local ok, em
+                task.desynchronize()
+                ok, em = pcall(function()
+                    return AssetService:CreateEditableMeshAsync(content)
+                end)
+                if not ok or not em then
+                    task.synchronize()
+                    resultEvent:Fire(jobId, false,
+                        "CreateEditableMeshAsync: " .. tostring(em))
+                    return
+                end
+                local vids = em:GetVertices()
+                if not vids or #vids == 0 then
+                    task.synchronize()
+                    resultEvent:Fire(jobId, false, "no vertices")
+                    return
+                end
+                local verts, uvs, normals = {}, {}, {}
+                local idMap = {}
+                for i, vid in ipairs(vids) do
+                    idMap[vid] = i - 1
+                    local p = em:GetPosition(vid)
+                    verts[#verts+1] = p.X; verts[#verts+1] = p.Y; verts[#verts+1] = p.Z
+                    local okUV, uv = pcall(em.GetUV, em, vid)
+                    if okUV and uv then
+                        uvs[#uvs+1] = uv.X; uvs[#uvs+1] = uv.Y
+                    else
+                        uvs[#uvs+1] = 0; uvs[#uvs+1] = 0
+                    end
+                    local okN, n = pcall(em.GetNormal, em, vid)
+                    if okN and n then
+                        normals[#normals+1] = n.X; normals[#normals+1] = n.Y; normals[#normals+1] = n.Z
+                    end
+                    -- pace lightly inside actor too
+                    if i % 500 == 0 then task.wait() end
+                end
+                local faces = {}
+                local fids
+                local okF = pcall(function() fids = em:GetFaces() end)
+                if not okF or not fids then
+                    okF = pcall(function() fids = em:GetTriangles() end)
+                end
+                if okF and fids then
+                    for i, fid in ipairs(fids) do
+                        local fv
+                        local okFV = pcall(function() fv = em:GetFaceVertices(fid) end)
+                        if not okFV or not fv then
+                            okFV = pcall(function() fv = { em:GetTriangleVertices(fid) } end)
+                        end
+                        if okFV and fv and #fv >= 3 then
+                            local a, b, c = idMap[fv[1]], idMap[fv[2]], idMap[fv[3]]
+                            if a and b and c then
+                                faces[#faces+1] = a; faces[#faces+1] = b; faces[#faces+1] = c
+                            end
+                        end
+                        if i % 500 == 0 then task.wait() end
+                    end
+                end
+                task.synchronize()
+                if #faces == 0 then
+                    resultEvent:Fire(jobId, false, "no faces produced")
+                    return
+                end
+                -- Pass back a table. BindableEvents can carry tables across
+                -- actor boundaries.
+                resultEvent:Fire(jobId, true, {
+                    format = "ROCORDER-GEOM/1",
+                    verts = verts, uvs = uvs, normals = normals, faces = faces,
+                })
+                return
+            end
+
+            resultEvent:Fire(jobId, false, "unknown kind " .. tostring(kind))
+        end)
+    ]==]
+
+    -- Try writing the Source. Most executors patch the security check
+    -- that makes this read-only.
+    local writeOk = pcall(function() workerScript.Source = workerSource end)
+    local readBack
+    pcall(function() readBack = workerScript.Source end)
+    local stuck = writeOk and (readBack == workerSource)
+
+    if not stuck then
+        _G.ROCORDER_ACTOR_ERR =
+            "Script.Source write " ..
+            (writeOk and "appeared to succeed but didn't stick (" ..
+                (readBack and (#readBack > 60 and (#readBack .. " bytes")
+                    or readBack:sub(1, 60)) or "nil") .. ")"
+                or "threw")
+        pcall(function() workerScript:Destroy() end)
+        pcall(function() actor:Destroy() end)
+        print("[ROCORDER] Actor scaffold unavailable: "
+            .. _G.ROCORDER_ACTOR_ERR)
+    else
+        -- Start the script. Listen for the "ready" signal.
+        local ready = false
+        local readyConn
+        readyConn = readyEvent.Event:Connect(function() ready = true end)
+        workerScript.Parent = actor
+
+        local waited = 0
+        while not ready and waited < 2.0 do
+            task.wait(0.05); waited = waited + 0.05
+        end
+        if readyConn then readyConn:Disconnect() end
+
+        if not ready then
+            _G.ROCORDER_ACTOR_ERR = "Actor worker script never signaled ready "
+                .. "(maybe Source.set silently failed, or scripts under "
+                .. "Actors are disabled in this executor)"
+            pcall(function() workerScript:Destroy() end)
+            pcall(function() actor:Destroy() end)
+            print("[ROCORDER] Actor scaffold unavailable: "
+                .. _G.ROCORDER_ACTOR_ERR)
+        else
+            -- Round-trip ping test
+            local pong = nil
+            local pongConn
+            pongConn = resultEvent.Event:Connect(function(jobId, ok, data)
+                if jobId == "probe-ping" then
+                    pong = { ok = ok, data = data }
+                end
+            end)
+            jobEvent:Fire("probe-ping", "ping", nil)
+            waited = 0
+            while pong == nil and waited < 2.0 do
+                task.wait(0.05); waited = waited + 0.05
+            end
+            if pongConn then pongConn:Disconnect() end
+
+            if pong and pong.ok and pong.data == "pong" then
+                _G.ROCORDER_ACTOR_OK = true
+                _G.ROCORDER_ACTOR = actor
+                _G.ROCORDER_ACTOR_JOB = jobEvent
+                _G.ROCORDER_ACTOR_RESULT = resultEvent
+                _G.ROCORDER_ACTOR_DETACH = function()
+                    pcall(function() actor:Destroy() end)
+                    _G.ROCORDER_ACTOR_OK = false
+                    _G.ROCORDER_ACTOR = nil
+                end
+                print("[ROCORDER] Actor scaffold installed and ping round-trip "
+                    .. "succeeded — parallel extraction available")
+            else
+                _G.ROCORDER_ACTOR_ERR = pong and ("ping returned " .. tostring(pong.data))
+                    or "ping timed out (worker not responding to BindableEvents)"
+                pcall(function() actor:Destroy() end)
+                print("[ROCORDER] Actor scaffold unavailable: "
+                    .. _G.ROCORDER_ACTOR_ERR)
+            end
+        end
+    end
+end
+
+-- ============================================================================
 -- Parallel-Luau probe.
 --
 -- The remaining ~160 ms stalls during extraction come from Roblox's own
@@ -491,6 +768,48 @@ end
 local function _syncSafe()
     if not PARALLEL_OK then return end
     pcall(task.synchronize)
+end
+
+-- ============================================================================
+-- Actor job dispatch.
+--
+-- When the Actor scaffold passed its probe (_G.ROCORDER_ACTOR_OK = true),
+-- mesh and image extraction can be offloaded into the actor's worker
+-- script — which runs in parallel context and doesn't stall the main
+-- thread on CreateEditable*Async or any of the editable read methods.
+--
+-- _runJobInActor sends a (kind, payload) job, waits for the matching
+-- result event by job id, and returns the data — or nil + reason on
+-- timeout / actor reporting failure. Caller decides whether to retry
+-- in serial.
+-- ============================================================================
+local _actorJobCounter = 0
+local function _runJobInActor(kind, payload, timeoutSec)
+    if not _G.ROCORDER_ACTOR_OK then return nil, "actor unavailable" end
+    if not _G.ROCORDER_ACTOR_JOB or not _G.ROCORDER_ACTOR_RESULT then
+        return nil, "actor events missing"
+    end
+    _actorJobCounter = _actorJobCounter + 1
+    local jobId = "j" .. _actorJobCounter
+
+    local result
+    local conn
+    conn = _G.ROCORDER_ACTOR_RESULT.Event:Connect(function(rJobId, ok, data)
+        if rJobId == jobId then result = { ok = ok, data = data } end
+    end)
+
+    pcall(function() _G.ROCORDER_ACTOR_JOB:Fire(jobId, kind, payload) end)
+
+    local waited = 0
+    local timeout = timeoutSec or 30
+    while result == nil and waited < timeout do
+        task.wait(0.05); waited = waited + 0.05
+    end
+    if conn then pcall(function() conn:Disconnect() end) end
+
+    if not result then return nil, "actor job timed out after " .. timeout .. "s" end
+    if not result.ok then return nil, tostring(result.data or "actor reported failure") end
+    return result.data
 end
 
 local EXTRACT_SLICE_SEC = 0.003   -- ~3 ms of work per frame, max
@@ -563,6 +882,18 @@ local function extractMeshFromPart(part)
         end
     end
     if not content then return nil, "no mesh content on part" end
+
+    -- FAST PATH: dispatch to the Actor's worker if available. Everything
+    -- inside the actor runs in parallel context, so CreateEditableMeshAsync
+    -- + GetVertices + per-vert loop + GetFaces loop don't stall the main
+    -- thread. We get back a ready-built geom table. Falls through to
+    -- serial path on any actor error so a single bad job doesn't break the
+    -- recorder.
+    if _G.ROCORDER_ACTOR_OK then
+        local geom, err = _runJobInActor("mesh", content)
+        if geom then return geom end
+        -- err is informational; fall through to serial below.
+    end
 
     local okem, em = pcall(function()
         return AssetService:CreateEditableMeshAsync(content)
@@ -675,6 +1006,16 @@ local function extractImageFromContent(ref)
     if not EXTRACT_OK then return nil, "EditableImage API unavailable" end
     local content = _toContent(ref)
     if not content then return nil, "no content" end
+
+    -- FAST PATH: actor runs the whole image extraction in parallel and
+    -- returns the final ROCORDER-RGBA8 string body. Skip the local strip
+    -- loop entirely when this succeeds.
+    if _G.ROCORDER_ACTOR_OK then
+        local body, err = _runJobInActor("image", content)
+        if type(body) == "string" then return body end
+        -- fall through to serial extraction on actor failure
+    end
+
     local ok, ei = pcall(function()
         return AssetService:CreateEditableImageAsync(content)
     end)
