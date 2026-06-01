@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 11, 0),
+    "version": (1, 12, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.11.0-alpha"
+ROCORDER_VERSION = "1.12.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -439,10 +439,15 @@ class AssetFetcher:
 
     # ---- meshes ----------------------------------------------------------
     def _parse_geom_json(self, path):
-        """Parse the recorder's <id>.geom.json (engine-extracted geometry:
-        flat verts/uvs/normals/faces arrays, 0-indexed) into the same dict
-        shape parse_roblox_mesh produces: {verts:[(x,y,z)], uvs:[(u,v)],
-        faces:[(a,b,c)], version}."""
+        """Parse the recorder's <id>.geom.json into the importer mesh dict.
+
+        GEOM/2 (current): verts (flat xyz) + faces (vertex-slot triplets) +
+        faceUVs (per face: 3 corner UVs = 6 floats, aligned to faces). UVs are
+        per-corner so seams/islands map correctly.
+
+        GEOM/1 (legacy): verts + per-vertex uvs + faces. Those files have
+        all-zero UVs (the recorder bug this format predates), so they texture
+        flat — re-record to get GEOM/2."""
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
@@ -450,13 +455,17 @@ class AssetFetcher:
             self.log("    geom.json read error {}: {}".format(path, e))
             return None
         vf = d.get("verts") or []
-        uf = d.get("uvs") or []
         ff = d.get("faces") or []
         verts = [(vf[i], vf[i + 1], vf[i + 2]) for i in range(0, len(vf) - 2, 3)]
-        uvs = [(uf[i], uf[i + 1]) for i in range(0, len(uf) - 1, 2)]
         faces = [(ff[i], ff[i + 1], ff[i + 2]) for i in range(0, len(ff) - 2, 3)]
         if not verts or not faces:
             return None
+        fu = d.get("faceUVs")
+        if fu is not None:
+            return {"verts": verts, "faces": faces, "face_uvs": fu,
+                    "version": "geom2"}
+        uf = d.get("uvs") or []
+        uvs = [(uf[i], uf[i + 1]) for i in range(0, len(uf) - 1, 2)]
         return {"verts": verts, "uvs": uvs, "faces": faces, "version": "geom"}
 
     def get_mesh(self, ref):
@@ -761,7 +770,8 @@ def _add_mesh_geometry(bm, uv_layer, mesh, place_mat, part, scale, flip_v=True):
     converted Roblox-local -> Blender-local, then placed by place_mat (the
     canonical rest). Sets per-loop UVs. Returns the new BMVerts."""
     raw = mesh["verts"]
-    uvs = mesh["uvs"]
+    uvs = mesh.get("uvs")            # GEOM/1 + binary: per-vertex
+    face_uvs = mesh.get("face_uvs")  # GEOM/2: per-face-corner (6 floats/face)
     faces = mesh["faces"]
     if not raw or not faces:
         return None
@@ -793,17 +803,27 @@ def _add_mesh_geometry(bm, uv_layer, mesh, place_mat, part, scale, flip_v=True):
     bm.verts.ensure_lookup_table()
 
     n = len(bmverts)
-    for (a, b, c) in faces:
+    nfu = len(face_uvs) if face_uvs else 0
+    for fi, (a, b, c) in enumerate(faces):
         if a >= n or b >= n or c >= n:
             continue
         try:
             f = bm.faces.new((bmverts[a], bmverts[b], bmverts[c]))
         except ValueError:
             continue  # duplicate/degenerate face
-        for loop, vidx in zip(f.loops, (a, b, c)):
-            if vidx < len(uvs):
+        for ci, (loop, vidx) in enumerate(zip(f.loops, (a, b, c))):
+            if face_uvs is not None:
+                # per-corner UVs: face fi, corner ci -> floats [fi*6 + ci*2 ..]
+                base = fi * 6 + ci * 2
+                if base + 1 < nfu:
+                    u, v = face_uvs[base], face_uvs[base + 1]
+                else:
+                    u, v = 0.0, 0.0
+            elif uvs and vidx < len(uvs):
                 u, v = uvs[vidx]
-                loop[uv_layer].uv = (u, (1.0 - v) if flip_v else v)
+            else:
+                u, v = 0.0, 0.0
+            loop[uv_layer].uv = (u, (1.0 - v) if flip_v else v)
 
     bmesh.ops.transform(bm, matrix=place_mat, verts=bmverts)
     return bmverts
@@ -857,19 +877,62 @@ _DECAL_AXIS = {
 }
 
 
+def _project_decal_planar(bm, uv_layer, verts, axis, slot=1):
+    """Project a 0..1 planar UV onto the faces of `verts` that point roughly
+    along `axis`, and assign them material `slot`. Used for the face decal on
+    the spherical classic head (and any non-box decal target)."""
+    bm.normal_update()
+    axis = axis.normalized()
+    faces = set()
+    for v in verts:
+        faces.update(v.link_faces)
+    front = [f for f in faces if f.normal.normalized().dot(axis) > 0.25]
+    if not front:
+        return
+    up = Vector((0.0, 0.0, 1.0))
+    if abs(axis.dot(up)) > 0.9:
+        up = Vector((0.0, 1.0, 0.0))
+    uaxis = axis.cross(up).normalized()
+    vaxis = uaxis.cross(axis).normalized()
+    us, vs, co = [], [], {}
+    for f in front:
+        for loop in f.loops:
+            p = loop.vert.co
+            uu, vv = p.dot(uaxis), p.dot(vaxis)
+            co[loop] = (uu, vv); us.append(uu); vs.append(vv)
+    umin, umax = min(us), max(us); vmin, vmax = min(vs), max(vs)
+    du = (umax - umin) or 1.0; dv = (vmax - vmin) or 1.0
+    for f in front:
+        f.material_index = slot
+        for loop in f.loops:
+            uu, vv = co[loop]
+            loop[uv_layer].uv = ((uu - umin) / du, (vv - vmin) / dv)
+
+
 def _add_primitive_local(bm, uv_layer, part, scale, decal_axis=None):
-    """Build a box / ball / wedge for a classic Part at the origin in
+    """Build a box / ball / head / wedge for a classic Part at the origin in
     Blender-local coords (NOT yet placed). If decal_axis is given, the face
     pointing that way gets material slot 1 and a planar 0..1 UV (so a face
     decal / logo shows on the right side). Returns the new BMVerts."""
     shape = part.get("shape") or "Block"
+    is_head = (part.get("meshType") == "Head")
     sx, sy, sz = (float(s) for s in part.get("size", [1.0, 1.0, 1.0]))
 
-    if shape == "Ball":
-        ret = bmesh.ops.create_uvsphere(
-            bm, u_segments=20, v_segments=12,
-            radius=max(min(sx, sy, sz) * 0.5 * scale, 1e-4))
-        return ret["verts"]
+    if shape == "Ball" or is_head:
+        # Classic Head is a Block part with a SpecialMesh MeshType=Head — it
+        # renders as a rounded head in-game, NOT a cube. Approximate with a
+        # sphere fit to the part size; project the face decal onto the front.
+        ret = bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=16,
+                                        radius=0.5)
+        verts = ret["verts"]
+        bmesh.ops.scale(
+            bm,
+            vec=(max(sx * scale, 1e-4), max(sz * scale, 1e-4),
+                 max(sy * scale, 1e-4)),
+            verts=verts)
+        if is_head and decal_axis is not None:
+            _project_decal_planar(bm, uv_layer, verts, decal_axis, slot=1)
+        return verts
 
     ret = bmesh.ops.create_cube(bm, size=1.0)
     verts = ret["verts"]

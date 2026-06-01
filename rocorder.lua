@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.11.0-alpha"
+local ROCORDER_VERSION = "1.12.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -895,33 +895,38 @@ local function extractMeshFromPart(part)
 
     local vids = em:GetVertices()
     if not vids or #vids == 0 then return nil, "no vertices" end
-    local verts, uvs, normals = {}, {}, {}
+    local verts = {}
     local idMap = {}    -- engine-vertex-id -> 0-indexed slot
-    -- Pace EVERY iteration. paceExtractor short-circuits cheaply (~1us) when
-    -- the per-frame budget isn't spent yet, so the overhead is negligible
-    -- compared to the per-vertex EditableMesh API cost. The previous
-    -- "every 100 verts" gate let a chunk accumulate ~200ms of work on big
-    -- meshes before the pace check could fire — visible as recurring
-    -- ~200ms heartbeat stalls during long mesh extractions.
+    -- Positions only here. UVs are read PER FACE CORNER below — in the stable
+    -- EditableMesh API, GetUV(id) takes a *UV id*, not a vertex id (the old
+    -- code passed a vertex id, so every UV came back as the 0,0 fallback and
+    -- textures rendered as a single flat color). UV ids live per-face via
+    -- GetFaceUVs(faceId).
     for i, vid in ipairs(vids) do
         idMap[vid] = i - 1
         local p = em:GetPosition(vid)
         verts[#verts+1] = p.X; verts[#verts+1] = p.Y; verts[#verts+1] = p.Z
-        local okUV, uv = pcall(em.GetUV, em, vid)
-        if okUV and uv then
-            uvs[#uvs+1] = uv.X; uvs[#uvs+1] = uv.Y
-        else
-            uvs[#uvs+1] = 0; uvs[#uvs+1] = 0
-        end
-        local okN, n = pcall(em.GetNormal, em, vid)
-        if okN and n then
-            normals[#normals+1] = n.X; normals[#normals+1] = n.Y; normals[#normals+1] = n.Z
-        end
         paceExtractor()
     end
 
-    -- Faces (triangles). Method name varies by Roblox API revision.
-    local faces = {}
+    -- Faces + per-corner UVs (GEOM/2). Method names vary by API revision, so
+    -- everything is pcall-probed and degrades to geometry-only (UV 0,0) if the
+    -- face-UV accessors are missing.
+    local faces, faceUVs = {}, {}
+    local uvCache = {}   -- uvId -> {x,y}  (GetUV can repeat across corners)
+    local function uvFor(uvid)
+        if uvid == nil then return 0, 0 end
+        local c = uvCache[uvid]
+        if c then return c[1], c[2] end
+        local okU, uv = pcall(em.GetUV, em, uvid)
+        if okU and uv then
+            uvCache[uvid] = { uv.X, uv.Y }
+            return uv.X, uv.Y
+        end
+        uvCache[uvid] = { 0, 0 }
+        return 0, 0
+    end
+
     local fids
     local okF = pcall(function() fids = em:GetFaces() end)
     if not okF or not fids then
@@ -938,6 +943,13 @@ local function extractMeshFromPart(part)
                 local a, b, c = idMap[fv[1]], idMap[fv[2]], idMap[fv[3]]
                 if a and b and c then
                     faces[#faces+1] = a; faces[#faces+1] = b; faces[#faces+1] = c
+                    -- per-corner UV ids for this face, corner-aligned with fv
+                    local fuv
+                    pcall(function() fuv = em:GetFaceUVs(fid) end)
+                    for k = 1, 3 do
+                        local u, v = uvFor(fuv and fuv[k])
+                        faceUVs[#faceUVs+1] = u; faceUVs[#faceUVs+1] = v
+                    end
                 end
             end
             paceExtractor()
@@ -946,8 +958,8 @@ local function extractMeshFromPart(part)
     if #faces == 0 then return nil, "no faces produced" end
 
     return {
-        format = "ROCORDER-GEOM/1",
-        verts = verts, uvs = uvs, normals = normals, faces = faces,
+        format = "ROCORDER-GEOM/2",
+        verts = verts, faces = faces, faceUVs = faceUVs,
     }
 end
 
@@ -979,13 +991,14 @@ end
 local function _encodeGeomChunked(geom)
     if type(geom) ~= "table" then return nil, "geom not a table" end
     -- format string is a literal; arrays go through the paced encoder.
+    -- GEOM/2 carries per-face-corner UVs (faceUVs, 6 floats/face) instead of
+    -- the per-vertex uvs/normals of GEOM/1.
     paceExtractor()
     local body = table.concat({
-        '{"format":"', geom.format or "ROCORDER-GEOM/1", '"',
+        '{"format":"', geom.format or "ROCORDER-GEOM/2", '"',
         ',"verts":',   _encodeNumberArrayPaced(geom.verts),
-        ',"uvs":',     _encodeNumberArrayPaced(geom.uvs),
-        ',"normals":', _encodeNumberArrayPaced(geom.normals),
         ',"faces":',   _encodeNumberArrayPaced(geom.faces),
+        ',"faceUVs":', _encodeNumberArrayPaced(geom.faceUVs),
         '}',
     })
     paceExtractor()
