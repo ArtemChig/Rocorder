@@ -9,6 +9,39 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.17-alpha — 2026-06-01
+
+Backed out the parallel-Luau extraction path. Roblox's client-side
+editable APIs are more restrictive than docs implied: not just
+`CreateEditable*Async` but also `EditableMesh:GetVertices` (and
+presumably every other editable read method) refuse parallel context:
+
+```
+EXTRACT mesh ... FAILED — Function EditableMesh.GetVertices is
+not safe to call in parallel
+```
+
+1.9.16's log showed every mesh failing extraction at GetVertices and
+falling through to HTTP — which gave us raw mesh-format files, not
+the structured `.geom.json` the importer wants. "0 stalls" was hollow
+— we'd silently lost mesh extraction.
+
+- **`_processOne` no longer desyncs.** Reverted to the 1.9.14 cascade:
+  serial main-thread extraction, paced via `paceExtractor`. The 160 ms
+  stalls during big-mesh extraction are back, but mesh extraction
+  itself works again.
+- **`extractMeshFromPart` / `extractImageFromContent` no longer
+  internally sync.** The 1.9.16 `_syncSafe / _desyncSafe` wrappers
+  around `Create*Async` are gone since the caller never desyncs.
+- **Probe still runs at module load** — its result is informational,
+  printed once. Useful diagnostic if Roblox loosens the parallel
+  restrictions in a future version.
+
+Net for the user: identical behavior to 1.9.14 (the last known-good
+extractor). Future paths to eliminate the 160 ms stalls now require
+genuine Actor scaffolding — out of scope without executor-specific
+Source modification.
+
 ## 1.9.16-alpha — 2026-06-01
 
 Recovers from the 1.9.15 regression. The parallel-Luau probe succeeded,
