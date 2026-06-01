@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.15.1-alpha"
+local ROCORDER_VERSION = "1.15.2-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2092,6 +2092,67 @@ end
 -- meshes) follows. Returns rig (parts + joints) and refs = { {name, inst}, ... }
 -- where `inst` is a live Instance reference (so duplicate-named accessory
 -- parts each resolve to the right object every tick).
+-- CharacterMesh: Roblox's canonical R6 body-part appearance override. A
+-- CharacterMesh instance parented to the Character targets a BodyPart enum
+-- and supplies a MeshId + BaseTextureId + OverlayTextureId. Games like
+-- Violence District use this to replace blocky R6 body parts with sculpted
+-- meshes; without these helpers we'd capture the original Block parts and
+-- import boxes. Used by captureRig (initial / respawn) AND by the throttled
+-- _rescanExistingAssets so a CharacterMesh added/changed mid-game also
+-- lands — without this, _rescanExistingAssets's partInfo() rebuild on a
+-- Block body part would silently erase the override that captureRig set.
+local CMESH_PART_MAP = {
+    Head = "Head", Torso = "Torso",
+    LeftArm  = "Left Arm",  RightArm = "Right Arm",
+    LeftLeg  = "Left Leg",  RightLeg = "Right Leg",
+}
+local function _cmRefOrNil(id)
+    local n = tonumber(id)
+    if not n or n == 0 then return nil end
+    return "rbxassetid://" .. tostring(n)
+end
+local function collectCharacterMeshOverrides(char)
+    local out = {}
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("CharacterMesh") then
+            local okBP, bp = pcall(function() return child.BodyPart end)
+            if okBP and bp then
+                local partName = CMESH_PART_MAP[bp.Name]
+                if partName then
+                    local mid = _cmRefOrNil(child.MeshId)
+                    if mid then
+                        out[partName] = {
+                            meshId      = mid,
+                            baseTexture = _cmRefOrNil(child.BaseTextureId),
+                            overlayTex  = _cmRefOrNil(child.OverlayTextureId),
+                        }
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+local function applyCharacterMeshOverride(partRec, o)
+    partRec.meshId   = o.meshId
+    partRec.shape    = "CharacterMesh"
+    partRec.charMesh = true
+    if o.baseTexture and not partRec.textureId then
+        partRec.textureId = o.baseTexture
+    end
+    if o.overlayTex then
+        partRec.overlayTexture = o.overlayTex
+    end
+end
+local function applyCharacterMeshOverrides(parts, overrides)
+    local applied = 0
+    for _, partRec in ipairs(parts) do
+        local o = overrides[partRec.name]
+        if o then applyCharacterMeshOverride(partRec, o); applied = applied + 1 end
+    end
+    return applied
+end
+
 local function captureRig(player)
     local char = player.Character
     if not char then return nil end
@@ -2214,57 +2275,12 @@ local function captureRig(player)
     -- clothing template, so when a player wears a Shirt/Pants the shirt
     -- texture maps onto the sculpted body correctly — the importer prefers
     -- shirt/pants over BaseTextureId for body parts.
-    do
-        local CMESH_PART_MAP = {
-            Head = "Head", Torso = "Torso",
-            LeftArm  = "Left Arm",  RightArm = "Right Arm",
-            LeftLeg  = "Left Leg",  RightLeg = "Right Leg",
-        }
-        local overrides = {}
-        local function refOrNil(id)
-            local n = tonumber(id)
-            if not n or n == 0 then return nil end
-            return "rbxassetid://" .. tostring(n)
-        end
-        for _, child in ipairs(char:GetChildren()) do
-            if child:IsA("CharacterMesh") then
-                local okBP, bp = pcall(function() return child.BodyPart end)
-                if okBP and bp then
-                    local partName = CMESH_PART_MAP[bp.Name]
-                    if partName then
-                        local mid = refOrNil(child.MeshId)
-                        if mid then
-                            overrides[partName] = {
-                                meshId       = mid,
-                                baseTexture  = refOrNil(child.BaseTextureId),
-                                overlayTex   = refOrNil(child.OverlayTextureId),
-                            }
-                        end
-                    end
-                end
-            end
-        end
-        local applied = 0
-        for _, partRec in ipairs(rig.parts) do
-            local o = overrides[partRec.name]
-            if o then
-                partRec.meshId    = o.meshId        -- override wins for the body part
-                partRec.shape     = "CharacterMesh" -- importer auto-fits to part size
-                partRec.charMesh  = true
-                if o.baseTexture and not partRec.textureId then
-                    partRec.textureId = o.baseTexture
-                end
-                if o.overlayTex then
-                    partRec.overlayTexture = o.overlayTex
-                end
-                applied = applied + 1
-            end
-        end
-        if applied > 0 then
-            rig.characterMeshes = applied
-            print(fmt("[ROCORDER] applied %d CharacterMesh override(s) for "
-                .. "%s (game-replaced body part meshes)", applied, player.Name))
-        end
+    local cmOverrides = collectCharacterMeshOverrides(char)
+    local applied = applyCharacterMeshOverrides(rig.parts, cmOverrides)
+    if applied > 0 then
+        rig.characterMeshes = applied
+        print(fmt("[ROCORDER] applied %d CharacterMesh override(s) for "
+            .. "%s (game-replaced body part meshes)", applied, player.Name))
     end
 
     for _, dsc in ipairs(char:GetDescendants()) do
@@ -2448,6 +2464,12 @@ end
 function Tracker:_rescanExistingAssets(entry, debugLog)
     if not EXTRACT_OK then return end
     if entry.rescanSettled then return end
+    -- Re-collect CharacterMesh overrides every tick so a mid-game add/swap
+    -- is caught AND so the rebuild below doesn't erase the override that
+    -- captureRig applied (partInfo() called on a Block body part returns no
+    -- mesh, which would otherwise overwrite entry.rig.parts[i] with a
+    -- meshless record). char comes from entry.char (set at ensure/respawn).
+    local cmOverrides = entry.char and collectCharacterMeshOverrides(entry.char) or {}
     local foundNew = false
     for i, r in ipairs(entry.refs) do
         local inst = r.inst
@@ -2455,6 +2477,10 @@ function Tracker:_rescanExistingAssets(entry, debugLog)
             local old = entry.rig.parts[i]
             local oldName = (old and old.name) or r.name
             local new = partInfo(inst, oldName)
+            -- Re-apply CharacterMesh override on the freshly-built record so
+            -- the body part keeps its sculpted mesh through every rescan tick.
+            local o = cmOverrides[new.name]
+            if o then applyCharacterMeshOverride(new, o) end
             if _assetFingerprintChanged(old, new) then
                 -- only counts as "new work" (resets the settle counter) when
                 -- the new fingerprint actually carries an asset id we might

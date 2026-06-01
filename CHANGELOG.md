@@ -9,6 +9,33 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.15.2-alpha — 2026-06-02
+
+**1.15.0 CharacterMesh capture didn't survive the throttled rescan.** The
+log said "applied N CharacterMesh override(s)" at capture, but the saved
+`rig.json` had every body part back as `shape=Block` with no `meshId` —
+boxes on import. Diagnosed from a 1.15.0 recording where `characterMeshes:
+3` was recorded but every body part was `shape=Block, meshId=None`.
+
+Root cause: `Tracker:_rescanExistingAssets` runs ~1 Hz and rebuilds each
+part record via `partInfo(inst, name)`. On a Block body part with a
+CharacterMesh override, `partInfo()` returns no mesh (it only looks at the
+BasePart + its SpecialMesh children — CharacterMesh is a sibling Instance
+on the Character, not a child of the part). The rebuilt record replaced
+the one captureRig had populated → override silently erased every second.
+
+Fix:
+- Extracted CharacterMesh discovery / apply into module-local helpers
+  (`collectCharacterMeshOverrides`, `applyCharacterMeshOverride`).
+- `_rescanExistingAssets` now re-collects overrides each tick and
+  re-applies them to the fresh `partInfo` before deciding whether the
+  fingerprint changed. So the override persists across rescans AND a
+  mid-game add/swap of a CharacterMesh is picked up (same way mid-game
+  clothing changes are caught).
+
+Re-record to pick up the data (the rig.json from 1.15.0 still has the
+override stripped).
+
 ## 1.15.1-alpha — 2026-06-02
 
 - BACKLOG.md: added a P2 cluster covering Files-tab improvements (sort
