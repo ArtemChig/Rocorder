@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.8-alpha"
+local ROCORDER_VERSION = "1.9.9-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -496,8 +496,12 @@ local function extractMeshFromPart(part)
     if not vids or #vids == 0 then return nil, "no vertices" end
     local verts, uvs, normals = {}, {}, {}
     local idMap = {}    -- engine-vertex-id -> 0-indexed slot
-    -- Pace every 100 vertices: at ~50us per vert that's ~5ms before each
-    -- pace check, then paceExtractor decides whether to actually yield.
+    -- Pace EVERY iteration. paceExtractor short-circuits cheaply (~1us) when
+    -- the per-frame budget isn't spent yet, so the overhead is negligible
+    -- compared to the per-vertex EditableMesh API cost. The previous
+    -- "every 100 verts" gate let a chunk accumulate ~200ms of work on big
+    -- meshes before the pace check could fire — visible as recurring
+    -- ~200ms heartbeat stalls during long mesh extractions.
     for i, vid in ipairs(vids) do
         idMap[vid] = i - 1
         local p = em:GetPosition(vid)
@@ -512,7 +516,7 @@ local function extractMeshFromPart(part)
         if okN and n then
             normals[#normals+1] = n.X; normals[#normals+1] = n.Y; normals[#normals+1] = n.Z
         end
-        if i % 100 == 0 then paceExtractor() end
+        paceExtractor()
     end
 
     -- Faces (triangles). Method name varies by Roblox API revision.
@@ -535,7 +539,7 @@ local function extractMeshFromPart(part)
                     faces[#faces+1] = a; faces[#faces+1] = b; faces[#faces+1] = c
                 end
             end
-            if i % 100 == 0 then paceExtractor() end
+            paceExtractor()
         end
     end
     if #faces == 0 then return nil, "no faces produced" end
@@ -544,6 +548,35 @@ local function extractMeshFromPart(part)
         format = "ROCORDER-GEOM/1",
         verts = verts, uvs = uvs, normals = normals, faces = faces,
     }
+end
+
+-- Encode a geom table to JSON with pacing between sections. A single
+-- HttpService:JSONEncode on a 500 KB mesh blob blocks for 50-100 ms — long
+-- enough to be a frame-killer on its own. We split the encode into four
+-- subarray encodes (verts / uvs / normals / faces) with paceExtractor()
+-- between them, so the work spreads across 2-4 frames instead of all
+-- happening in one.
+local function _encodeGeomChunked(geom)
+    if type(geom) ~= "table" then return nil, "geom not a table" end
+    local pieces = { '{"format":"', geom.format or "ROCORDER-GEOM/1", '"' }
+    local function addArray(key, arr)
+        paceExtractor()
+        pieces[#pieces + 1] = ',"' .. key .. '":'
+        local ok, encoded = pcall(HttpService.JSONEncode, HttpService, arr)
+        if not ok or type(encoded) ~= "string" then
+            return false, "JSONEncode " .. key .. " failed: " .. tostring(encoded)
+        end
+        pieces[#pieces + 1] = encoded
+        return true
+    end
+    local ok, err
+    ok, err = addArray("verts",   geom.verts);   if not ok then return nil, err end
+    ok, err = addArray("uvs",     geom.uvs);     if not ok then return nil, err end
+    ok, err = addArray("normals", geom.normals); if not ok then return nil, err end
+    ok, err = addArray("faces",   geom.faces);   if not ok then return nil, err end
+    pieces[#pieces + 1] = "}"
+    paceExtractor()
+    return table.concat(pieces)
 end
 
 -- Extract an image to raw RGBA8 bytes + a small text header. Filename ends in
@@ -849,7 +882,11 @@ local function _processOne(entry, dbg)
         if entry.kind == "mesh" then
             local geom
             geom, err = extractMeshFromPart(ref.inst)
-            if geom then body = HttpService:JSONEncode(geom) end
+            if geom then
+                -- Chunked encode with pacing between subarrays; a single
+                -- HttpService:JSONEncode of a 500 KB mesh was a ~100 ms stall.
+                body, err = _encodeGeomChunked(geom)
+            end
         else
             local imgRef = _imgRefFromPartInfo(ref.info, entry.id)
             body, err = extractImageFromContent(imgRef)
@@ -2100,12 +2137,15 @@ function rec:_downloadAssets(logSink)
         for _, id in ipairs(list) do
             local path = ASSETS_FOLDER .. "/" .. id
 
-            -- treat an existing file as cached ONLY if it's a real asset;
-            -- error-page files saved by older versions get re-downloaded.
-            -- Also count an extracted .geom.json / .rgba as "cached" so we
-            -- don't re-download something the in-engine extractor already got.
+            -- Treat as cached if the queue worker already extracted/saved it
+            -- this session (EXTRACTED flag — survives the brief writefile→
+            -- isfile lag) OR if any form is on disk. For bare bin files we
+            -- still validate via looksLikeAsset to weed out 401 error-page
+            -- bodies left by pre-1.7.2 versions.
             local cached = false
-            if isfile and (isfile(_geomPath(id)) or isfile(_imgPath(id))) then
+            if EXTRACTED[id] then
+                cached = true
+            elseif isfile and (isfile(_geomPath(id)) or isfile(_imgPath(id))) then
                 cached = true
             elseif isfile and isfile(path) then
                 if readfile then

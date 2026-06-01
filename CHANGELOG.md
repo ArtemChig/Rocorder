@@ -9,6 +9,29 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.9-alpha — 2026-05-31
+
+Cuts the dominant remaining source of in-game stutter during extraction.
+
+- **`paceExtractor()` is now called on every iteration** of the mesh
+  vertex + face loops, not every 100. The helper short-circuits in ~1 µs
+  when the budget isn't spent, so the extra calls are nearly free — and
+  the old "every 100" gate let chunks accumulate ~200 ms of EditableMesh
+  API work before the pace check could fire. That was the cause of the
+  recurring ~200 ms heartbeat stalls observed during 500+ KB mesh
+  extractions.
+- **Mesh JSON encode is now chunked**. `HttpService:JSONEncode` is
+  synchronous and blocks for 50-100 ms on a 500 KB mesh blob — a
+  frame-killer on its own. New `_encodeGeomChunked` builds the JSON in
+  four pieces (verts / uvs / normals / faces) with `paceExtractor()`
+  between each, spreading the encode across 2-4 frames.
+- **Legacy ASSET DOWNLOAD pass now respects `EXTRACTED[id]`** as a cache
+  signal. Previously, the queue worker's HTTP fallback would save a
+  clothing template to `<id>` (bare bin), then the legacy pass at Stop
+  would re-fetch and re-save the same id — wasting one HTTP round-trip
+  per clothing template that hit the fallback path. The inline cache
+  check now hits the in-session flag first.
+
 ## 1.9.8-alpha — 2026-05-31
 
 Late-joining players and mid-recording equips are now visible to the live
