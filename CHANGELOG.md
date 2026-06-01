@@ -9,6 +9,33 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.11-alpha — 2026-06-01
+
+- **Mesh JSON encode is now manual & paced internally.**
+  `HttpService:JSONEncode` of a 30 000-number array (the verts list for a
+  10 k-vert mesh) is unbreakable C code that blocks for 20-40 ms. The
+  outer-chunk pacing introduced in 1.9.9 couldn't help — pacing AROUND a
+  20 ms op leaves the 20 ms hit intact. New `_encodeNumberArrayPaced`
+  does the encode in a Lua loop with `paceExtractor()` every 1000
+  elements, cutting each subarray encode into ~1 ms slices. `tostring`
+  on a Roblox float produces JSON-valid number literals, so output bytes
+  remain importer-compatible. Expected effect: small (~30-100 ms)
+  stutters during mesh extraction also disappear.
+- **Failure label no longer wrongly accuses player of leaving.** The
+  fallback in `_processOne` printed `(player left before extraction)`
+  whenever no live partRef existed — but clothing templates
+  (Shirt/Pants) enqueue with `partInst = nil` by design, because
+  `CreateEditableImageAsync` rejects clothing IDs. So clothing
+  failures (off-sale UGC, private, restricted assets) were misattributed
+  as the player leaving. Now distinguished:
+  - `(asset not publicly accessible — likely off-sale / private
+    clothing / restricted UGC)` for never-had-a-partInst entries.
+  - `(player left before extraction)` only when an entry HAD a partRef
+    and lost it.
+  - No tag for "tried both paths, both failed for a generic reason".
+  The `missed` stat (shown in the UI as "of which N missed: player
+  left") now reflects actual player-leave events only.
+
 ## 1.9.10-alpha — 2026-06-01
 
 Fixes the residual ~1 Hz stutter the user reported even after assets had
