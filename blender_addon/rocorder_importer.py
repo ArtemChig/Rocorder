@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 15, 2),
+    "version": (1, 15, 3),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.15.2-alpha"
+ROCORDER_VERSION = "1.15.3-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -785,8 +785,14 @@ def _add_mesh_geometry(bm, uv_layer, mesh, place_mat, part, scale, flip_v=True):
     size = part.get("size", [1.0, 1.0, 1.0])
     sx, sy, sz = (float(s) for s in size)
 
-    if part.get("shape") == "FileMesh":
-        # legacy SpecialMesh: render at Scale, no auto-fit to part size
+    if part.get("shape") in ("FileMesh", "CharacterMesh"):
+        # legacy SpecialMesh + CharacterMesh: render at authored size, no
+        # auto-fit to part size. CharacterMesh meshes are sculpted at
+        # anatomical proportions (e.g. torso mesh bbox ~1.33×1.85×0.84 even
+        # though the BasePart is the standard R6 2×2×1) — Roblox renders
+        # them as-is at the part's CFrame, NOT bbox-stretched to part size.
+        # Stretching them to fit the part size made every CharacterMesh
+        # avatar squashed / blocky-shaped in 1.15.x.
         ms = part.get("meshScale", [1.0, 1.0, 1.0])
         fx, fy, fz = float(ms[0]), float(ms[1]), float(ms[2])
         cx = cy = cz = 0.0
@@ -1125,23 +1131,24 @@ def _build_part_object(part, name, place, scale, assets, import_meshes,
     if import_meshes and assets is not None:
         if part.get("meshId"):
             mesh_data = assets.get_mesh(part.get("meshId"))
-        # Body parts on classic R6 (Torso / arms / legs) with the player
-        # wearing a Shirt or Pants prefer that texture over textureId. This
-        # matters for CharacterMesh-replaced bodies (Violence District etc.):
-        # the CharacterMesh's mesh has UVs that follow the R6 clothing
-        # template, so shirt/pants applied as the texture wraps the sculpted
-        # body correctly — same as in-game. Falls back to textureId /
-        # colorMap (CharacterMesh's BaseTextureId is recorded as textureId)
-        # when the player has no clothing for that part.
-        if apply_clothing and clothing:
-            if name in ("Torso", "Left Arm", "Right Arm") and clothing.get("shirt"):
-                body_tex = assets.get_image_path(clothing["shirt"])
-            elif name in ("Left Leg", "Right Leg") and clothing.get("pants"):
-                body_tex = assets.get_image_path(clothing["pants"])
-        if body_tex is None:
-            tref = part.get("textureId") or part.get("colorMap")
-            if tref:
-                body_tex = assets.get_image_path(tref)
+        # Texture selection for body parts.
+        #
+        # Plain Block body parts (no CharacterMesh): we wrap the classic R6
+        # Shirt/Pants template onto the box via our own _clothed_box UVs in
+        # the primitive branch below — handled there, not here.
+        #
+        # CharacterMesh body parts: render the mesh with its OWN authored
+        # UVs and the texture(s) baked for those UVs (BaseTextureId /
+        # OverlayTextureId). We must NOT substitute Shirt/Pants because a
+        # game-authored CharacterMesh has sculpted-anatomical UVs that don't
+        # follow the standard R6 clothing template — painting the shirt
+        # across that UV layout splatters the texture nonsensically (the
+        # 1.15.x bug). When the CharacterMesh has no BaseTexture, falling
+        # back to plain colour is more correct than wearing the shirt over
+        # mismatched UVs.
+        tref = part.get("textureId") or part.get("colorMap")
+        if tref:
+            body_tex = assets.get_image_path(tref)
 
     verts = None
     if mesh_data:
