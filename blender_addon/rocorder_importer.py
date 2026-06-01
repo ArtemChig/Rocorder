@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 14, 2),
+    "version": (1, 15, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.14.2-alpha"
+ROCORDER_VERSION = "1.15.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -1125,9 +1125,23 @@ def _build_part_object(part, name, place, scale, assets, import_meshes,
     if import_meshes and assets is not None:
         if part.get("meshId"):
             mesh_data = assets.get_mesh(part.get("meshId"))
-        tref = part.get("textureId") or part.get("colorMap")
-        if tref:
-            body_tex = assets.get_image_path(tref)
+        # Body parts on classic R6 (Torso / arms / legs) with the player
+        # wearing a Shirt or Pants prefer that texture over textureId. This
+        # matters for CharacterMesh-replaced bodies (Violence District etc.):
+        # the CharacterMesh's mesh has UVs that follow the R6 clothing
+        # template, so shirt/pants applied as the texture wraps the sculpted
+        # body correctly — same as in-game. Falls back to textureId /
+        # colorMap (CharacterMesh's BaseTextureId is recorded as textureId)
+        # when the player has no clothing for that part.
+        if apply_clothing and clothing:
+            if name in ("Torso", "Left Arm", "Right Arm") and clothing.get("shirt"):
+                body_tex = assets.get_image_path(clothing["shirt"])
+            elif name in ("Left Leg", "Right Leg") and clothing.get("pants"):
+                body_tex = assets.get_image_path(clothing["pants"])
+        if body_tex is None:
+            tref = part.get("textureId") or part.get("colorMap")
+            if tref:
+                body_tex = assets.get_image_path(tref)
 
     verts = None
     if mesh_data:
