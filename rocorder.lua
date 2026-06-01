@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.19.1-alpha"
+local ROCORDER_VERSION = "1.19.2-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2179,11 +2179,23 @@ local VIEWMODEL_UID = -1  -- sentinel; player UserIds are always positive
 
 -- Returns (verdict, reason_string) so we can both detect AND diagnose. A
 -- candidate must be a Model that has BaseParts + Motor6Ds + at least one
--- MeshPart, none anchored, no BaseParts shared with any player's Character.
+-- MeshPart, none anchored, no BaseParts shared with any player's Character,
+-- AND has no Humanoid (real FPS viewmodels don't — anything with a
+-- Humanoid is a character preview / NPC dummy / emote dummy). Also rejects
+-- Models with too many parts (>40, real viewmodels are hands + gun = ~5-20).
 -- The reason string is "ok" on accept or a short failure tag otherwise.
 local function _viewmodelVerdict(inst, playerBodySet)
     if not inst then return false, "nil" end
     if not inst:IsA("Model") then return false, "not Model" end
+    -- Cheap structural rejects first.
+    if inst:FindFirstChildOfClass("Humanoid") then
+        return false, "has Humanoid (character/dummy, not a viewmodel)"
+    end
+    local lname = inst.Name:lower()
+    if lname:find("dummy") or lname:find("preview")
+            or lname:find("placeholder") then
+        return false, "name suggests dummy/preview"
+    end
     local hasMotor6D, hasMeshPart, hasBasePart = false, false, false
     local anchored, sharedWithPlayer = false, false
     local nParts, nMesh, nMotor = 0, 0, 0
@@ -2202,6 +2214,9 @@ local function _viewmodelVerdict(inst, playerBodySet)
     if not hasBasePart then return false, "no BaseParts" end
     if not hasMeshPart then return false, "no MeshPart" end
     if not hasMotor6D then return false, "no Motor6D" end
+    if nParts > 40 then
+        return false, fmt("too many parts (%d > 40, looks like a full character)", nParts)
+    end
     return true, fmt("ok (parts=%d mesh=%d motor=%d)", nParts, nMesh, nMotor)
 end
 
@@ -2277,12 +2292,11 @@ end
 -- One-shot diagnostic dump: list every Model under every scan location with
 -- a short verdict line. Hugely helpful for "where does Rivals hide its
 -- viewmodel" — the debug log immediately tells us the path and why each
--- candidate didn't qualify. Fires once per session via a _G marker so it
--- doesn't spam the log. Limited to ~30 models total to stay sane on big
--- containers.
-local function _viewmodelDiagnostic(debugLog)
-    if not debugLog or _G.ROCORDER_VM_DIAG_DONE then return end
-    _G.ROCORDER_VM_DIAG_DONE = true
+-- candidate didn't qualify. Fires once per Tracker (one per loader execute)
+-- via a flag passed in by the caller. Capped at ~30 Models total.
+local function _viewmodelDiagnostic(debugLog, gate)
+    if not debugLog or gate.done then return end
+    gate.done = true
     local playerBodySet = {}
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Character then
@@ -2574,10 +2588,10 @@ function Tracker.new()
     return setmetatable({
         tracked  = {},
         pending  = {},
-        currentT = 0,    -- session-relative seconds; set per tick by the
-                          -- recorder before calling :snapshot. Used to stamp
-                          -- per-life boundaries (life fromT/toT) so the
-                          -- importer can map each frame to its active life.
+        currentT = 0,
+        -- one-shot gate for the viewmodel scan diagnostic; fires once per
+        -- Tracker (i.e. once per loader execute) when detection fails.
+        _vmDiagGate = { done = false },
     }, Tracker)
 end
 
@@ -3099,13 +3113,24 @@ function Tracker:snapshot(cfg, encode, debugLog)
     if cfg.CAPTURE_VIEWMODEL ~= false then
         local vmodel = _findViewmodel()
         local entry = self.tracked[VIEWMODEL_UID]
+        -- Self-heal: if the prior viewmodel is gone (Model destroyed or its
+        -- char field no longer matches anything we'd accept), forget it so
+        -- we don't keep a row alive pointing at a dead Instance, and so the
+        -- diagnostic dump fires when there's truly nothing left.
+        if entry and (not entry.char or not entry.char.Parent) then
+            self.tracked[VIEWMODEL_UID] = nil
+            entry = nil
+            if debugLog then
+                debugLog("viewmodel detached (previous Model gone)")
+            end
+        end
         if vmodel then
             entry = self:ensureViewmodel(vmodel, encode, debugLog) or entry
-        elseif not entry and debugLog then
-            -- First time we've looked AND found nothing: dump the candidate
-            -- containers' Models with their reject reasons. Fires once per
-            -- session via a _G marker.
-            _viewmodelDiagnostic(debugLog)
+        elseif debugLog then
+            -- No viewmodel currently active. Run the one-shot diagnostic so
+            -- we know what Models we considered. Gated per-Tracker (once
+            -- per loader execute). Runs even when a stale entry exists.
+            _viewmodelDiagnostic(debugLog, self._vmDiagGate)
         end
         if entry and entry.char == vmodel then
             -- only emit when the viewmodel currently exists (Camera child
