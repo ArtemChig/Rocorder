@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.16-alpha"
+local ROCORDER_VERSION = "1.9.17-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -564,15 +564,9 @@ local function extractMeshFromPart(part)
     end
     if not content then return nil, "no mesh content on part" end
 
-    -- CreateEditableMeshAsync is NOT safe in parallel context. If the worker
-    -- desynced us before this call, briefly sync just for the API call, then
-    -- re-desync so the vertex/face loops below can still run in parallel.
-    -- _syncSafe / _desyncSafe are no-ops when the parallel probe failed.
-    _syncSafe()
     local okem, em = pcall(function()
         return AssetService:CreateEditableMeshAsync(content)
     end)
-    _desyncSafe()
     if not okem or not em then return nil, "CreateEditableMeshAsync: " .. tostring(em) end
 
     local vids = em:GetVertices()
@@ -681,16 +675,9 @@ local function extractImageFromContent(ref)
     if not EXTRACT_OK then return nil, "EditableImage API unavailable" end
     local content = _toContent(ref)
     if not content then return nil, "no content" end
-
-    -- CreateEditableImageAsync is NOT safe in parallel context. Sync just for
-    -- the API call, then re-desync for the strip-extract loop (which IS
-    -- parallel-safe per Roblox docs — pixel reads on an already-created
-    -- EditableImage don't require synchronization).
-    _syncSafe()
     local ok, ei = pcall(function()
         return AssetService:CreateEditableImageAsync(content)
     end)
-    _desyncSafe()
     if not ok or not ei then return nil, "CreateEditableImageAsync: " .. tostring(ei) end
     local sz = ei.Size
     local w, h = math.floor(sz.X), math.floor(sz.Y)
@@ -1117,41 +1104,32 @@ end
 -- Try the extractor path; if it fails or no live part remains, try a one-shot
 -- authenticated HTTP fetch. Returns true if the asset ended up on disk.
 --
--- Parallel-Luau pattern (1.9.15+, gated by PARALLEL_OK probe at module load):
---   - The heavy extraction work (CreateEditable*Async, ReadPixelsBuffer,
---     JSON encode) runs in DESYNCHRONIZED context — off the main thread.
---   - Before any executor file I/O (writefile), HTTP request, or game-state
---     introspection (Players:GetPlayerByUserId), we SYNCHRONIZE back to
---     the main thread.
---   - If the probe says parallel isn't available, _desyncSafe/_syncSafe
---     are no-ops and the worker runs entirely on the main thread as before.
+-- Parallel-Luau experiment (1.9.15 / 1.9.16) FAILED. Roblox's client-side
+-- editable APIs are too restrictive: not just CreateEditable*Async but also
+-- EditableMesh:GetVertices and (likely) every other editable read method
+-- refuses parallel context. The probe at module load still runs and prints
+-- the result (useful diagnostic), but _processOne no longer attempts to
+-- desync — every API call below would just throw and the entry would fall
+-- through to HTTP fallback, losing the .geom.json output we want. Better
+-- to keep the existing 160 ms stalls than to lose every mesh extraction.
 local function _processOne(entry, dbg)
-    local ref = _findLivePartRef(entry)  -- Instance read, main thread
+    local ref = _findLivePartRef(entry)
     local body, err
 
-    -- Enter parallel context for the heavy extraction work. Wrap in pcall
-    -- so any thrown error still hits the resync below — leaving the worker
-    -- coroutine stuck desynchronized would silently break the next entry.
-    local desynced = _desyncSafe()
-    local extractOk, extractErr = pcall(function()
-        if ref then
-            if entry.kind == "mesh" then
-                local geom
-                geom, err = extractMeshFromPart(ref.inst)
-                if geom then
-                    -- Chunked encode with pacing between subarrays; a single
-                    -- HttpService:JSONEncode of a 500 KB mesh was a ~100 ms stall.
-                    body, err = _encodeGeomChunked(geom)
-                end
-            else
-                local imgRef = _imgRefFromPartInfo(ref.info, entry.id)
-                body, err = extractImageFromContent(imgRef)
+    if ref then
+        if entry.kind == "mesh" then
+            local geom
+            geom, err = extractMeshFromPart(ref.inst)
+            if geom then
+                -- Chunked encode with pacing between subarrays; a single
+                -- HttpService:JSONEncode of a 500 KB mesh was a ~100 ms stall.
+                body, err = _encodeGeomChunked(geom)
             end
+        else
+            local imgRef = _imgRefFromPartInfo(ref.info, entry.id)
+            body, err = extractImageFromContent(imgRef)
         end
-    end)
-    -- Synchronize back to main thread before writefile / HTTP / Player APIs.
-    if desynced then _syncSafe() end
-    if not extractOk then err = err or tostring(extractErr) end
+    end
 
     -- Step 2 (REMOVED in 1.9.14, kept as comment for record): we briefly
     -- tried wrapping the URL in a live Decal and using Content.fromObject
