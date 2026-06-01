@@ -9,6 +9,33 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.14.0-alpha — 2026-06-01
+
+**Classic R6 2D clothing (Shirt / Pants) now wraps onto the box body** — the
+last piece for fully-correct imports. The 3D mesh clothing already worked;
+this fills in classic-body avatars.
+
+- A classic Block body part (Torso / Left+Right Arm / Left+Right Leg) with no
+  mesh, on a player wearing a Shirt/Pants, is now built as a box whose six
+  faces are UV-mapped into the **585×559 classic template** layout, with the
+  shirt texture on the torso+arms and the pants texture on the legs — so the
+  clothing wraps like in-game instead of showing flat color.
+- Template region coordinates were read directly off Roblox's official
+  shirt/pants template guide (the `R·FRONT·L·BACK` torso cross with `UP`/`DOWN`,
+  and the two limb crosses `L·B·R·F` / `F·L·B·R` with `U`/`D`). 64 px/stud,
+  so torso front/back are 128×128, sides 64×128, caps 128×64; limb sides
+  64×128, caps 64×64. The rects + per-face orientation live in clearly-named
+  tables (`_TORSO_RECTS`, `_RIGHT_LIMB_RECTS`, `_LEFT_LIMB_RECTS`, `_FACE_AXES`)
+  so any single mirrored/rotated face is a one-line tweak.
+- New import option **"Apply classic clothing (Shirt/Pants)"** (default on).
+- The recorder already captures `clothing` (shirt/pants/tshirt) and extracts
+  the templates to `.rgba`, so no re-record is needed — just reinstall the
+  add-on and re-import.
+
+T-shirt (ShirtGraphic) overlay on the torso front is not yet applied (it's a
+separate decal layer); noted for later. Head clothing N/A (head uses its face
+decal).
+
 ## 1.13.1-alpha — 2026-06-01
 
 The 1.12.2 mesh-cache migration **deleted nothing** — diagnosed from
