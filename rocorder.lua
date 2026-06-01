@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.19.0-alpha"
+local ROCORDER_VERSION = "1.19.1-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2177,24 +2177,77 @@ end
 -- ============================================================================
 local VIEWMODEL_UID = -1  -- sentinel; player UserIds are always positive
 
-local function _isViewmodelCandidate(inst, playerBodySet)
-    if not inst or not inst:IsA("Model") then return false end
+-- Returns (verdict, reason_string) so we can both detect AND diagnose. A
+-- candidate must be a Model that has BaseParts + Motor6Ds + at least one
+-- MeshPart, none anchored, no BaseParts shared with any player's Character.
+-- The reason string is "ok" on accept or a short failure tag otherwise.
+local function _viewmodelVerdict(inst, playerBodySet)
+    if not inst then return false, "nil" end
+    if not inst:IsA("Model") then return false, "not Model" end
     local hasMotor6D, hasMeshPart, hasBasePart = false, false, false
+    local anchored, sharedWithPlayer = false, false
+    local nParts, nMesh, nMotor = 0, 0, 0
     for _, d in ipairs(inst:GetDescendants()) do
         if d:IsA("BasePart") then
-            if playerBodySet[d] then return false end
-            if d.Anchored then return false end
-            hasBasePart = true
-            if d:IsA("MeshPart") then hasMeshPart = true end
+            if playerBodySet[d] then sharedWithPlayer = true end
+            if d.Anchored then anchored = true end
+            hasBasePart = true; nParts = nParts + 1
+            if d:IsA("MeshPart") then hasMeshPart = true; nMesh = nMesh + 1 end
         elseif d:IsA("Motor6D") then
-            hasMotor6D = true
+            hasMotor6D = true; nMotor = nMotor + 1
         end
     end
-    return hasBasePart and hasMeshPart and hasMotor6D
+    if sharedWithPlayer then return false, "shares parts with a Player.Character" end
+    if anchored then return false, "has anchored part(s)" end
+    if not hasBasePart then return false, "no BaseParts" end
+    if not hasMeshPart then return false, "no MeshPart" end
+    if not hasMotor6D then return false, "no Motor6D" end
+    return true, fmt("ok (parts=%d mesh=%d motor=%d)", nParts, nMesh, nMotor)
+end
+
+-- Recurse a small fixed depth through `root`. Calls visit(child, full_path)
+-- for every Instance, stopping once visit returns true (used to short-circuit
+-- when we find a viewmodel). Depth-limited so we don't walk an entire
+-- character tree.
+local function _walkLimited(root, maxDepth, visit, pathPrefix)
+    if not root then return false end
+    for _, child in ipairs(root:GetChildren()) do
+        local fullPath = pathPrefix .. "." .. child.Name
+        if visit(child, fullPath) then return true end
+        if maxDepth > 0 then
+            if _walkLimited(child, maxDepth - 1, visit, fullPath) then return true end
+        end
+    end
+    return false
+end
+
+local _VM_SCAN_LOCATIONS = nil
+local function _viewmodelScanLocations()
+    if _VM_SCAN_LOCATIONS then return _VM_SCAN_LOCATIONS end
+    local locs = {}
+    locs[#locs + 1] = { name = "workspace.Camera",
+        get = function() return workspace.CurrentCamera end, depth = 3 }
+    locs[#locs + 1] = { name = "ReplicatedFirst",
+        get = function()
+            local ok, r = pcall(function() return game:GetService("ReplicatedFirst") end)
+            return ok and r or nil
+        end, depth = 3 }
+    local lp = Players and Players.LocalPlayer
+    if lp then
+        locs[#locs + 1] = { name = "LocalPlayer.PlayerScripts",
+            get = function() return lp:FindFirstChildOfClass("PlayerScripts") end,
+            depth = 3 }
+        locs[#locs + 1] = { name = "LocalPlayer.PlayerGui",
+            get = function() return lp:FindFirstChildOfClass("PlayerGui") end,
+            depth = 2 }
+    end
+    locs[#locs + 1] = { name = "workspace",
+        get = function() return workspace end, depth = 1 }   -- top-level only
+    _VM_SCAN_LOCATIONS = locs
+    return locs
 end
 
 local function _findViewmodel()
-    -- Build the "don't grab another player's body" set once per call.
     local playerBodySet = {}
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Character then
@@ -2203,23 +2256,63 @@ local function _findViewmodel()
             end
         end
     end
-    local cam = workspace.CurrentCamera
-    if cam then
-        for _, child in ipairs(cam:GetChildren()) do
-            if _isViewmodelCandidate(child, playerBodySet) then
-                return child, "workspace.Camera"
+    local foundModel, foundPath
+    for _, loc in ipairs(_viewmodelScanLocations()) do
+        local root = loc.get()
+        _walkLimited(root, loc.depth, function(inst, fullPath)
+            if inst:IsA("Model") then
+                local ok = _viewmodelVerdict(inst, playerBodySet)
+                if ok then
+                    foundModel = inst
+                    foundPath = loc.name .. fullPath:sub(#loc.name + 1, -1)
+                    return true   -- stop walking
+                end
             end
-        end
-    end
-    local okRF, rf = pcall(function() return game:GetService("ReplicatedFirst") end)
-    if okRF and rf then
-        for _, child in ipairs(rf:GetChildren()) do
-            if _isViewmodelCandidate(child, playerBodySet) then
-                return child, "ReplicatedFirst"
-            end
-        end
+        end, loc.name)
+        if foundModel then return foundModel, foundPath end
     end
     return nil, nil
+end
+
+-- One-shot diagnostic dump: list every Model under every scan location with
+-- a short verdict line. Hugely helpful for "where does Rivals hide its
+-- viewmodel" — the debug log immediately tells us the path and why each
+-- candidate didn't qualify. Fires once per session via a _G marker so it
+-- doesn't spam the log. Limited to ~30 models total to stay sane on big
+-- containers.
+local function _viewmodelDiagnostic(debugLog)
+    if not debugLog or _G.ROCORDER_VM_DIAG_DONE then return end
+    _G.ROCORDER_VM_DIAG_DONE = true
+    local playerBodySet = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then
+            for _, d in ipairs(p.Character:GetDescendants()) do
+                if d:IsA("BasePart") then playerBodySet[d] = true end
+            end
+        end
+    end
+    debugLog("=== viewmodel scan diagnostic (1.19.1+) ===")
+    local total = 0
+    for _, loc in ipairs(_viewmodelScanLocations()) do
+        local root = loc.get()
+        if root then
+            local hit = false
+            _walkLimited(root, loc.depth, function(inst, fullPath)
+                if inst:IsA("Model") and total < 30 then
+                    hit = true; total = total + 1
+                    local ok, why = _viewmodelVerdict(inst, playerBodySet)
+                    debugLog(fmt("  %s  =>  %s", fullPath, why))
+                    return ok    -- short-circuit if we hit a real candidate
+                end
+            end, loc.name)
+            if not hit then
+                debugLog(fmt("  %s: no Models in scan depth %d", loc.name, loc.depth))
+            end
+        else
+            debugLog(fmt("  %s: container not found", loc.name))
+        end
+    end
+    debugLog("=== end viewmodel scan diagnostic ===")
 end
 
 local function captureViewmodelRig(vmodel)
@@ -3008,6 +3101,11 @@ function Tracker:snapshot(cfg, encode, debugLog)
         local entry = self.tracked[VIEWMODEL_UID]
         if vmodel then
             entry = self:ensureViewmodel(vmodel, encode, debugLog) or entry
+        elseif not entry and debugLog then
+            -- First time we've looked AND found nothing: dump the candidate
+            -- containers' Models with their reject reasons. Fires once per
+            -- session via a _G marker.
+            _viewmodelDiagnostic(debugLog)
         end
         if entry and entry.char == vmodel then
             -- only emit when the viewmodel currently exists (Camera child
