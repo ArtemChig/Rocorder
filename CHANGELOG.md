@@ -9,6 +9,33 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.12.0-alpha — 2026-06-01
+
+Fixes the two confirmed importer/extraction bugs from the in-game-vs-Blender
+comparison: collapsed UVs (textures showed as flat color) and the classic
+head rendering as a cube.
+
+- **Mesh UVs were all (0,0) — FIXED (requires re-record).** The recorder's
+  `extractMeshFromPart` called `em:GetUV(vertexId)`, but in the stable
+  EditableMesh API `GetUV` takes a *UV id*, not a vertex id — UV ids are
+  reached per-face via `GetFaceUVs(faceId)`. So every UV fell back to (0,0)
+  and every face sampled one texel → solid flat color on every extracted
+  mesh. Extraction now reads UVs correctly per face corner and writes a new
+  **`ROCORDER-GEOM/2`** geom format (`verts` + `faces` + per-corner
+  `faceUVs`). **You must re-record** — geom files already on disk are
+  GEOM/1 with the zero UVs baked in.
+- **Importer reads GEOM/2** (per-face-corner UVs, applied to bmesh loops) and
+  still reads GEOM/1 / binary meshes (per-vertex UVs) for older recordings.
+- **Classic head no longer a cube.** A classic Head is a Block part with a
+  SpecialMesh `MeshType=Head` (no mesh id), so the importer fell back to a
+  box. It now builds a size-fitted sphere and projects the face decal onto
+  the front hemisphere — much closer to the in-game rounded head.
+
+Known remaining (next): classic-R6 Shirt/Pants are extracted (`.rgba`) but
+not yet wrapped onto the box Torso/arms/legs via the R6 UV template, so those
+base-body boxes still show flat-colored under any layered-clothing meshes.
+That's the last piece for full fidelity on classic-body avatars.
+
 ## 1.11.0-alpha — 2026-06-01
 
 **The Blender importer now consumes the engine-extracted assets** the recorder
