@@ -9,6 +9,36 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.17.0-alpha — 2026-06-02
+
+**Texture alpha now blends OVER the body colour instead of cutting through
+to nothing.** Matches Roblox's in-game rendering: a shirt PNG with a
+transparent background shows the player's skin in the transparent regions,
+a face decal shows the head's skin around the eyes/mouth, an accessory with
+partial alpha shows the accessory's flat colour beneath. Before, the alpha
+was wired straight to BSDF Alpha and blend mode HASHED — so you'd see
+straight *through* the avatar wherever the texture wasn't fully opaque.
+
+- `_image_material` now builds a Mix RGB node:
+  - Color1 = part body colour (baked in)
+  - Color2 = image-texture colour
+  - Factor = image-texture alpha
+  - Output → Principled BSDF Base Color
+  - Material itself stays opaque.
+- Roblox's actual see-through (`Part.Transparency`) is still applied
+  separately when >0 — via BSDF Alpha + HASHED blend mode — so a literally
+  semi-transparent part still renders see-through correctly. The two
+  concepts (texture alpha = mix factor vs. part transparency = real
+  see-through) are no longer conflated.
+- Textures without an alpha channel are unchanged (texture colour goes
+  straight to Base Color).
+- Material cache key now includes the body colour and the transparency
+  level, so two parts using the same texture but different skin colours
+  get distinct materials (the colour is baked into the Mix node, so they
+  can't share).
+
+Importer-only change. Reinstall the add-on and re-import.
+
 ## 1.16.0-alpha — 2026-06-02
 
 **Shirt/Pants now wrap a CharacterMesh body** the same way they wrap the

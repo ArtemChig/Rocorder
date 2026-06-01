@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 16, 0),
+    "version": (1, 17, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.16.0-alpha"
+ROCORDER_VERSION = "1.17.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -907,34 +907,74 @@ def _add_mesh_geometry(bm, uv_layer, mesh, place_mat, part, scale, flip_v=True,
 
 
 def _image_material(name, image_path, color, transparency, log):
-    """Principled-BSDF material with an image-texture base color. Falls back to
-    a flat color material when image_path is None."""
+    """Principled-BSDF material with an image-texture base color blended OVER
+    the part's body color via texture alpha. Matches Roblox's in-game
+    rendering: a shirt with a transparent background draws the player's skin
+    in the transparent regions instead of rendering see-through; a face
+    decal shows the head's skin colour around the eyes/mouth; an accessory
+    with a partly-transparent texture shows the accessory's flat colour
+    beneath. Part.Transparency (Roblox's see-through control) is applied
+    separately as actual alpha. Falls back to a flat colour material when
+    image_path is None."""
     if not image_path:
         return _color_material(color, transparency)
-    key = "ROCORDER_TEX_" + os.path.basename(image_path)
+
+    # Cache key includes body colour + transparency: the body colour is
+    # baked into the material via the Mix node, so two parts using the same
+    # texture but different colours need distinct materials. Transparent
+    # parts likewise need their own.
+    r = max(0.0, min(1.0, float(color[0])))
+    g = max(0.0, min(1.0, float(color[1])))
+    b = max(0.0, min(1.0, float(color[2])))
+    color_tag = "{:02x}{:02x}{:02x}".format(
+        int(r * 255 + 0.5), int(g * 255 + 0.5), int(b * 255 + 0.5))
+    key = "ROCORDER_TEX_" + os.path.basename(image_path) + "_" + color_tag
+    if transparency > 0.0:
+        key += "_t{:02d}".format(int(transparency * 100 + 0.5))
     mat = bpy.data.materials.get(key)
     if mat is not None:
         return mat
+
     try:
         img = bpy.data.images.load(image_path, check_existing=True)
     except Exception as e:
         if log:
             log("    image load failed {}: {}".format(image_path, e))
         return _color_material(color, transparency)
+
     mat = bpy.data.materials.new(key)
     mat.use_nodes = True
     nt = mat.node_tree
     bsdf = nt.nodes.get("Principled BSDF")
     tex = nt.nodes.new("ShaderNodeTexImage")
     tex.image = img
-    tex.location = (-300, 200)
+    tex.location = (-600, 200)
+
     if bsdf is not None:
-        nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-        # use texture alpha for transparency if the image has it
         if img.channels == 4:
+            # Texture has alpha → blend texture OVER body colour with its
+            # alpha as the mix factor. transparent texel ⇒ body colour,
+            # opaque texel ⇒ texture colour, partial alpha smoothly blends.
+            # Material stays opaque (no see-through) — that's the whole
+            # point. ShaderNodeMixRGB (the legacy name) still works in
+            # Blender 4.x and avoids needing the newer ShaderNodeMix.
+            mix = nt.nodes.new("ShaderNodeMixRGB")
+            mix.blend_type = "MIX"
+            mix.location = (-300, 200)
+            mix.inputs["Color1"].default_value = (r, g, b, 1.0)
+            nt.links.new(tex.outputs["Color"], mix.inputs["Color2"])
+            nt.links.new(tex.outputs["Alpha"], mix.inputs["Fac"])
+            nt.links.new(mix.outputs["Color"], bsdf.inputs["Base Color"])
+        else:
+            # No alpha channel — texture colour is the final colour.
+            nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+
+        # Part.Transparency = real see-through, independent of texture alpha.
+        # Only touched when >0 so opaque parts stay fully opaque.
+        if transparency > 0.0:
             alpha_in = bsdf.inputs.get("Alpha")
             if alpha_in is not None:
-                nt.links.new(tex.outputs["Alpha"], alpha_in)
+                alpha_in.default_value = 1.0 - transparency
             try:
                 mat.blend_method = "HASHED"
             except (AttributeError, TypeError):
