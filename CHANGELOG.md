@@ -9,6 +9,40 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.19.0-alpha — 2026-06-02
+
+**POV viewmodel capture for FPS games (Rivals, Phantom Forces, Arsenal, …).**
+The first-person hands + gun rig lives outside every player's `Character`,
+so the existing per-Character capture never saw it. Auto-detected each tick
+and recorded as its own entity.
+
+- **Detection.** Scan `workspace.CurrentCamera`'s children, then
+  `ReplicatedFirst`'s children, for a `Model` containing BaseParts +
+  Motor6Ds + at least one MeshPart, none anchored, no BaseParts shared
+  with any player's Character (so we never grab a third-person body by
+  mistake). First match wins.
+- **Recorder.** New `Tracker:ensureViewmodel` runs each tick. The viewmodel
+  uses `VIEWMODEL_UID = -1` (negative sentinel — real UserIds are always
+  positive) as its key in `Tracker.tracked`, so it shares every existing
+  bit of plumbing: per-life splits, rigData → rig.json revisions, the
+  `(uid:cframe|...)` row in each `.rec` frame.
+- **Weapon / model swaps.** When the detected viewmodel Model is a
+  different Instance than the previous tick's, that's a life boundary —
+  current life is closed (`toT` set), a fresh life starts with the new
+  rig. Same `RIG/3` mechanics players use.
+- **New setting** *POV viewmodel* (Settings → Sources, default ON). Turn it
+  off if your game has a quirky `Model` under Camera that we keep
+  mis-detecting.
+- **Importer.** Negative uid is recognised as a viewmodel: armatures land
+  in a top-level `Viewmodel` collection (no roster lookup needed). Each
+  life still goes into its own `Viewmodel_LifeN` sub-collection with
+  visibility keyframes, identical to the player-life machinery.
+- **No new format-id**. RIG/3 covers it as a synthetic player record. `.rec`
+  frames already accept negative uids — no change to the frame parser.
+
+Re-record to pick up viewmodel data. Existing recordings have no viewmodel
+captured (predates 1.19.0) — nothing breaks, just no viewmodel armature.
+
 ## 1.18.0-alpha — 2026-06-02
 
 **Per-life splits.** When a player dies and respawns mid-recording, each

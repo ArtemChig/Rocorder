@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.18.0-alpha"
+local ROCORDER_VERSION = "1.19.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -242,6 +242,11 @@ local SETTING_DEFS = {
       group="Sources" },
     { key="SRC_CAMERA",       type="bool", default=false, label="Player camera",
       desc="Per-tick CFrame + FOV of the local camera. Imports as a Blender camera.",
+      group="Sources" },
+    { key="CAPTURE_VIEWMODEL", type="bool", default=true,  label="POV viewmodel",
+      desc="First-person viewmodel (hands + gun) for FPS games. Auto-detected "
+        .. "under workspace.Camera or ReplicatedFirst. Imports as a "
+        .. "separate Viewmodel collection.",
       group="Sources" },
 }
 
@@ -2153,6 +2158,115 @@ local function applyCharacterMeshOverrides(parts, overrides)
     return applied
 end
 
+-- ============================================================================
+-- POV viewmodel — first-person hand/gun rig used by FPS games.
+--
+-- The viewmodel is a separate Model parented OUTSIDE every player's Character
+-- (usually `workspace.CurrentCamera` or `ReplicatedFirst`) so the existing
+-- per-Character capture never sees it. We auto-detect a candidate Model on
+-- every tick: must have BaseParts + Motor6Ds + at least one MeshPart, must
+-- NOT be anchored, must NOT share any BasePart with a player's Character
+-- (so we don't accidentally grab someone's third-person body). The local
+-- player's POV is the only one we'd ever see — other players' viewmodels
+-- aren't replicated to us.
+--
+-- Viewmodel tracking uses a sentinel uid (negative) so it shares the
+-- existing Tracker plumbing (lives, snapshot rows, rig.json) with players.
+-- Importer recognizes the sentinel and routes those armatures to a
+-- separate "Viewmodel" top-level collection.
+-- ============================================================================
+local VIEWMODEL_UID = -1  -- sentinel; player UserIds are always positive
+
+local function _isViewmodelCandidate(inst, playerBodySet)
+    if not inst or not inst:IsA("Model") then return false end
+    local hasMotor6D, hasMeshPart, hasBasePart = false, false, false
+    for _, d in ipairs(inst:GetDescendants()) do
+        if d:IsA("BasePart") then
+            if playerBodySet[d] then return false end
+            if d.Anchored then return false end
+            hasBasePart = true
+            if d:IsA("MeshPart") then hasMeshPart = true end
+        elseif d:IsA("Motor6D") then
+            hasMotor6D = true
+        end
+    end
+    return hasBasePart and hasMeshPart and hasMotor6D
+end
+
+local function _findViewmodel()
+    -- Build the "don't grab another player's body" set once per call.
+    local playerBodySet = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then
+            for _, d in ipairs(p.Character:GetDescendants()) do
+                if d:IsA("BasePart") then playerBodySet[d] = true end
+            end
+        end
+    end
+    local cam = workspace.CurrentCamera
+    if cam then
+        for _, child in ipairs(cam:GetChildren()) do
+            if _isViewmodelCandidate(child, playerBodySet) then
+                return child, "workspace.Camera"
+            end
+        end
+    end
+    local okRF, rf = pcall(function() return game:GetService("ReplicatedFirst") end)
+    if okRF and rf then
+        for _, child in ipairs(rf:GetChildren()) do
+            if _isViewmodelCandidate(child, playerBodySet) then
+                return child, "ReplicatedFirst"
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function captureViewmodelRig(vmodel)
+    if not vmodel then return nil, nil end
+    local rig = {
+        userId      = VIEWMODEL_UID,
+        name        = "Viewmodel",
+        displayName = "POV",
+        rigType     = "Viewmodel",
+        parts       = {},
+        joints      = {},
+        isViewmodel = true,
+        sourcePath  = vmodel:GetFullName(),
+    }
+    local refs = {}
+    local used = {}
+    local function uniqueName(raw)
+        local nm = sanitizeName(raw)
+        local cand, i = nm, 1
+        while used[cand] do i = i + 1; cand = nm .. "_" .. i end
+        used[cand] = true
+        return cand
+    end
+    for _, desc in ipairs(vmodel:GetDescendants()) do
+        if desc:IsA("BasePart") and not desc.Anchored then
+            local nm = uniqueName(desc.Name)
+            rig.parts[#rig.parts + 1] = partInfo(desc, nm)
+            refs[#refs + 1] = { name = nm, inst = desc }
+        end
+    end
+    for _, dsc in ipairs(vmodel:GetDescendants()) do
+        if dsc:IsA("Motor6D") then
+            local p0, p1 = dsc.Part0, dsc.Part1
+            if p0 and p1 then
+                rig.joints[#rig.joints + 1] = {
+                    name  = dsc.Name,
+                    part0 = sanitizeName(p0.Name),
+                    part1 = sanitizeName(p1.Name),
+                    c0    = { dsc.C0:GetComponents() },
+                    c1    = { dsc.C1:GetComponents() },
+                }
+            end
+        end
+    end
+    return rig, refs
+end
+
 local function captureRig(player)
     local char = player.Character
     if not char then return nil end
@@ -2712,6 +2826,83 @@ function Tracker:ensure(player, encode, debugLog)
     return entry
 end
 
+-- Viewmodel: ensure / respawn. Parallel to player ensure + _rebuildRefs but
+-- on a Model (not a Player). The viewmodel uses VIEWMODEL_UID as its key in
+-- self.tracked so it shares all the existing Tracker plumbing — life
+-- splits, snapshot rows, rigData output.
+function Tracker:ensureViewmodel(vmodel, encode, debugLog)
+    local entry = self.tracked[VIEWMODEL_UID]
+    if entry and entry.char == vmodel then return entry end
+
+    -- Either first sighting or a Model swap. Capture fresh.
+    local rig, refs = captureViewmodelRig(vmodel)
+    if not rig or not refs then return nil end
+
+    if entry then
+        -- Model swap = new life. Same shape as Tracker:_rebuildRefs.
+        local closedLife = {
+            fromT          = entry.lifeFromT or 0,
+            toT            = self.currentT or (entry.lifeFromT or 0),
+            rigType        = entry.rig.rigType,
+            parts          = entry.rig.parts,
+            joints         = entry.rig.joints,
+            isViewmodel    = true,
+            sourcePath     = entry.rig.sourcePath,
+        }
+        entry.lifeHistory = entry.lifeHistory or {}
+        entry.lifeHistory[#entry.lifeHistory + 1] = closedLife
+        entry.rig         = rig
+        entry.refs        = refs
+        entry.last        = {}
+        entry.known       = {}
+        entry.partLost    = {}
+        entry.char        = vmodel
+        entry.lifeFromT   = self.currentT or 0
+        entry.rescanSettled = false
+        entry.consecutiveEmptyRescans = 0
+        if debugLog then
+            debugLog(fmt("viewmodel swapped (%s) — life %d closed at t=%.2fs, "
+                .. "life %d started (%d parts)",
+                rig.sourcePath, #entry.lifeHistory, closedLife.toT,
+                #entry.lifeHistory + 1, #refs))
+        end
+    else
+        entry = {
+            uid = VIEWMODEL_UID,
+            displayName = "POV",
+            rig = rig, refs = refs, last = {},
+            char = vmodel, known = {},
+            ticks = 0, culledTicks = 0,
+            hadChar = true, partLost = {}, rangeIn = true,
+            lastScanClock = os.clock(),
+            lifeFromT   = self.currentT or 0,
+            lifeHistory = {},
+            isViewmodel = true,
+        }
+        self.tracked[VIEWMODEL_UID] = entry
+        if debugLog then
+            debugLog(fmt("viewmodel detected at %s (%d parts, %d joints) "
+                .. "— life 1 started", rig.sourcePath, #refs, #rig.joints))
+        end
+    end
+
+    for i, r in ipairs(refs) do
+        if r.inst then entry.known[r.inst] = true end
+        entry.last[i] = (r.inst and r.inst:IsA("BasePart"))
+            and encode(r.inst.CFrame) or "0,0,0,0,0,0,1"
+        if not r.inst then entry.partLost[i] = true end
+    end
+
+    if EXTRACT_OK then
+        for i, r in ipairs(refs) do
+            if r.inst then
+                enqueuePartAssets(r.inst, rig.parts[i], VIEWMODEL_UID, "POV")
+            end
+        end
+    end
+    return entry
+end
+
 function Tracker:snapshot(cfg, encode, debugLog)
     local entries = {}
     local cameraPos
@@ -2806,6 +2997,38 @@ function Tracker:snapshot(cfg, encode, debugLog)
             end
         end
     end
+
+    -- POV viewmodel — emit a row in the same frame for the local player's
+    -- first-person rig (gun + hands) if a candidate Model is currently
+    -- attached. Same data shape as a player row (`uid:cframe|cframe|...`)
+    -- with VIEWMODEL_UID as the key. Other tracker plumbing (life splits,
+    -- rigData → rig.json revisions) is shared with players.
+    if cfg.CAPTURE_VIEWMODEL ~= false then
+        local vmodel = _findViewmodel()
+        local entry = self.tracked[VIEWMODEL_UID]
+        if vmodel then
+            entry = self:ensureViewmodel(vmodel, encode, debugLog) or entry
+        end
+        if entry and entry.char == vmodel then
+            -- only emit when the viewmodel currently exists (Camera child
+            -- present); when the viewmodel is detached we just skip the row
+            -- for this frame — keeps it absent from any post-detach scenes.
+            local parts = {}
+            for i, r in ipairs(entry.refs) do
+                local pt = r.inst
+                local lost = not (pt and pt.Parent and pt:IsA("BasePart"))
+                if not lost then
+                    parts[i] = encode(pt.CFrame); entry.last[i] = parts[i]
+                else
+                    parts[i] = entry.last[i] or "0,0,0,0,0,0,1"
+                end
+            end
+            entries[#entries+1] = tostring(VIEWMODEL_UID) .. ":" .. table.concat(parts, "|")
+            entry.ticks += 1
+            entry.lastSeenClock = now
+        end
+    end
+
     return entries
 end
 
