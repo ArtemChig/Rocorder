@@ -9,6 +9,33 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.12.2-alpha — 2026-06-01
+
+The 1.12.0 UV fix never actually ran, because the extractor caches assets by
+file existence: every mesh was already on disk as a pre-fix GEOM/1 file (all
+UVs zero), so `_isCached` skipped re-extracting it. Result: re-recording kept
+reusing the broken files and textures still looked flat.
+
+- **One-time mesh-cache migration.** On load, if the marker `assets/.geom_v2`
+  is absent, every existing `.geom.json` is deleted (they're all pre-1.12
+  zero-UV GEOM/1) and the marker is written. They then re-extract as GEOM/2
+  with correct per-corner UVs on your next recording. Only filenames are
+  listed (no file contents read), so it's fast. `.rgba` textures and bare
+  files are untouched. **Just re-execute the loader and record again.**
+- **EditableMesh API probe** logged once per session (console + debug log):
+  `EditableMesh API probe: GetFaceUVs=yes GetUVs=… GetUV=yes …`. Tells us
+  exactly which UV accessors this Roblox build exposes.
+- **Per-mesh UV-range log**: `geom: N verts, M tris, UV range [0.000..0.973]`
+  — or `… UV range [0.000..0.000]  *** UVs FLAT — extraction failed` if the
+  UVs still don't come through. So the debug log now proves whether UV
+  extraction worked, no guessing.
+
+If after re-recording the debug log shows a non-flat UV range, the meshes will
+texture correctly in Blender. (The classic R6 box body — Torso/arms/legs — is
+genuinely primitive blocks in-engine, occluded in-game by mesh clothing;
+texturing/handling those is the separate classic-R6 wrapping item in
+BACKLOG.md.)
+
 ## 1.12.1-alpha — 2026-06-01
 
 - Added `BACKLOG.md` to track planned/deferred features, and a pointer to it
