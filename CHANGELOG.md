@@ -9,6 +9,36 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.11.0-alpha — 2026-06-01
+
+**The Blender importer now consumes the engine-extracted assets** the recorder
+has been producing — `.geom.json` meshes and `.rgba` textures. This is what
+turns the previously-unfetchable (CDN-401) UGC into real geometry and real
+textures in Blender instead of grey boxes.
+
+- **`<id>.geom.json` → mesh.** `AssetFetcher.get_mesh` now checks for the
+  recorder's `.geom.json` (flat verts/uvs/normals/faces from EditableMesh)
+  before anything else and parses it straight into the importer's mesh
+  structure. No Roblox binary-mesh parsing, no CDN, no auth — and it's
+  present for assets the CDN refuses. Falls back to the bare-file / CDN
+  binary path when no `.geom.json` exists.
+- **`<id>.rgba` → texture.** `AssetFetcher.get_image_path` now detects the
+  recorder's raw-RGBA8 extraction (header `ROCORDER-RGBA8\n<w>\n<h>\n` +
+  pixels), converts it to a PNG in the asset cache once (numpy-accelerated,
+  vertical-flipped from Roblox top-origin to Blender bottom-origin), and
+  feeds that PNG to the normal image-material path. Cached PNGs are reused
+  on subsequent imports.
+- **Import log** now breaks assets down as `N geom.json + N rgba
+  (engine-extracted), N bare-local, N downloaded, …` so you can see how much
+  came from the engine vs the network.
+- Bare HTTP-fallback files (`<id>`) and the CDN path still work unchanged;
+  the typed extraction files are simply preferred when present.
+
+Still pending: classic-R6 Shirt/Pants templates are now extracted to
+`.rgba`, but wrapping them onto the box body via the standard R6 UV layout
+isn't applied yet — classic bodies render flat-colored. MeshPart bodies and
+accessories (with real UVs) are textured correctly.
+
 ## 1.10.0-alpha — 2026-06-01
 
 **New: per-player include / exclude filter with live Roblox avatar icons.**
