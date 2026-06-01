@@ -9,6 +9,54 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.15.0-alpha — 2026-06-01
+
+**Capture `CharacterMesh` overrides** — fixes the "arms/legs are wrong
+shape" import bug in Violence District and any other game that replaces
+blocky R6 body parts with sculpted meshes.
+
+Background. Roblox's `CharacterMesh` instance is the canonical way to
+replace an R6 body part's appearance: it's parented to the Character model,
+targets a `BodyPart` enum (Head / Torso / LeftArm / RightArm / LeftLeg /
+RightLeg), and supplies its own `MeshId` + `BaseTextureId` +
+`OverlayTextureId`. We were only scanning `BaseParts` for mesh data, so the
+override mesh was invisible to us and the original blocky boxes is what
+imported.
+
+Recorder:
+- `captureRig` now scans the Character for `CharacterMesh` instances and
+  records `{MeshId, BaseTextureId, OverlayTextureId}` per body part. The
+  matching `rig.parts[i]` gets `meshId` overridden, `shape="CharacterMesh"`,
+  `charMesh=true`, and `textureId`/`overlayTexture` filled in (the
+  CharacterMesh's MeshId wins for that body part).
+- `extractMeshFromPart` now takes an optional `partInfoRef` and falls back to
+  extracting the mesh by content URL when the part itself has no mesh (so
+  CharacterMesh meshes — which aren't attached to a single BasePart —
+  extract via the normal queue).
+- `enqueuePartAssets` also enqueues `overlayTexture` now.
+- Logged at capture: `applied N CharacterMesh override(s) for <player>`.
+
+Importer:
+- A part with `shape="CharacterMesh"` flows through the MeshPart
+  auto-fit branch (everything except `"FileMesh"`), which fits the mesh's
+  bbox to the body part's size — exactly right since CharacterMesh meshes
+  are sculpted at standard R6 body part dimensions (Torso 2×2×1, etc.).
+- Texture priority for classic-R6 body parts (Torso / arms / legs): if
+  the player has a Shirt/Pants AND classic clothing is enabled, that
+  texture wins over `textureId` (= the CharacterMesh's `BaseTextureId`).
+  CharacterMesh meshes have UVs matching the R6 clothing template, so
+  shirt/pants applied as the texture wraps the sculpted body correctly,
+  same as in-game.
+
+Architecturally: this is also a more general fix for "body mesh data lost
+during recording" — the asset-fetch path now reads mesh content from any
+source (BasePart MeshPart / SpecialMesh / CharacterMesh override) instead
+of being tied to a single part type, so future game-specific override
+mechanisms (e.g. WrapDeformer) will be easier to add (same hook).
+
+Requires re-record to pick up CharacterMesh data; the importer side is
+backward compatible.
+
 ## 1.14.2-alpha — 2026-06-01
 
 - **Classic-clothing region layout corrected (cell spacing).** 1.14.1 packed

@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.14.2-alpha"
+local ROCORDER_VERSION = "1.15.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -882,22 +882,29 @@ end
 --   { verts = {x,y,z, ...}, uvs = {u,v, ...},
 --     normals = {x,y,z, ...}, faces = {a,b,c, ...} }   (0-indexed)
 -- Or returns nil + reason string.
-local function extractMeshFromPart(part)
+local function extractMeshFromPart(part, partInfoRef)
     if not EXTRACT_OK then return nil, "EditableMesh API unavailable" end
     local content
-    if part:IsA("MeshPart") then
+    if part and part:IsA("MeshPart") then
         local ok, mc = pcall(function() return part.MeshContent end)
         if ok and mc then content = mc end
         if not content then
             local ok2, mid = pcall(function() return part.MeshId end)
             if ok2 and mid and mid ~= "" then content = _toContent(mid) end
         end
-    else
+    elseif part then
         local sm = part:FindFirstChildOfClass("SpecialMesh")
         if sm then
             local ok, mid = pcall(function() return sm.MeshId end)
             if ok and mid and mid ~= "" then content = _toContent(mid) end
         end
+    end
+    -- Fallback: extract by a content URL from partInfo. Used for
+    -- CharacterMesh overrides where the part itself has no mesh — the
+    -- mesh content lives on a separate CharacterMesh instance and we
+    -- recorded its asset URL on the part record.
+    if not content and partInfoRef and partInfoRef.meshId then
+        content = _toContent(partInfoRef.meshId)
     end
     if not content then return nil, "no mesh content on part" end
 
@@ -1553,7 +1560,7 @@ local function _processOne(entry, dbg)
     if ref then
         if entry.kind == "mesh" then
             local geom
-            geom, err = extractMeshFromPart(ref.inst)
+            geom, err = extractMeshFromPart(ref.inst, ref.info)
             if geom then
                 -- Chunked encode with pacing between subarrays; a single
                 -- HttpService:JSONEncode of a 500 KB mesh was a ~100 ms stall.
@@ -1954,8 +1961,9 @@ local function enqueuePartAssets(part, partInfo, uid, displayName)
         _enqueueAsset(meshId, "mesh", part, partInfo, uid, displayName)
     end
     local imgs = {}
-    if partInfo.textureId then imgs[#imgs+1] = partInfo.textureId end
-    if partInfo.colorMap  then imgs[#imgs+1] = partInfo.colorMap  end
+    if partInfo.textureId      then imgs[#imgs+1] = partInfo.textureId      end
+    if partInfo.colorMap       then imgs[#imgs+1] = partInfo.colorMap       end
+    if partInfo.overlayTexture then imgs[#imgs+1] = partInfo.overlayTexture end
     if partInfo.decals then
         for _, d in ipairs(partInfo.decals) do
             if d.texture then imgs[#imgs+1] = d.texture end
@@ -2192,6 +2200,70 @@ local function captureRig(player)
                 print(fmt("[ROCORDER] captured %d externally-welded part(s) for "
                     .. "%s (game-attached 3D clothing/cosmetics)", added, player.Name))
             end
+        end
+    end
+
+    -- CharacterMesh overrides. Roblox's canonical way to replace the appearance
+    -- of an R6 body part: a CharacterMesh Instance parented to the Character
+    -- targets a BodyPart enum (Head / Torso / LeftArm / RightArm / LeftLeg /
+    -- RightLeg) and supplies its own MeshId + BaseTextureId + OverlayTextureId.
+    -- Games like Violence District use this to give blocky R6 avatars sculpted
+    -- arms / legs / torso shapes. Without this capture we'd see the original
+    -- Block parts (those are what we scan), miss the override, and import as
+    -- boxes. CharacterMesh meshes also have UVs that follow the standard R6
+    -- clothing template, so when a player wears a Shirt/Pants the shirt
+    -- texture maps onto the sculpted body correctly — the importer prefers
+    -- shirt/pants over BaseTextureId for body parts.
+    do
+        local CMESH_PART_MAP = {
+            Head = "Head", Torso = "Torso",
+            LeftArm  = "Left Arm",  RightArm = "Right Arm",
+            LeftLeg  = "Left Leg",  RightLeg = "Right Leg",
+        }
+        local overrides = {}
+        local function refOrNil(id)
+            local n = tonumber(id)
+            if not n or n == 0 then return nil end
+            return "rbxassetid://" .. tostring(n)
+        end
+        for _, child in ipairs(char:GetChildren()) do
+            if child:IsA("CharacterMesh") then
+                local okBP, bp = pcall(function() return child.BodyPart end)
+                if okBP and bp then
+                    local partName = CMESH_PART_MAP[bp.Name]
+                    if partName then
+                        local mid = refOrNil(child.MeshId)
+                        if mid then
+                            overrides[partName] = {
+                                meshId       = mid,
+                                baseTexture  = refOrNil(child.BaseTextureId),
+                                overlayTex   = refOrNil(child.OverlayTextureId),
+                            }
+                        end
+                    end
+                end
+            end
+        end
+        local applied = 0
+        for _, partRec in ipairs(rig.parts) do
+            local o = overrides[partRec.name]
+            if o then
+                partRec.meshId    = o.meshId        -- override wins for the body part
+                partRec.shape     = "CharacterMesh" -- importer auto-fits to part size
+                partRec.charMesh  = true
+                if o.baseTexture and not partRec.textureId then
+                    partRec.textureId = o.baseTexture
+                end
+                if o.overlayTex then
+                    partRec.overlayTexture = o.overlayTex
+                end
+                applied = applied + 1
+            end
+        end
+        if applied > 0 then
+            rig.characterMeshes = applied
+            print(fmt("[ROCORDER] applied %d CharacterMesh override(s) for "
+                .. "%s (game-replaced body part meshes)", applied, player.Name))
         end
     end
 
