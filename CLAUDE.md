@@ -2,6 +2,10 @@
 
 Read this on entry to the project. These rules apply to every change.
 
+Planned/deferred features live in [`BACKLOG.md`](./BACKLOG.md) — consult it
+when picking up "what's next", and move an item into `CHANGELOG.md` when it
+ships.
+
 ## Versioning
 
 **Every change bumps the project version.** No exception. If the diff is

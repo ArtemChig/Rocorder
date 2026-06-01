@@ -9,6 +9,14 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.12.1-alpha — 2026-06-01
+
+- Added `BACKLOG.md` to track planned/deferred features, and a pointer to it
+  from `CLAUDE.md`. Seeded with: classic-R6 Shirt/Pants wrapping (P1), the
+  exact classic-head mesh to replace the sphere approximation (P2), and a few
+  noticed limitations (enclosed-body hiding, full rig-revision importer
+  support, other classic primitives). No code/behavior change.
+
 ## 1.12.0-alpha — 2026-06-01
 
 Fixes the two confirmed importer/extraction bugs from the in-game-vs-Blender
