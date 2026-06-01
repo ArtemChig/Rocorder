@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.12.2-alpha"
+local ROCORDER_VERSION = "1.13.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2105,6 +2105,54 @@ local function captureRig(player)
             local nm = uniqueName(desc.Name)
             rig.parts[#rig.parts + 1] = partInfo(desc, nm)
             refs[#refs + 1] = { name = nm, inst = desc }
+        end
+    end
+
+    -- Externally-welded parts: 3D clothing / cosmetics the GAME attaches to
+    -- the player but parents OUTSIDE the Character (so the scans above miss
+    -- them). GetConnectedParts(true) follows every rigid joint (Weld /
+    -- WeldConstraint / Motor6D / Snap) from a body part to find the whole
+    -- welded assembly. We keep parts that are (a) not already ours, (b) not
+    -- another player's body, (c) not anchored (excludes the welded map), and
+    -- cap the count so a stray weld to a vehicle/map can't pull in the world.
+    -- These are captured as extra root parts; the importer animates them by
+    -- their recorded world CFrame (same as the avatar's own MeshParts).
+    do
+        local rootPart = char:FindFirstChild("HumanoidRootPart")
+            or (refs[1] and refs[1].inst)
+        if rootPart and rootPart:IsA("BasePart") then
+            local mine = {}
+            for _, r in ipairs(refs) do if r.inst then mine[r.inst] = true end end
+            local otherChar = {}
+            for _, pl in ipairs(Players:GetPlayers()) do
+                if pl ~= player and pl.Character then
+                    for _, d in ipairs(pl.Character:GetDescendants()) do
+                        if d:IsA("BasePart") then otherChar[d] = true end
+                    end
+                end
+            end
+            local okC, connected = pcall(function()
+                return rootPart:GetConnectedParts(true)
+            end)
+            local added = 0
+            if okC and type(connected) == "table" then
+                for _, cp in ipairs(connected) do
+                    if added >= 200 then break end
+                    if cp:IsA("BasePart") and not mine[cp] and not otherChar[cp]
+                        and not cp.Anchored then
+                        local nm = uniqueName(cp.Name)
+                        rig.parts[#rig.parts + 1] = partInfo(cp, nm)
+                        refs[#refs + 1] = { name = nm, inst = cp }
+                        mine[cp] = true
+                        added = added + 1
+                    end
+                end
+            end
+            if added > 0 then
+                rig.externalParts = added
+                print(fmt("[ROCORDER] captured %d externally-welded part(s) for "
+                    .. "%s (game-attached 3D clothing/cosmetics)", added, player.Name))
+            end
         end
     end
 
