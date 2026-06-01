@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 10, 0),
+    "version": (1, 11, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.10.0-alpha"
+ROCORDER_VERSION = "1.11.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -273,22 +273,36 @@ class AssetFetcher:
         self._last_request = 0.0
         self._auth_body_logged = False
         self.stats = {"downloads": 0, "cache_hits": 0, "fails": 0,
-                      "auth_fails": 0, "local_hits": 0}
+                      "auth_fails": 0, "local_hits": 0,
+                      "geom_hits": 0, "rgba_hits": 0}
         try:
             os.makedirs(cache_dir, exist_ok=True)
         except OSError as e:
             self.log("WARN could not create asset cache dir {}: {}".format(cache_dir, e))
 
+    def _local_path(self, asset_id, ext):
+        """Path to a recorder file named exactly '<id><ext>' (ext '' = bare),
+        or None. Used for the typed extraction files .geom.json / .rgba and
+        the bare HTTP-fallback file."""
+        for d in self.local_dirs:
+            p = os.path.join(d, asset_id + ext)
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                return p
+        return None
+
     def _find_local(self, asset_id):
-        """Return a path to a recorder-downloaded asset file for this id, if any
-        (file named exactly '<id>' or '<id>.<ext>'). Honors a user-drop folder
-        so you can hand-place any asset the executor couldn't reach."""
+        """Return a path to a recorder-downloaded RAW asset file for this id
+        (the bare '<id>' HTTP-fallback file, or a hand-dropped '<id>.<ext>').
+        Skips the typed extraction files (.geom.json / .rgba) — those are read
+        directly by get_mesh / get_image_path, not fed to the binary parser."""
         for d in self.local_dirs:
             exact = os.path.join(d, asset_id)
             if os.path.isfile(exact) and os.path.getsize(exact) > 0:
                 return exact
             try:
                 for fn in os.listdir(d):
+                    if fn.endswith(".geom.json") or fn.endswith(".rgba"):
+                        continue
                     if fn == asset_id or fn.startswith(asset_id + "."):
                         p = os.path.join(d, fn)
                         if os.path.isfile(p) and os.path.getsize(p) > 0:
@@ -424,6 +438,27 @@ class AssetFetcher:
         return m.group(1) if m else None
 
     # ---- meshes ----------------------------------------------------------
+    def _parse_geom_json(self, path):
+        """Parse the recorder's <id>.geom.json (engine-extracted geometry:
+        flat verts/uvs/normals/faces arrays, 0-indexed) into the same dict
+        shape parse_roblox_mesh produces: {verts:[(x,y,z)], uvs:[(u,v)],
+        faces:[(a,b,c)], version}."""
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError) as e:
+            self.log("    geom.json read error {}: {}".format(path, e))
+            return None
+        vf = d.get("verts") or []
+        uf = d.get("uvs") or []
+        ff = d.get("faces") or []
+        verts = [(vf[i], vf[i + 1], vf[i + 2]) for i in range(0, len(vf) - 2, 3)]
+        uvs = [(uf[i], uf[i + 1]) for i in range(0, len(uf) - 1, 2)]
+        faces = [(ff[i], ff[i + 1], ff[i + 2]) for i in range(0, len(ff) - 2, 3)]
+        if not verts or not faces:
+            return None
+        return {"verts": verts, "uvs": uvs, "faces": faces, "version": "geom"}
+
     def get_mesh(self, ref):
         aid = _asset_id(ref)
         if not aid:
@@ -431,6 +466,20 @@ class AssetFetcher:
         if aid in self._mesh_cache:
             c = self._mesh_cache[aid]
             return c or None
+        # PREFERRED: engine-extracted geometry the recorder wrote as
+        # <id>.geom.json. Cleaner than the CDN binary mesh, and present for
+        # assets the CDN would refuse (UGC, off-sale). No parsing of Roblox's
+        # versioned binary format needed.
+        geom_path = self._local_path(aid, ".geom.json")
+        if geom_path:
+            mesh = self._parse_geom_json(geom_path)
+            if mesh:
+                self.stats["geom_hits"] += 1
+                self.log("    mesh {} <- local .geom.json verts={} faces={}".format(
+                    aid, len(mesh["verts"]), len(mesh["faces"])))
+                self._mesh_cache[aid] = mesh
+                return mesh
+            self.log("    mesh {} .geom.json unreadable -> other sources".format(aid))
         path = self._download(aid, ".mesh")
         if not path:
             self.log("    mesh {} unavailable (no local file + network "
@@ -466,6 +515,75 @@ class AssetFetcher:
         return mesh
 
     # ---- images ----------------------------------------------------------
+    def _fill_image_pixels(self, img, pix, w, h):
+        """Load raw top-left-origin RGBA8 bytes into a Blender image (whose
+        pixel buffer is bottom-left origin), flipping vertically. Uses numpy
+        (bundled with Blender) for speed; falls back to pure Python."""
+        try:
+            import numpy as np
+            a = np.frombuffer(pix, dtype=np.uint8).astype(np.float32) / 255.0
+            a = a.reshape(h, w, 4)[::-1, :, :]      # flip rows: top-origin -> bottom-origin
+            img.pixels.foreach_set(a.ravel())
+            return True
+        except Exception:
+            pass
+        try:
+            out = [0.0] * (w * h * 4)
+            row = w * 4
+            for y in range(h):
+                src = (h - 1 - y) * row
+                dst = y * row
+                for i in range(row):
+                    out[dst + i] = pix[src + i] / 255.0
+            img.pixels.foreach_set(out)
+            return True
+        except Exception as e:
+            self.log("    pixel fill failed: {}".format(e))
+            return False
+
+    def _rgba_to_png(self, rgba_path, png_path):
+        """Convert the recorder's <id>.rgba (header 'ROCORDER-RGBA8\\n<w>\\n<h>\\n'
+        then raw RGBA8) into a PNG at png_path so Blender's normal image loader
+        can use it. Returns True on success."""
+        try:
+            with open(rgba_path, "rb") as fh:
+                raw = fh.read()
+        except OSError as e:
+            self.log("    .rgba read error {}: {}".format(rgba_path, e))
+            return False
+        nl1 = raw.find(b"\n")
+        nl2 = raw.find(b"\n", nl1 + 1) if nl1 >= 0 else -1
+        nl3 = raw.find(b"\n", nl2 + 1) if nl2 >= 0 else -1
+        if nl3 < 0 or raw[:nl1] != b"ROCORDER-RGBA8":
+            self.log("    .rgba header invalid: {}".format(rgba_path))
+            return False
+        try:
+            w = int(raw[nl1 + 1:nl2]); h = int(raw[nl2 + 1:nl3])
+        except ValueError:
+            return False
+        pix = raw[nl3 + 1:]
+        need = w * h * 4
+        if w <= 0 or h <= 0 or len(pix) < need:
+            self.log("    .rgba size mismatch {}x{}: need {} got {}".format(
+                w, h, need, len(pix)))
+            return False
+        img = bpy.data.images.new("_rocorder_rgba_tmp", width=w, height=h, alpha=True)
+        ok = False
+        try:
+            if self._fill_image_pixels(img, pix[:need], w, h):
+                img.filepath_raw = png_path
+                img.file_format = "PNG"
+                img.save()
+                ok = os.path.isfile(png_path)
+        except Exception as e:
+            self.log("    .rgba -> png failed: {}".format(e))
+        finally:
+            try:
+                bpy.data.images.remove(img)
+            except Exception:
+                pass
+        return ok
+
     def get_image_path(self, ref):
         aid = _asset_id(ref)
         if not aid:
@@ -473,6 +591,19 @@ class AssetFetcher:
         if aid in self._image_cache:
             c = self._image_cache[aid]
             return c or None
+        # PREFERRED: engine-extracted texture the recorder wrote as <id>.rgba
+        # (raw RGBA8 the client had loaded — present even for off-sale clothing
+        # the CDN 401s). Convert to a PNG in the cache dir once; reuse after.
+        rgba_path = self._local_path(aid, ".rgba")
+        if rgba_path:
+            png_path = os.path.join(self.cache_dir, aid + ".rgba.png")
+            ok = (os.path.isfile(png_path) and os.path.getsize(png_path) > 0) \
+                or self._rgba_to_png(rgba_path, png_path)
+            if ok:
+                self.stats["rgba_hits"] += 1
+                self._image_cache[aid] = png_path
+                return png_path
+            self.log("    image {} .rgba convert failed -> other sources".format(aid))
         path = self._download(aid, ".png")  # ext is cosmetic; Blender sniffs content
         self._image_cache[aid] = path or False
         return path
@@ -1171,9 +1302,11 @@ def build_player(player_rig, label, scale, collection, log, force_standard_r6=Tr
     clothing = player_rig.get("clothing")
     if clothing:
         log("  clothing on character: {}".format(clothing))
-        log("  NOTE: classic Shirt/Pants wrapping isn't applied yet (needs the "
-            "classic body UV template) — bodies will show as flat-colored "
-            "parts until that lands.")
+        log("  NOTE: the Shirt/Pants template images ARE extracted now "
+            "(<id>.rgba), but classic-R6 wrapping onto the box body via the "
+            "standard body UV layout isn't applied yet — classic bodies show "
+            "flat-colored until that lands. MeshPart bodies + accessories with "
+            "real UVs are textured correctly.")
 
     return {
         "arm": arm_obj,
@@ -1599,8 +1732,9 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     cookie_hint = False
     if assets is not None:
         log("")
-        log("assets: {} local (recorder), {} downloaded, {} cache hits, "
-            "{} fails ({} auth/401)".format(
+        log("assets: {} geom.json + {} rgba (engine-extracted), {} bare-local, "
+            "{} downloaded, {} cache hits, {} fails ({} auth/401)".format(
+                assets.stats["geom_hits"], assets.stats["rgba_hits"],
                 assets.stats["local_hits"], assets.stats["downloads"],
                 assets.stats["cache_hits"], assets.stats["fails"],
                 assets.stats["auth_fails"]))
