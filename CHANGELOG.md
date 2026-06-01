@@ -9,6 +9,34 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.12-alpha — 2026-06-01
+
+Three more performance/correctness fixes from the latest log analysis:
+
+- **Adaptive `paceExtractor` recovery yield.** When a single chunk takes
+  >30 ms (a tell-tale sign we just returned from a heavy Roblox API call
+  we can't pace inside — `CreateEditableMeshAsync`,
+  `CreateEditableImageAsync`, a big `ReadPixelsBuffer`), the pacer now
+  yields **three** frames instead of one. Single-frame yields after a
+  150 ms hitch leave the game only ~7 ms (at 144 fps) to render before
+  the next chunk slams in — three frames give it ~20 ms, enough for a
+  clean render. This is the dominant remaining cause of small stutters.
+- **HTTP fallback fails fast on 401/403.** A clothing template that
+  401s from `assetdelivery v1` will also 401 from `assetdelivery v2`
+  (both check the same auth). The previous "try all endpoints × 2
+  attempts × 0.8 s backoff" wasted 1-2 s per inaccessible asset and
+  contributed visible stalls. Now: on the first 401/403 we break out
+  of both endpoint and retry loops. 429 (rate-limit) and 5xx still
+  retry as before.
+- **"Player left" label now requires the player to have actually left.**
+  Previously the tag fired whenever `_findLivePartRef` returned nil —
+  even when the player was still in the game and just had their tool/
+  accessory part destroyed. Now distinguished:
+  - `(part instance destroyed — tool unequipped / accessory removed /
+    script deleted)` when the owner is still in `Players:GetPlayers()`.
+  - `(player left before extraction)` only when no owner remains.
+  The `missed` per-player stat now reflects true disconnects only.
+
 ## 1.9.11-alpha — 2026-06-01
 
 - **Mesh JSON encode is now manual & paced internally.**
