@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.12.1-alpha"
+local ROCORDER_VERSION = "1.12.2-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -893,6 +893,20 @@ local function extractMeshFromPart(part)
     end)
     if not okem or not em then return nil, "CreateEditableMeshAsync: " .. tostring(em) end
 
+    -- One-time API capability probe: tells us EXACTLY which UV accessors this
+    -- Roblox build exposes, so if UVs still come out flat we know whether
+    -- GetFaceUVs is even available (vs needing a different method).
+    if not _G.ROCORDER_UV_PROBE_LOGGED then
+        _G.ROCORDER_UV_PROBE_LOGGED = true
+        local function has(m) return (typeof(em[m]) == "function") and "yes" or "no" end
+        local msg = fmt("EditableMesh API probe: GetFaceUVs=%s GetUVs=%s "
+            .. "GetUV=%s GetFaceVertices=%s GetFaceNormals=%s",
+            has("GetFaceUVs"), has("GetUVs"), has("GetUV"),
+            has("GetFaceVertices"), has("GetFaceNormals"))
+        print("[ROCORDER] " .. msg)
+        if _G.ROCORDER_CURRENT_DBG then pcall(_G.ROCORDER_CURRENT_DBG, "  " .. msg) end
+    end
+
     local vids = em:GetVertices()
     if not vids or #vids == 0 then return nil, "no vertices" end
     local verts = {}
@@ -956,6 +970,21 @@ local function extractMeshFromPart(part)
         end
     end
     if #faces == 0 then return nil, "no faces produced" end
+
+    -- UV sanity log: proves whether UV extraction actually worked. Flat
+    -- [0..0] means GetFaceUVs/GetUV returned nothing on this build.
+    if _G.ROCORDER_CURRENT_DBG and #faceUVs > 0 then
+        local mn, mx = math.huge, -math.huge
+        for i = 1, #faceUVs do
+            local v = faceUVs[i]
+            if v < mn then mn = v end
+            if v > mx then mx = v end
+        end
+        pcall(_G.ROCORDER_CURRENT_DBG, fmt(
+            "  geom: %d verts, %d tris, UV range [%.3f..%.3f]%s",
+            #verts / 3, #faces / 3, mn, mx,
+            (mx <= mn + 1e-6) and "  *** UVs FLAT — extraction failed" or ""))
+    end
 
     return {
         format = "ROCORDER-GEOM/2",
@@ -4808,6 +4837,41 @@ rec.onStateChange = function() if UI.gui then UI:_refreshStatus() end end
 ----------------------------------------------------------------
 buildUI()
 Indicator:refresh()  -- pick up persisted state (e.g. IR_ENABLED) on script load
+
+-- One-time mesh-cache migration. Every .geom.json written before the UV fix
+-- (1.12.0) is ROCORDER-GEOM/1 with all-zero UVs (the GetUV-on-vertex-id bug).
+-- Because the extractor caches by file existence, those stale files would be
+-- reused forever and never regenerate with correct UVs. Purge them ONCE
+-- (gated by a marker file) so they re-extract as GEOM/2. Only filenames are
+-- listed — no file contents read — so this is fast. Images (.rgba) and bare
+-- files are untouched.
+do
+    if isfolder and listfiles and delfile and isfile
+        and isfolder(ASSETS_FOLDER) then
+        local marker = ASSETS_FOLDER .. "/.geom_v2"
+        if not isfile(marker) then
+            local ok, files = pcall(listfiles, ASSETS_FOLDER)
+            local purged = 0
+            if ok and type(files) == "table" then
+                for _, path in ipairs(files) do
+                    local norm = path:gsub("\\", "/")
+                    if norm:sub(-10) == ".geom.json" then
+                        pcall(delfile, path)
+                        local id = norm:match("([^/]+)%.geom%.json$")
+                        if id then EXTRACTED[id] = nil end
+                        purged = purged + 1
+                    end
+                end
+            end
+            pcall(writefile, marker, "v2")
+            if purged > 0 then
+                print(fmt("[ROCORDER] mesh cache migrated: purged %d pre-1.12 "
+                    .. "geom file(s) with broken UVs — they will re-extract as "
+                    .. "GEOM/2 with correct UVs on this recording", purged))
+            end
+        end
+    end
+end
 
 -- Asset extractor worker + watchdog. The worker drains the queue; the
 -- watchdog respawns it if it goes silent (defensive — should never actually
