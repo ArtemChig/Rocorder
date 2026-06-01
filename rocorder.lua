@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.9-alpha"
+local ROCORDER_VERSION = "1.9.10-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -1449,8 +1449,18 @@ end
 -- that and enqueues the now-available asset ids. Cheap: _enqueueAsset
 -- dedupes via EXTRACTED + Q.byId so re-calling for already-seen ids is a
 -- no-op.
+--
+-- Settled flag: after 3 consecutive empty rescans (no new content arrived
+-- on any of this player's existing refs) we declare content "settled" and
+-- stop rescanning that player. This eliminates the ~1 Hz frame stutter the
+-- user reported in 1.9.9 — partInfo() does ~15 pcall'd property reads per
+-- part, so 4 players × 20 parts × 15 pcalls = ~1200 pcalls/sec spent
+-- looking for content that arrived seconds ago and isn't going to change.
+-- The flag is reset on respawn so a swapped Character is re-scanned.
 function Tracker:_rescanExistingAssets(entry, debugLog)
     if not EXTRACT_OK then return end
+    if entry.rescanSettled then return end
+    local foundNew = false
     for i, r in ipairs(entry.refs) do
         local inst = r.inst
         if inst and inst.Parent and inst:IsA("BasePart") then
@@ -1464,6 +1474,7 @@ function Tracker:_rescanExistingAssets(entry, debugLog)
             local oldDecals = (old and old.decals) or {}
             if new.decals and #new.decals > #oldDecals then upgraded = true end
             if upgraded then
+                foundNew = true
                 if debugLog then
                     debugLog(fmt("uid=%d part[%d] %s mesh content arrived (mesh=%s tex=%s)",
                         entry.uid, i - 1, new.name,
@@ -1471,6 +1482,19 @@ function Tracker:_rescanExistingAssets(entry, debugLog)
                 end
                 entry.rig.parts[i] = new
                 enqueuePartAssets(inst, new, entry.uid, entry.displayName)
+            end
+        end
+    end
+    if foundNew then
+        entry.consecutiveEmptyRescans = 0
+    else
+        local n = (entry.consecutiveEmptyRescans or 0) + 1
+        entry.consecutiveEmptyRescans = n
+        if n >= 3 then
+            entry.rescanSettled = true
+            if debugLog then
+                debugLog(fmt("uid=%d asset rescan settled (no new content "
+                    .. "for 3 consecutive scans)", entry.uid))
             end
         end
     end
@@ -1494,6 +1518,11 @@ function Tracker:_rebuildRefs(entry, player, encode, debugLog)
         if r.inst then entry.known[r.inst] = true end
     end
     entry.char = player.Character
+    -- New Character means content streaming starts over. Reopen the rescan
+    -- gate so newly-attached parts whose mesh content arrives late get
+    -- caught by _rescanExistingAssets again.
+    entry.rescanSettled = false
+    entry.consecutiveEmptyRescans = 0
     self:_appendNewParts(entry, player.Character, encode, debugLog)
     if debugLog then
         debugLog(fmt("uid=%d refs rebuilt after respawn (%d parts)",

@@ -9,6 +9,27 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.10-alpha — 2026-06-01
+
+Fixes the residual ~1 Hz stutter the user reported even after assets had
+finished downloading.
+
+- **Asset rescan settles after 3 quiet scans.** The 1 Hz
+  `_rescanExistingAssets` sweep (added in 1.9.8 to catch avatar mesh
+  content that streamed in after ENSURE) was running forever for every
+  tracked player. Each call invokes `partInfo()` on every ref —
+  ~15 pcall'd property reads per part — so 4 players × 20 parts ×
+  15 pcalls ≈ 1200 pcalls per second of pure idle overhead, manifesting
+  as a ~1 Hz hitch. The rescan now sets `entry.rescanSettled = true`
+  after 3 consecutive scans found no new content, and skips entirely
+  thereafter. Typical case: 3 s of low-cost scans, then zero overhead.
+- **Settled flag resets on respawn.** When `_rebuildRefs` runs after a
+  Character swap (death + respawn), `rescanSettled` is cleared so newly-
+  attached parts whose mesh content arrives late get caught again.
+- One-line settle log: `uid=X asset rescan settled (no new content for
+  3 consecutive scans)` — visible per player in the debug log if you
+  want to confirm the flag is firing.
+
 ## 1.9.9-alpha — 2026-05-31
 
 Cuts the dominant remaining source of in-game stutter during extraction.
