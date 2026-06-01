@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 18, 0),
+    "version": (1, 19, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.18.0-alpha"
+ROCORDER_VERSION = "1.19.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -1744,7 +1744,18 @@ def build_player(player_rig, label, scale, collection, log, force_standard_r6=Tr
 # ----------------------------------------------------------------------------
 # Import
 # ----------------------------------------------------------------------------
+def _is_viewmodel_uid(uid):
+    """Negative uid is the recorder's POV viewmodel sentinel (real UserIds are
+    always positive). Imported as a separate top-level Viewmodel collection."""
+    try:
+        return int(uid) < 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _player_label(roster, uid):
+    if _is_viewmodel_uid(uid):
+        return "Viewmodel" if int(uid) == -1 else "Viewmodel_{}".format(-int(uid))
     info = roster.get(uid, {})
     name = info.get("displayName") or info.get("name") or "Player"
     return "{}_{}".format(name, uid)
