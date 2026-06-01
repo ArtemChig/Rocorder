@@ -9,6 +9,49 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.22-alpha — 2026-06-01
+
+**Clothing templates now extract via the engine (EditableImage), bypassing
+CDN auth — the fix for "restricted clothing won't download".**
+
+The whole point of the EditableImage approach is that it reads the bytes
+the *client* already loaded for rendering, regardless of whether our
+account can fetch the asset from the CDN. It's why otherwise-401 UGC
+meshes/textures extracted fine. But clothing was never routed through it:
+
+- Clothing (Shirt.ShirtTemplate / Pants.PantsTemplate) enqueues with
+  `partInst = nil` because it isn't a single BasePart.
+- In `_processOne`, the EditableImage path lived inside `if ref then`
+  (a live part instance). With no part, clothing skipped it entirely and
+  went straight to the HTTP fallback — which 401s on off-sale / private
+  UGC. The `enqueueClothing` comment even *claimed* it used
+  `Content.fromUri`, but the code never did.
+
+Now, for any image entry with no live part, `_processOne` tries
+`CreateEditableImageAsync` before HTTP, attempting several content-ref
+forms for robustness:
+1. the stored template URL,
+2. `rbxassetid://<id>`,
+3. the live `Shirt`/`Pants`/`ShirtGraphic` template read straight off an
+   owning player's character (the exact Content the engine resolved).
+
+Since the clothing is being rendered on a present player, its bytes are
+in the client and EditableImage should return them. HTTP remains the
+last-resort fallback. Off-sale clothing of players who have already
+*left* still can't be recovered (no live render to read from) — but
+clothing of present players should now extract regardless of CDN
+permission.
+
+Also: **the broken Actor scaffold is disabled.** Confirmed in the F9
+console that Xeno does not execute engine-created Script instances even
+with `RunContext=Client` under `PlayerScripts` — the worker showed a red
+error and never signaled ready. The scaffold code is gated behind
+`ENABLE_ACTOR_SCAFFOLD = false`, and any actor a prior version left in
+`workspace` / `PlayerScripts` is now cleaned up on load (removes the red
+console error). Parallel extraction via Actor is a dead end in Xeno; the
+remaining ~160 ms extraction stalls stay, per the user's call to
+prioritize getting all assets over smoothing those out.
+
 ## 1.9.21-alpha — 2026-06-01
 
 Fix the Actor scaffold's "worker script never signaled ready" failure.
