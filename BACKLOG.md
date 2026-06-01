@@ -7,27 +7,11 @@ wherever they fit by priority. When one lands, move it out of here and into
 Priority key: **P1** = committed next / actively wanted · **P2** = wanted,
 not urgent · **P3** = nice-to-have / noticed-in-passing.
 
+(Shipped: classic-R6 Shirt/Pants wrapping landed in 1.14.0-alpha — face
+orientation per the official 585×559 template; tune `_FACE_AXES` /
+`*_RECTS` in the importer if any face is mirrored.)
+
 ---
-
-## P1 — Classic-R6 Shirt / Pants / T-shirt wrapping
-
-Apply the 2D clothing templates (already extracted to `<id>.rgba`) onto the
-classic R6 **box** body — Torso, Left/Right Arm, Left/Right Leg — using
-Roblox's standard R6 clothing UV layout. Each box face maps to a fixed
-rectangle in the template image.
-
-- Recorder side: nothing more needed — `Shirt.ShirtTemplate` /
-  `Pants.PantsTemplate` / `ShirtGraphic.Graphic` are captured in the rig's
-  `clothing` field and the template pixels extract to `.rgba`.
-- Importer side: when a body part is a plain Block (no meshId) and the player
-  has clothing, build the box with per-face UVs into the shirt/pants template
-  region for that face, and use the clothing texture as the material.
-- Reference: the classic R6 template is a fixed cross/grid unwrap. Torso
-  (front/back/sides/top/bottom), arms and legs each have known sub-rects.
-- Why it matters: classic-body avatars currently import flat-colored boxes
-  for the torso/limbs (the user's complaint #3). MeshPart bodies + accessories
-  with real UVs already texture correctly.
-- Status: this is the agreed next big importer feature.
 
 ## P2 — Bundle the exact classic-head mesh (replace the sphere approximation)
 

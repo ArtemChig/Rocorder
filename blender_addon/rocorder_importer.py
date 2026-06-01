@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 13, 1),
+    "version": (1, 14, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.13.1-alpha"
+ROCORDER_VERSION = "1.14.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -966,8 +966,138 @@ def _add_primitive_local(bm, uv_layer, part, scale, decal_axis=None):
     return verts
 
 
+# ---------------------------------------------------------------------------
+# Classic R6 2D clothing (Shirt / Pants) wrapped onto the box body.
+# ---------------------------------------------------------------------------
+# Read directly off Roblox's official 585x559 template guide. The shirt and
+# pants templates share ONE layout (shirt paints torso+arms, pants paints
+# torso+legs). 64 px/stud, so torso front/back = 128x128, torso sides =
+# 64x128, torso up/down = 128x64; limb side faces = 64x128, caps = 64x64.
+#
+# Template layout (pixels, top-left origin) from the guide image:
+#   TORSO:  R·FRONT·L·BACK in a row, UP above FRONT, DOWN below FRONT.
+#   RIGHT limb (bottom-left):  L·B·R·F row, U/D above/below F.
+#   LEFT  limb (bottom-right): F·L·B·R row, U/D above/below F.
+_TPL_W, _TPL_H = 585.0, 559.0
+
+
+def _px(x, y, w, h):
+    """Pixel rect (top-left origin) -> Blender UV rect (u0, v0, u1, v1),
+    v flipped (Blender UV is bottom-origin)."""
+    return (x / _TPL_W, 1.0 - (y + h) / _TPL_H,
+            (x + w) / _TPL_W, 1.0 - y / _TPL_H)
+
+
+# Per-face in-plane axes (u, v) in the box's Blender-local space, so the
+# template rectangle is laid onto the face upright and un-mirrored. (If a
+# specific face comes out mirrored/rotated in testing, flip that face's axes
+# here — it's a one-line change per face.)
+_FACE_AXES = {
+    "Front":  (Vector((-1, 0, 0)), Vector((0, 0, 1))),   # +Y
+    "Back":   (Vector(( 1, 0, 0)), Vector((0, 0, 1))),   # -Y
+    "Right":  (Vector(( 0, 1, 0)), Vector((0, 0, 1))),   # +X
+    "Left":   (Vector(( 0, -1, 0)), Vector((0, 0, 1))),  # -X
+    "Top":    (Vector((-1, 0, 0)), Vector((0, 1, 0))),   # +Z
+    "Bottom": (Vector((-1, 0, 0)), Vector((0, -1, 0))),  # -Z
+}
+
+_TORSO_RECTS = {
+    "Top":    _px(228,   8, 128,  64),
+    "Front":  _px(228,  72, 128, 128),
+    "Bottom": _px(228, 200, 128,  64),
+    "Right":  _px(164,  72,  64, 128),
+    "Left":   _px(356,  72,  64, 128),
+    "Back":   _px(420,  72, 128, 128),
+}
+# Right limb cross: row L B R F (x = 8,72,136,200), F's U/D at x=200.
+_RIGHT_LIMB_RECTS = {
+    "Left":   _px(  8, 354, 64, 128),
+    "Back":   _px( 72, 354, 64, 128),
+    "Right":  _px(136, 354, 64, 128),
+    "Front":  _px(200, 354, 64, 128),
+    "Top":    _px(200, 290, 64,  64),
+    "Bottom": _px(200, 482, 64,  64),
+}
+# Left limb cross: row F L B R (x = 321,385,449,513), F's U/D at x=321.
+_LEFT_LIMB_RECTS = {
+    "Front":  _px(321, 354, 64, 128),
+    "Left":   _px(385, 354, 64, 128),
+    "Back":   _px(449, 354, 64, 128),
+    "Right":  _px(513, 354, 64, 128),
+    "Top":    _px(321, 290, 64,  64),
+    "Bottom": _px(321, 482, 64,  64),
+}
+
+
+def _clothing_for_part(name, clothing, assets):
+    """For a classic body part name, return (regions, template_image_path) or
+    (None, None). Torso + arms use the shirt; legs use the pants. regions maps
+    face -> (uv_rect, u_axis, v_axis)."""
+    if not clothing or assets is None:
+        return None, None
+    shirt = clothing.get("shirt")
+    pants = clothing.get("pants")
+    if name == "Torso":
+        ref, rects = (shirt or pants), _TORSO_RECTS
+    elif name == "Right Arm":
+        ref, rects = shirt, _RIGHT_LIMB_RECTS
+    elif name == "Left Arm":
+        ref, rects = shirt, _LEFT_LIMB_RECTS
+    elif name == "Right Leg":
+        ref, rects = pants, _RIGHT_LIMB_RECTS
+    elif name == "Left Leg":
+        ref, rects = pants, _LEFT_LIMB_RECTS
+    else:
+        return None, None
+    if not ref:
+        return None, None
+    img = assets.get_image_path(ref)
+    if not img:
+        return None, None
+    regions = {k: (rects[k], _FACE_AXES[k][0], _FACE_AXES[k][1]) for k in rects}
+    return regions, img
+
+
+def _build_clothed_box(bm, uv_layer, part, scale, regions):
+    """Box for a classic body part with each face UV-mapped into its clothing-
+    template rectangle, so the shirt/pants wraps like in-game. Returns verts."""
+    sx, sy, sz = (float(s) for s in part.get("size", [1.0, 1.0, 1.0]))
+    ret = bmesh.ops.create_cube(bm, size=1.0)
+    verts = ret["verts"]
+    bmesh.ops.scale(
+        bm,
+        vec=(max(sx * scale, 1e-4), max(sz * scale, 1e-4), max(sy * scale, 1e-4)),
+        verts=verts)
+    bm.normal_update()
+    faces = set()
+    for v in verts:
+        faces.update(v.link_faces)
+    for f in faces:
+        n = f.normal.normalized()
+        ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
+        if ay >= ax and ay >= az:
+            key = "Front" if n.y > 0 else "Back"
+        elif ax >= ay and ax >= az:
+            key = "Right" if n.x > 0 else "Left"
+        else:
+            key = "Top" if n.z > 0 else "Bottom"
+        reg = regions.get(key)
+        if not reg:
+            continue
+        (u0, v0, u1, v1), uax, vax = reg
+        coords = [(loop.vert.co.dot(uax), loop.vert.co.dot(vax)) for loop in f.loops]
+        us = [c[0] for c in coords]; vs = [c[1] for c in coords]
+        umin, umax = min(us), max(us); vmin, vmax = min(vs), max(vs)
+        du = (umax - umin) or 1.0; dv = (vmax - vmin) or 1.0
+        for loop, (cu, cv) in zip(f.loops, coords):
+            fu = (cu - umin) / du; fv = (cv - vmin) / dv
+            loop[uv_layer].uv = (u0 + fu * (u1 - u0), v0 + fv * (v1 - v0))
+    return verts
+
+
 def _build_part_object(part, name, place, scale, assets, import_meshes,
-                       arm_obj, collection, log):
+                       arm_obj, collection, log, clothing=None,
+                       apply_clothing=False):
     """Build ONE Blender object for a single part (body part, accessory, hat,
     or tool piece), skinned 100% to its bone via an Armature modifier. Keeping
     parts as separate objects (instead of one merged mesh) lets you select /
@@ -1000,22 +1130,37 @@ def _build_part_object(part, name, place, scale, assets, import_meshes,
         materials.append(_image_material(name, body_tex, color, transp, log)
                          if body_tex else _color_material(color, transp))
     else:
-        # primitive; optionally with a decal (face / logo) on one side
-        decal_tex, decal_axis = None, None
-        if import_meshes and assets is not None and decals:
-            for d in decals:
-                tex = assets.get_image_path(d.get("texture"))
-                if tex:
-                    decal_tex = tex
-                    decal_axis = _DECAL_AXIS.get(d.get("face", "Front"))
-                    break
-        verts = _add_primitive_local(bm, uv_layer, part, scale, decal_axis)
-        materials.append(_color_material(color, transp))   # slot 0
-        if decal_tex:
-            materials.append(_image_material(            # slot 1
-                name + "_decal", decal_tex, color, transp, log))
-            kind = "box+decal"
-        bmesh.ops.transform(bm, matrix=place, verts=verts)
+        # Classic R6 2D clothing: a Block body part (Torso / arms / legs) with
+        # no mesh, when the player has a Shirt/Pants, becomes a box whose faces
+        # are UV-mapped into the 585x559 template so the clothing wraps like
+        # in-game.
+        cloth_regions, cloth_tex = (None, None)
+        if apply_clothing and import_meshes and assets is not None \
+                and part.get("shape") == "Block" and not part.get("meshType"):
+            cloth_regions, cloth_tex = _clothing_for_part(name, clothing, assets)
+        if cloth_regions and cloth_tex:
+            verts = _build_clothed_box(bm, uv_layer, part, scale, cloth_regions)
+            materials.append(_image_material(name + "_cloth", cloth_tex,
+                                             color, transp, log))
+            kind = "clothed-box"
+            bmesh.ops.transform(bm, matrix=place, verts=verts)
+        else:
+            # primitive; optionally with a decal (face / logo) on one side
+            decal_tex, decal_axis = None, None
+            if import_meshes and assets is not None and decals:
+                for d in decals:
+                    tex = assets.get_image_path(d.get("texture"))
+                    if tex:
+                        decal_tex = tex
+                        decal_axis = _DECAL_AXIS.get(d.get("face", "Front"))
+                        break
+            verts = _add_primitive_local(bm, uv_layer, part, scale, decal_axis)
+            materials.append(_color_material(color, transp))   # slot 0
+            if decal_tex:
+                materials.append(_image_material(            # slot 1
+                    name + "_decal", decal_tex, color, transp, log))
+                kind = "box+decal"
+            bmesh.ops.transform(bm, matrix=place, verts=verts)
 
     if not verts:
         bm.free()
@@ -1167,7 +1312,7 @@ def compute_joint_pivots(player_rig, D, c0c1, scale):
 # Armature + skinned mesh
 # ----------------------------------------------------------------------------
 def build_player(player_rig, label, scale, collection, log, force_standard_r6=True,
-                 assets=None, import_meshes=False):
+                 assets=None, import_meshes=False, apply_clothing=False):
     parts = [p for p in player_rig.get("parts", []) if p.get("name")]
     if not parts:
         log("  no parts in rig — skipping player")
@@ -1340,7 +1485,9 @@ def build_player(player_rig, label, scale, collection, log, force_standard_r6=Tr
         place = D.get(name, Matrix.Identity(4))
         target = body_coll if name in jointed else acc_coll
         obj, kind = _build_part_object(p, name, place, scale, assets,
-                                       import_meshes, arm_obj, target, log)
+                                       import_meshes, arm_obj, target, log,
+                                       clothing=player_rig.get("clothing"),
+                                       apply_clothing=apply_clothing)
         if obj is None:
             skipped_parts.append((name, "no geometry produced"))
             continue
@@ -1371,11 +1518,9 @@ def build_player(player_rig, label, scale, collection, log, force_standard_r6=Tr
     clothing = player_rig.get("clothing")
     if clothing:
         log("  clothing on character: {}".format(clothing))
-        log("  NOTE: the Shirt/Pants template images ARE extracted now "
-            "(<id>.rgba), but classic-R6 wrapping onto the box body via the "
-            "standard body UV layout isn't applied yet — classic bodies show "
-            "flat-colored until that lands. MeshPart bodies + accessories with "
-            "real UVs are textured correctly.")
+        log("  classic R6 clothing {} — shirt wraps torso+arms, pants wraps "
+            "legs via the 585x559 template UV layout".format(
+                "applied" if apply_clothing else "NOT applied (option off)"))
 
     return {
         "arm": arm_obj,
@@ -1404,7 +1549,7 @@ def _short_matrix(m):
 
 def import_replay(context, filepath, scale, set_fps, build_armature,
                   force_standard_r6, import_meshes, roblosecurity, cache_dir,
-                  debug, report):
+                  debug, report, apply_classic_clothing=True):
     log_lines = []
     log_path = None
     if debug:
@@ -1588,7 +1733,8 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
         built = build_player(rig, _player_label(roster, uid), scale,
                              player_coll(uid), log,
                              force_standard_r6=force_standard_r6,
-                             assets=assets, import_meshes=import_meshes)
+                             assets=assets, import_meshes=import_meshes,
+                             apply_clothing=apply_classic_clothing)
         if built is None:
             return None
         built["last_quat"] = {}
@@ -1901,6 +2047,13 @@ class IMPORT_OT_rocorder(Operator, ImportHelper):
         default="",
         subtype="DIR_PATH",
     )
+    apply_classic_clothing: BoolProperty(
+        name="Apply classic clothing (Shirt/Pants)",
+        description="Wrap classic 2D Shirt/Pants templates onto the box body "
+                    "(Torso/arms/legs) via Roblox's 585x559 template UV layout. "
+                    "Turn off to leave the classic body flat-colored",
+        default=True,
+    )
     debug: BoolProperty(
         name="Write debug log",
         description="Write a verbose .import.log next to the .rec listing the "
@@ -1917,6 +2070,7 @@ class IMPORT_OT_rocorder(Operator, ImportHelper):
             self.force_standard_r6, self.import_meshes,
             self.roblosecurity, self.asset_cache_dir,
             self.debug, self.report,
+            apply_classic_clothing=self.apply_classic_clothing,
         )
 
 
