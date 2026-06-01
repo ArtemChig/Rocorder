@@ -9,6 +9,36 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.19.1-alpha — 2026-06-02
+
+The user's first Rivals recording on 1.19.0 didn't pick up a viewmodel —
+the game must parent it somewhere beyond the original Camera +
+ReplicatedFirst direct-child scan. Widened the search and added a
+diagnostic dump so the next failure pinpoints the exact path instead of
+making us guess.
+
+- **Wider scan locations** (all depth-limited so we don't walk a whole
+  Character tree):
+  - `workspace.Camera` — recurse depth 3
+  - `ReplicatedFirst` — recurse depth 3
+  - `LocalPlayer.PlayerScripts` — recurse depth 3
+  - `LocalPlayer.PlayerGui` — recurse depth 2
+  - `workspace` top-level Models (depth 1) — for games that park the
+    viewmodel at the workspace root
+- **Diagnostic dump** logged once per session when detection fails:
+  enumerates every Model under every scan location with a short reason
+  string (`ok`, `has anchored part(s)`, `shares parts with a
+  Player.Character`, `no Motor6D`, etc.). Capped at 30 Models so a giant
+  PlayerScripts tree doesn't drown the log.
+- **`_viewmodelVerdict`** replaces the boolean check — same accept rules
+  (Model with BaseParts + Motor6Ds + MeshPart, none anchored, not a player's
+  body) but also returns the reject reason so a borderline candidate
+  shows up in the diagnostic with a clear explanation.
+
+So: if the next Rivals recording still doesn't catch the viewmodel, the
+log will list every Model we considered with its rejection reason — paste
+that and I can tune the heuristic exactly.
+
 ## 1.19.0-alpha — 2026-06-02
 
 **POV viewmodel capture for FPS games (Rivals, Phantom Forces, Arsenal, …).**

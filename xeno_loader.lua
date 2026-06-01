@@ -12,7 +12,7 @@
 -- Requires the repo to be PUBLIC (raw.githubusercontent.com refuses anonymous
 -- requests for private repos).
 
-local ROCORDER_LOADER_VERSION = "1.19.0-alpha"
+local ROCORDER_LOADER_VERSION = "1.19.1-alpha"
 
 local REPO_USER   = "ArtemChig"
 local REPO_NAME   = "Rocorder"
