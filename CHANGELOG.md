@@ -9,6 +9,37 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.13.1-alpha — 2026-06-01
+
+The 1.12.2 mesh-cache migration **deleted nothing** — diagnosed from
+KkielPv: their MeshPart bodies were still GEOM/1 (zero UVs → all UVs
+collapsed to one corner in Blender) while their FileMesh clothing (a brand-
+new asset) extracted fine as GEOM/2. Of 269 geom files, 181 were still the
+broken GEOM/1.
+
+Root cause: the migration listed files with `listfiles` and deleted via
+those paths, but Xeno's `listfiles` returns paths in a format `delfile`
+silently rejects (pcall swallowed the failure) — so every delete no-opped
+while the marker still got written, permanently skipping the migration.
+
+Fix — self-healing per-asset re-extraction:
+- New `_geomStaleV1(id)` reads a cached mesh geom's header (via the
+  canonical `_geomPath`, the format `delfile`/`readfile` actually accept;
+  result remembered per id so each file is read at most once per session)
+  and reports whether it's the broken GEOM/1.
+- At enqueue, a mesh whose cached geom is stale GEOM/1 is deleted and
+  re-extracted as GEOM/2 with correct UVs — instead of being skipped as
+  "already cached". Logged as `mesh X was stale GEOM/1 … re-extracting`.
+- Removed the dead listfiles-based migration block.
+- Importer now logs a clear warning if it still loads a GEOM/1 file
+  (`ZERO UVs — stale pre-1.12 file; re-record …`), so any remaining flat
+  mesh is obvious instead of silent.
+
+So: re-execute the loader and record with the avatars you care about — each
+mesh present in that recording gets its UVs fixed on the spot. (Meshes not
+in the recording stay GEOM/1 until a recording includes them — self-heals on
+demand, no full-cache wipe.)
+
 ## 1.13.0-alpha — 2026-06-01
 
 UVs are confirmed working (the API probe logs `GetFaceUVs=yes` and meshes now
