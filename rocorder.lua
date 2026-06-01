@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.23-alpha"
+local ROCORDER_VERSION = "1.10.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2084,6 +2084,63 @@ local function captureRig(player)
 end
 
 ----------------------------------------------------------------
+-- Per-player include / exclude filter.
+--
+-- PLAYER_FILTER[uid] = "include" | "exclude" | nil(default).
+--
+-- Rule (as the user specified): if ANY player is explicitly "include",
+-- then ONLY included players are recorded (everyone else is implicitly
+-- excluded). Otherwise, everyone is recorded EXCEPT those explicitly
+-- "exclude". A plain module-local (NOT _G) so it resets on each loader
+-- re-execute — the user chose fresh-start-per-session.
+--
+-- Checked live in Tracker:snapshot every tick, so toggling takes effect
+-- immediately even while a recording or Instant Replay is running.
+----------------------------------------------------------------
+local PLAYER_FILTER = {}
+
+local function _filterHasAnyInclude()
+    for _, m in pairs(PLAYER_FILTER) do
+        if m == "include" then return true end
+    end
+    return false
+end
+
+-- Will this uid be recorded right now, given the current filter (ignoring
+-- the local-player / INCLUDE_LOCAL nuance — that's layered on in
+-- _shouldRecordPlayer)?
+local function _isPlayerRecorded(uid)
+    local mode = PLAYER_FILTER[uid]
+    if _filterHasAnyInclude() then
+        return mode == "include"
+    else
+        return mode ~= "exclude"
+    end
+end
+
+-- Effective record decision: the include/exclude filter AND the INCLUDE_LOCAL
+-- setting. The local player is recorded only when INCLUDE_LOCAL is on OR the
+-- user has explicitly pinned themselves "include" (tapping yourself to
+-- INCLUDED overrides INCLUDE_LOCAL). Both Tracker:snapshot and the UI panel
+-- call this so they always agree on who's being recorded.
+local function _shouldRecordPlayer(p, cfg)
+    if not _isPlayerRecorded(p.UserId) then return false end
+    if cfg and not cfg.INCLUDE_LOCAL and p == Players.LocalPlayer then
+        return PLAYER_FILTER[p.UserId] == "include"
+    end
+    return true
+end
+
+-- Cycle a uid's explicit setting: default -> include -> exclude -> default.
+local function _cyclePlayerFilter(uid)
+    local m = PLAYER_FILTER[uid]
+    if m == nil then PLAYER_FILTER[uid] = "include"
+    elseif m == "include" then PLAYER_FILTER[uid] = "exclude"
+    else PLAYER_FILTER[uid] = nil end
+    return PLAYER_FILTER[uid]
+end
+
+----------------------------------------------------------------
 -- Tracker — persistent per-player rig + last-pose cache. Lives across
 -- sessions and across the instant-replay buffer.
 ----------------------------------------------------------------
@@ -2389,7 +2446,13 @@ function Tracker:snapshot(cfg, encode, debugLog)
     local now = os.clock()
 
     for _, p in ipairs(Players:GetPlayers()) do
-        if cfg.INCLUDE_LOCAL or p ~= localPlayer then
+        -- Per-player include/exclude filter (+ INCLUDE_LOCAL). Excluded
+        -- players are skipped entirely: not ensured (so their assets never
+        -- enqueue) and not emitted as frame columns (so they stop appearing
+        -- in the recording from this tick on, like a player who left).
+        -- Re-including them resumes both. Checked live so it works
+        -- mid-recording / mid-IR.
+        if _shouldRecordPlayer(p, cfg) then
             local entry = self:ensure(p, encode, debugLog)
             if entry then
                 local char = p.Character
@@ -3664,6 +3727,41 @@ local function buildStatusPanel(parent)
     return { panel = panel, statusLabel = statusLabel, dot = dot, fields = v }
 end
 
+-- Players panel: live roster with Roblox avatar headshots and a per-player
+-- record toggle. Rows are managed diff-style by UI:_refreshPlayerFilter so
+-- thumbnails don't reload every refresh.
+local function buildPlayerFilterPanel(view, order)
+    local panel = mk("Frame", {
+        BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        LayoutOrder = order or 5 }, view)
+    corner(panel, 8); pad(panel, 14, 12, 14, 12); vlist(panel, 8)
+
+    mk("TextLabel", { Text = "Players", Font = THEME.fontBold, TextSize = 13,
+        TextColor3 = THEME.accent, BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 16), TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = 1 }, panel)
+
+    local summary = mk("TextLabel", { Text = "", Font = THEME.fontReg, TextSize = 12,
+        TextColor3 = THEME.text, BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 15), TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = 2 }, panel)
+
+    mk("TextLabel", {
+        Text = "tap a player: record \xE2\x86\x92 only-them \xE2\x86\x92 exclude \xE2\x86\x92 record",
+        Font = THEME.fontReg, TextSize = 10, TextColor3 = THEME.subtext,
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 12),
+        TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 3 }, panel)
+
+    local rowsHost = mk("Frame", { BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        LayoutOrder = 4 }, panel)
+    vlist(rowsHost, 4)
+
+    return { panel = panel, summary = summary, rowsHost = rowsHost,
+             rows = {}, nextOrder = 0 }
+end
+
 local function buildRecordView(parent)
     -- ScrollingFrame so content (especially the Assets panel's per-player
     -- list) never collides with the bottom footer. Same pattern as Settings.
@@ -3720,12 +3818,15 @@ local function buildRecordView(parent)
     recordBtn.MouseButton1Click:Connect(function() rec:Toggle() end)
     replayBtn.MouseButton1Click:Connect(function() rec:SaveReplay() end)
 
+    ---- Players panel: live roster + per-player record include/exclude ----
+    local filter = buildPlayerFilterPanel(view, 5)
+
     ---- Assets panel: aggregate progress + per-player breakdown ----
     local assetPanel = mk("Frame", {
         BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
-        LayoutOrder = 5,
+        LayoutOrder = 6,
     }, view)
     corner(assetPanel, 8); pad(assetPanel, 14, 12, 14, 12); vlist(assetPanel, 8)
 
@@ -3770,6 +3871,7 @@ local function buildRecordView(parent)
         view = view, status = status,
         recordBtn = recordBtn, replayBtn = replayBtn,
         irToggle = irToggle, refreshIrToggle = refreshIrToggle,
+        filter = filter,
         assetPanel = assetPanel,
         assetHeadline = assetHeadline,
         assetStats = assetStats,
@@ -4394,6 +4496,104 @@ function UI:setMinimized(min)
     end
 end
 
+-- Live roster + per-player record toggle. Diff-based: rows are created once
+-- per player (so avatar thumbnails don't reload), then re-styled each refresh
+-- to reflect the current effective record state.
+function UI:_refreshPlayerFilter()
+    local ctl = self.recordCtl; if not ctl or not ctl.filter then return end
+    local f = ctl.filter
+    local localPlayer = Players.LocalPlayer
+
+    local present = {}
+    for _, p in ipairs(Players:GetPlayers()) do present[p.UserId] = p end
+
+    -- drop rows for players who left
+    for uid, row in pairs(f.rows) do
+        if not present[uid] then
+            pcall(function() row.frame:Destroy() end)
+            f.rows[uid] = nil
+        end
+    end
+
+    local function makeRow(uid, p)
+        local frame = mk("TextButton", { Text = "", AutoButtonColor = false,
+            BackgroundColor3 = THEME.panelHi, BorderSizePixel = 0,
+            Size = UDim2.new(1, 0, 0, 30), LayoutOrder = f.nextOrder }, f.rowsHost)
+        f.nextOrder = f.nextOrder + 1
+        corner(frame, 6)
+        local av = mk("ImageLabel", { BackgroundColor3 = THEME.bg,
+            BorderSizePixel = 0,
+            Image = "rbxthumb://type=AvatarHeadShot&id=" .. uid .. "&w=48&h=48",
+            Position = UDim2.fromOffset(4, 3), Size = UDim2.fromOffset(24, 24) },
+            frame)
+        corner(av, 12)
+        local name = mk("TextLabel", { Font = THEME.fontReg, TextSize = 12,
+            TextColor3 = THEME.text, BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -132, 1, 0),
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd }, frame)
+        local chip = mk("TextLabel", { Font = THEME.fontBold, TextSize = 10,
+            BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
+            TextColor3 = Color3.new(1, 1, 1),
+            AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -6, 0.5, 0),
+            Size = UDim2.fromOffset(86, 20),
+            TextXAlignment = Enum.TextXAlignment.Center }, frame)
+        corner(chip, 4)
+        frame.MouseButton1Click:Connect(function()
+            _cyclePlayerFilter(uid)
+            self:_refreshPlayerFilter()
+        end)
+        local row = { frame = frame, av = av, name = name, chip = chip }
+        f.rows[uid] = row
+        return row
+    end
+
+    local total, recordedCount, includeCount, excludeCount = 0, 0, 0, 0
+    for uid, p in pairs(present) do
+        local row = f.rows[uid] or makeRow(uid, p)
+        local mode = PLAYER_FILTER[uid]
+        local recorded = _shouldRecordPlayer(p, rec.cfg)
+        total = total + 1
+        if recorded then recordedCount = recordedCount + 1 end
+        if mode == "include" then includeCount = includeCount + 1
+        elseif mode == "exclude" then excludeCount = excludeCount + 1 end
+
+        local isLocal = (p == localPlayer)
+        row.name.Text = (p.DisplayName or p.Name)
+            .. (isLocal and "  (you)" or "")
+
+        local chipText, chipBg
+        if mode == "include" then chipText, chipBg = "INCLUDED", THEME.success
+        elseif mode == "exclude" then chipText, chipBg = "EXCLUDED", THEME.danger
+        elseif recorded then chipText, chipBg = "REC", THEME.accent
+        else chipText, chipBg = "paused", THEME.standby end
+        row.chip.Text = chipText
+        row.chip.BackgroundColor3 = chipBg
+
+        if recorded then
+            row.frame.BackgroundColor3 = THEME.panelHi
+            row.name.TextColor3 = THEME.text
+            row.av.ImageColor3 = Color3.new(1, 1, 1)
+        else
+            row.frame.BackgroundColor3 = THEME.panel
+            row.name.TextColor3 = THEME.subtext
+            row.av.ImageColor3 = Color3.fromRGB(105, 108, 116)
+        end
+    end
+
+    if includeCount > 0 then
+        f.summary.Text = fmt("Recording only %d included \xE2\x80\xA2 %d paused",
+            recordedCount, total - recordedCount)
+    elseif recordedCount < total then
+        -- some not recorded: explicit excludes and/or local not opted in
+        local why = excludeCount > 0 and fmt(" \xE2\x80\xA2 %d excluded", excludeCount) or ""
+        f.summary.Text = fmt("Recording %d of %d%s", recordedCount, total, why)
+    else
+        f.summary.Text = fmt("Recording all %d player%s", total,
+            total == 1 and "" or "s")
+    end
+end
+
 function UI:_refreshStatus()
     local ctl = self.recordCtl; if not ctl then return end
     local s = ctl.status
@@ -4474,6 +4674,9 @@ function UI:_refreshStatus()
             "%s record  ·  %s save replay  ·  %s toggle window",
             rec.cfg.HOTKEY_RECORD, rec.cfg.HOTKEY_SAVE_REPLAY, rec.cfg.HOTKEY_UI)
     end
+
+    -- Players panel: live roster + record include/exclude toggles
+    self:_refreshPlayerFilter()
 
     -- Assets panel: aggregate progress + per-player rows
     if ctl.assetHeadline then

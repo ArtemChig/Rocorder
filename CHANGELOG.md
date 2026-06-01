@@ -9,6 +9,37 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.10.0-alpha — 2026-06-01
+
+**New: per-player include / exclude filter with live Roblox avatar icons.**
+
+A "Players" panel on the Record tab shows everyone currently in the server,
+each as a row with their **Roblox avatar headshot** (the circular thumbnail,
+loaded via `rbxthumb://`), display name, and a status chip you can tap.
+
+- **Tap a player to cycle their state**: default → *include* → *exclude* →
+  default.
+- **Rule** (as requested): if ANY player is set to *include*, only included
+  players are recorded — everyone else is paused. Otherwise everyone is
+  recorded except those set to *exclude*. So "record only my friend" =
+  tap the friend once (→ INCLUDED) and everyone else auto-pauses.
+- **Instantly readable**: recorded players show a bright row + blue **REC**
+  chip (or green **INCLUDED**); paused/excluded players are dimmed with a
+  grey **paused** / red **EXCLUDED** chip, and their avatar greys out. A
+  one-line summary at the top says exactly what's happening ("Recording all
+  5 players" / "Recording only 2 included • 3 paused" / "Recording 4 of 5 •
+  1 excluded").
+- **Works live during recording AND Instant Replay.** The filter is checked
+  every tick, so toggling someone takes effect on the very next frame —
+  excluded players stop being recorded and their assets stop extracting
+  immediately; re-including resumes both. No restart needed.
+- **Tap yourself to record yourself.** The local player follows the
+  existing `INCLUDE_LOCAL` setting by default, but explicitly tapping
+  yourself to INCLUDED overrides it.
+- Rows are managed diff-style so avatar thumbnails never flicker/reload on
+  the 5 Hz status refresh. Filter state is per-session (resets when you
+  re-execute the loader), as chosen.
+
 ## 1.9.23-alpha — 2026-06-01
 
 Two correctness fixes: no double-extraction, and mid-game rig/skin/clothing
