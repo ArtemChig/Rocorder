@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.11-alpha"
+local ROCORDER_VERSION = "1.9.12-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -442,7 +442,21 @@ local function paceExtractor()
         _lastPaceYieldAt = os.clock()
         return
     end
-    if now - _lastPaceYieldAt > EXTRACT_SLICE_SEC then
+    local elapsed = now - _lastPaceYieldAt
+    if elapsed > 0.030 then
+        -- A single chunk took >30 ms. We almost certainly just returned
+        -- from a heavy Roblox API call we couldn't pace inside
+        -- (CreateEditableMeshAsync / CreateEditableImageAsync / a big
+        -- ReadPixelsBuffer / a synchronous JSONEncode of a remaining
+        -- string-concat tail). Yield THREE frames so the game can render
+        -- a clean frame before the next chunk starts — single-frame yields
+        -- leave the game ~7 ms (at 144 fps) to recover, which is rarely
+        -- enough after a 100-150 ms hitch.
+        task.wait()
+        task.wait()
+        task.wait()
+        _lastPaceYieldAt = os.clock()
+    elseif elapsed > EXTRACT_SLICE_SEC then
         task.wait()
         _lastPaceYieldAt = os.clock()
     end
@@ -939,6 +953,10 @@ local function _processOne(entry, dbg)
             "https://assetdelivery.roblox.com/v2/asset/?id=" .. entry.id,
         }
         local lastErr
+        local sawAuthFailure = false  -- 401/403 means "we don't have access";
+                                      -- retrying with the same credentials won't
+                                      -- change that. Fail fast to avoid blowing
+                                      -- 1-2 s per off-sale/private asset.
         for attempt = 1, 2 do
             for _, url in ipairs(urls) do
                 local okr, resp = pcall(httpRequest, {
@@ -962,12 +980,17 @@ local function _processOne(entry, dbg)
                         end
                     else
                         lastErr = fmt("HTTP %s", tostring(code))
+                        if code == 401 or code == 403 then
+                            sawAuthFailure = true
+                            break  -- both endpoints check the same auth;
+                                   -- a 401 from v1 means v2 will 401 too.
+                        end
                     end
                 else
                     lastErr = tostring(resp)
                 end
             end
-            -- Backoff before retry (only between rounds, not after the last).
+            if sawAuthFailure then break end  -- don't waste the retry round
             if attempt < 2 then task.wait(0.8) end
         end
         err = err or lastErr
@@ -978,17 +1001,36 @@ local function _processOne(entry, dbg)
     -- BaseParts — AssetService:CreateEditableImageAsync rejects their IDs,
     -- so they ALWAYS go through HTTP. If THAT also failed it's an
     -- inaccessible asset (off-sale UGC, private), not "player left".
+    --
+    -- For entries that DID have a partInst but lost it, distinguish two
+    -- sub-cases: was the player still in the game (so the part itself was
+    -- destroyed — tool unequipped, accessory removed, script-deleted), or
+    -- has the player actually disconnected? The previous "player left"
+    -- label fired for both, which read as confusing in logs where nobody
+    -- had left.
     local hadAnyPart = false
     for _, r in ipairs(entry.partRefs) do
         if r.inst then hadAnyPart = true; break end
     end
-    local missed = hadAnyPart and (ref == nil)  -- true "player left"
+    local ownerStillHere = false
+    if hadAnyPart and ref == nil then
+        for uid in pairs(entry.owners) do
+            if Players:GetPlayerByUserId(uid) then
+                ownerStillHere = true; break
+            end
+        end
+    end
+    -- "missed" stat counts only true disconnects.
+    local missed = hadAnyPart and (ref == nil) and not ownerStillHere
     _markEntryFailed(entry, missed, dbg)
     if dbg then
         local tag
         if not hadAnyPart then
             tag = " (asset not publicly accessible — likely off-sale / "
                 .. "private clothing / restricted UGC)"
+        elseif ref == nil and ownerStillHere then
+            tag = " (part instance destroyed — tool unequipped / "
+                .. "accessory removed / script deleted)"
         elseif ref == nil then
             tag = " (player left before extraction)"
         else
