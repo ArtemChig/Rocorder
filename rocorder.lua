@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.13.0-alpha"
+local ROCORDER_VERSION = "1.13.1-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -399,6 +399,31 @@ local function _isCached(id)
     if EXTRACTED[id] then return true end
     if not isfile then return false end
     return isfile(_geomPath(id)) or isfile(_imgPath(id)) or isfile(_binPath(id))
+end
+
+-- Self-healing detection of stale pre-1.12 mesh geometry. Those files are
+-- ROCORDER-GEOM/1 with all-zero UVs (the GetUV-on-vertex-id bug). The cached
+-- file exists, so the extractor would normally skip re-extracting — leaving
+-- the broken UVs forever. _geomStaleV1 reads the cached geom's header (once
+-- per id per session, then remembered) and reports whether it's the broken
+-- v1, so the enqueue path can delete + re-extract it as GEOM/2.
+--
+-- Uses _geomPath (the canonical path format delfile/isfile/readfile accept) —
+-- the bulk listfiles-based migration couldn't reliably delete because
+-- listfiles returns paths in a different format than delfile expects.
+local _geomCheckedV2 = {}   -- id -> true once confirmed NOT stale (skip re-read)
+local function _geomStaleV1(id)
+    if not id or _geomCheckedV2[id] then return false end
+    if not (isfile and readfile) then return false end
+    local p = _geomPath(id)
+    if not isfile(p) then return false end
+    local ok, head = pcall(function() return readfile(p):sub(1, 48) end)
+    if not ok or type(head) ~= "string" then return false end
+    if head:find("ROCORDER-GEOM/1", 1, true) then
+        return true   -- stale v1 — caller should delete + re-extract
+    end
+    _geomCheckedV2[id] = true   -- v2 (or non-v1) — don't read this file again
+    return false
 end
 
 -- ============================================================================
@@ -1373,11 +1398,25 @@ local function _enqueueAsset(id, kind, partInst, partInfo, uid, displayName)
     local ps = uid and _ensurePlayerStats(uid, displayName) or nil
     _registerOwner(id, uid)
 
-    -- already on disk (any format) → count as done and skip
+    -- already on disk (any format) → count as done and skip — UNLESS it's a
+    -- stale pre-1.12 mesh geom (GEOM/1, zero UVs). Those get force-deleted and
+    -- re-extracted as GEOM/2 with correct UVs. This is the reliable fix for
+    -- the "textures show as flat color" bug on assets cached before 1.12.
     if EXTRACTED[id] or _isCached(id) then
-        if ps then ps.total = ps.total + 1; ps.done = ps.done + 1
-            ps.lastActivityAt = os.clock() end
-        return
+        if kind == "mesh" and _geomStaleV1(id) then
+            pcall(delfile, _geomPath(id))
+            EXTRACTED[id] = nil
+            if _G.ROCORDER_CURRENT_DBG then
+                pcall(_G.ROCORDER_CURRENT_DBG, fmt(
+                    "  mesh %s was stale GEOM/1 (zero UVs) — re-extracting as "
+                    .. "GEOM/2", id))
+            end
+            -- fall through to enqueue for fresh extraction
+        else
+            if ps then ps.total = ps.total + 1; ps.done = ps.done + 1
+                ps.lastActivityAt = os.clock() end
+            return
+        end
     end
 
     local entry = Q.byId[id]
@@ -4886,40 +4925,11 @@ rec.onStateChange = function() if UI.gui then UI:_refreshStatus() end end
 buildUI()
 Indicator:refresh()  -- pick up persisted state (e.g. IR_ENABLED) on script load
 
--- One-time mesh-cache migration. Every .geom.json written before the UV fix
--- (1.12.0) is ROCORDER-GEOM/1 with all-zero UVs (the GetUV-on-vertex-id bug).
--- Because the extractor caches by file existence, those stale files would be
--- reused forever and never regenerate with correct UVs. Purge them ONCE
--- (gated by a marker file) so they re-extract as GEOM/2. Only filenames are
--- listed — no file contents read — so this is fast. Images (.rgba) and bare
--- files are untouched.
-do
-    if isfolder and listfiles and delfile and isfile
-        and isfolder(ASSETS_FOLDER) then
-        local marker = ASSETS_FOLDER .. "/.geom_v2"
-        if not isfile(marker) then
-            local ok, files = pcall(listfiles, ASSETS_FOLDER)
-            local purged = 0
-            if ok and type(files) == "table" then
-                for _, path in ipairs(files) do
-                    local norm = path:gsub("\\", "/")
-                    if norm:sub(-10) == ".geom.json" then
-                        pcall(delfile, path)
-                        local id = norm:match("([^/]+)%.geom%.json$")
-                        if id then EXTRACTED[id] = nil end
-                        purged = purged + 1
-                    end
-                end
-            end
-            pcall(writefile, marker, "v2")
-            if purged > 0 then
-                print(fmt("[ROCORDER] mesh cache migrated: purged %d pre-1.12 "
-                    .. "geom file(s) with broken UVs — they will re-extract as "
-                    .. "GEOM/2 with correct UVs on this recording", purged))
-            end
-        end
-    end
-end
+-- (Stale pre-1.12 GEOM/1 mesh files — zero UVs — are now detected and
+-- re-extracted per-asset at enqueue time via _geomStaleV1, using the
+-- canonical _geomPath. The old listfiles-based bulk migration was removed
+-- because listfiles returns paths in a format delfile silently rejects in
+-- Xeno, so it deleted nothing.)
 
 -- Asset extractor worker + watchdog. The worker drains the queue; the
 -- watchdog respawns it if it goes silent (defensive — should never actually

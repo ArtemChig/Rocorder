@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 13, 0),
+    "version": (1, 13, 1),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.13.0-alpha"
+ROCORDER_VERSION = "1.13.1-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -484,8 +484,14 @@ class AssetFetcher:
             mesh = self._parse_geom_json(geom_path)
             if mesh:
                 self.stats["geom_hits"] += 1
-                self.log("    mesh {} <- local .geom.json verts={} faces={}".format(
-                    aid, len(mesh["verts"]), len(mesh["faces"])))
+                if mesh.get("version") == "geom":
+                    self.log("    mesh {} <- local .geom.json (GEOM/1, "
+                             "ZERO UVs — stale pre-1.12 file; re-record with "
+                             "this avatar present to regenerate it as GEOM/2 "
+                             "with correct UVs)".format(aid))
+                else:
+                    self.log("    mesh {} <- local .geom.json verts={} faces={}".format(
+                        aid, len(mesh["verts"]), len(mesh["faces"])))
                 self._mesh_cache[aid] = mesh
                 return mesh
             self.log("    mesh {} .geom.json unreadable -> other sources".format(aid))
