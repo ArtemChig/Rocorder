@@ -9,6 +9,39 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.15-alpha — 2026-06-01
+
+Experimental: parallel-Luau extraction to eliminate the remaining
+160 ms stutter band.
+
+- **Problem**: 1.9.14's log showed all remaining stalls were uniform
+  ~160 ms, caused by `CreateEditableMeshAsync` /
+  `CreateEditableImageAsync` blocking the main game thread during their
+  initial asset load. These are C-bound API calls we can't pace inside.
+- **Theory**: `task.desynchronize()` puts the calling thread on a
+  worker VM thread; heavy API calls there don't stall the main thread.
+  Officially requires the script to be parented to an `Actor`, but
+  executors sometimes relax this requirement.
+- **Probe at module load**: spawns a 1 s-bounded coroutine that tries
+  `task.desynchronize(); task.synchronize()`. Prints which world we're
+  in:
+  - `parallel Luau available — extractor will desync around heavy API
+    calls to keep main thread smooth` → success path active.
+  - `parallel Luau unavailable: <error>` → probe failed, behavior
+    identical to 1.9.14.
+- **`_processOne` cascade** wraps the extraction block in
+  `_desyncSafe` / `_syncSafe`. Synchronizes BEFORE any executor file
+  I/O (`writefile`), HTTP request, or game-state introspection
+  (`Players:GetPlayerByUserId`). Exception-safe — the resync runs even
+  if extraction errors so the worker can't get stuck desynchronized.
+- **Failure mode is silent and clean**. If `task.desynchronize` errors
+  at runtime even after probe succeeded, the per-call pcall catches it
+  and that single entry just runs in serial. Worker continues.
+
+If this works in your executor, the ~160 ms stalls during extraction
+should disappear entirely — the heavy API calls happen off the main
+thread. Check the print at script load to see which mode you're in.
+
 ## 1.9.14-alpha — 2026-06-01
 
 The 1.9.13 Decal-route experiment didn't work. Backed out so we don't
