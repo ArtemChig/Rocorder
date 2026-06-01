@@ -9,6 +9,45 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.18-alpha — 2026-06-01
+
+Real Actor + Script scaffold for parallel extraction. Where 1.9.15 had
+the worker coroutine call `task.desynchronize` directly (Roblox's
+editable APIs refused), this version creates an actual Roblox `Actor`
+instance with a `LocalScript` inside it. Scripts under an Actor have
+true parallel context, and the editable APIs accept them.
+
+- **Scaffold setup at module load** (under `_G` so it survives reloads):
+  - `Actor` named `_ROCORDER_ExtractorActor` parented to `workspace`
+  - 3 `BindableEvent`s under the actor: `Job`, `Result`, `Ready`
+  - `LocalScript` whose `Source` is set to a worker that listens on
+    `Job`, runs `Create*Async` + read methods in desync, posts back
+    on `Result`
+- **Probe before trusting it**: scaffold writes the source, verifies the
+  write stuck by reading it back, parents the script to start it,
+  waits up to 2 s for a `Ready` signal, sends a `ping` job, waits up
+  to 2 s for a `pong`. Sets `_G.ROCORDER_ACTOR_OK = true` only if the
+  full round-trip works.
+- **Fast path in `extractMeshFromPart` / `extractImageFromContent`**:
+  when `ROCORDER_ACTOR_OK`, dispatch the job to the actor and use the
+  result directly. On any actor failure (timeout, error in the worker,
+  unexpected data), silently fall through to the existing serial
+  extraction path — so a bad job can't break the recorder.
+- **Console output** at script load tells you exactly which path is
+  active:
+  - `Actor scaffold installed and ping round-trip succeeded` → parallel
+    extraction live. Main-thread stalls during extraction should
+    largely disappear.
+  - `Actor scaffold unavailable: Script.Source write …` → executor
+    didn't let us set Source. Falls back to serial.
+  - `Actor scaffold unavailable: ping timed out …` → Source was set
+    but the worker isn't responding. Falls back to serial.
+
+This is the architectural fix the 1.9.15-1.9.17 attempts were missing
+— a real Actor parent for the worker script, not just a desynced
+coroutine. Whether it actually works depends on Xeno allowing
+`Script.Source` writes (most executors do).
+
 ## 1.9.17-alpha — 2026-06-01
 
 Backed out the parallel-Luau extraction path. Roblox's client-side
