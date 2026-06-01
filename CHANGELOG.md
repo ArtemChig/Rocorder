@@ -9,6 +9,30 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.13.0-alpha — 2026-06-01
+
+UVs are confirmed working (the API probe logs `GetFaceUVs=yes` and meshes now
+extract with proper `[0..1]` UV ranges). This release captures the clothing
+that was missing entirely.
+
+- **Capture game-attached external 3D clothing/cosmetics.** Some games weld
+  3D clothing (uniforms, costumes) onto a player but parent those MeshParts
+  **outside** the player's `Character` — so the rig capture, which only
+  scanned `Character` descendants, never saw them and they were absent from
+  the import (not a failure in any log — just never recorded). `captureRig`
+  now also walks `HumanoidRootPart:GetConnectedParts(true)` to find the whole
+  rigidly-welded assembly and captures parts that are: not already the
+  player's, not another player's body, and not anchored (so the welded map
+  can't be pulled in), capped at 200. These import as extra root parts
+  animated by their recorded world CFrame, same as the avatar's own
+  MeshParts. Logged as `captured N externally-welded part(s)`. **Re-record
+  to pick up this clothing.**
+- New backward-compatible `externalParts` count on the rig (informational).
+
+Note: external clothing attached *after* spawn (vs at spawn) is captured at
+initial track + on respawn. If a game equips it well after spawn and it's
+still missed, periodic external re-scan is the follow-up.
+
 ## 1.12.2-alpha — 2026-06-01
 
 The 1.12.0 UV fix never actually ran, because the extractor caches assets by
