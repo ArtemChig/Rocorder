@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 17, 0),
+    "version": (1, 18, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.17.0-alpha"
+ROCORDER_VERSION = "1.18.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -1331,6 +1331,70 @@ def _build_part_object(part, name, place, scale, assets, import_meshes,
 # ----------------------------------------------------------------------------
 # Rig file
 # ----------------------------------------------------------------------------
+def _expand_lives(rig_players, log):
+    """Flatten a RIG/3 players dict into a list of single-life records.
+    Each result entry is one armature's worth of input:
+        {
+            "uid": int,
+            "life_idx": 1-based int,
+            "n_lives": total lives for this player in the rig,
+            "fromT": float seconds (0 means start of recording),
+            "toT": float seconds or None (None = active until end),
+            "rig": single-life rig dict the build_player(...) expects
+                   (rigType, parts, joints, clothing, name, displayName, userId),
+            "label_suffix": "" if only one life, "_LifeN" otherwise,
+        }
+    Backward-compat: a RIG/2 player record (no `revisions` field) becomes
+    one life spanning [0, None]."""
+    lives = []
+    for uid_key, p in (rig_players or {}).items():
+        try:
+            uid = int(uid_key)
+        except (ValueError, TypeError):
+            log("WARN non-int uid key in rig: {}".format(uid_key))
+            continue
+        name = p.get("name")
+        display = p.get("displayName")
+        revisions = p.get("revisions")
+        if revisions:
+            n_lives = len(revisions)
+            for i, rev in enumerate(revisions):
+                # Build a single-life rig dict the existing build_player path
+                # expects (it doesn't know about revisions).
+                single = {
+                    "userId": uid,
+                    "name": name,
+                    "displayName": display,
+                    "rigType": rev.get("rigType"),
+                    "parts": rev.get("parts", []),
+                    "joints": rev.get("joints", []),
+                    "clothing": rev.get("clothing"),
+                    "characterMeshes": rev.get("characterMeshes"),
+                    "externalParts": rev.get("externalParts"),
+                }
+                lives.append({
+                    "uid": uid,
+                    "life_idx": i + 1,
+                    "n_lives": n_lives,
+                    "fromT": float(rev.get("fromT") or 0.0),
+                    "toT": rev.get("toT"),
+                    "rig": single,
+                    "label_suffix": ("_Life{}".format(i + 1)) if n_lives > 1 else "",
+                })
+        else:
+            # RIG/2 flat shape: whole player is one life.
+            lives.append({
+                "uid": uid,
+                "life_idx": 1,
+                "n_lives": 1,
+                "fromT": 0.0,
+                "toT": None,
+                "rig": p,
+                "label_suffix": "",
+            })
+    return lives
+
+
 def load_rig_file(rec_filepath, header, log):
     candidates = []
     rig_field = header.get("rigFile")
@@ -1856,26 +1920,55 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     frame_seen   = {}     # uid -> set of frame_num
     part_count_mismatch = {}  # uid -> [(frame_num, got, expected), ...]
 
-    def player_coll(uid):
-        sub = player_colls.get(uid)
+    # RIG/3: expand the rig into per-life entries. RIG/2 players become one
+    # life each. Multi-life players get one armature per life in their own
+    # sub-collection, with visibility keyframed at the life boundaries.
+    all_lives = _expand_lives(rig_players, log)
+    # Index for fast frame-time lookup: uid -> [life_info, ...] sorted by fromT.
+    lives_by_uid = {}
+    for li in all_lives:
+        lives_by_uid.setdefault(li["uid"], []).append(li)
+    for uid, lst in lives_by_uid.items():
+        lst.sort(key=lambda li: li["fromT"])
+
+    def player_coll(uid, life_idx=None, label_suffix=""):
+        """Top-level collection per player; if life_idx is set and the player
+        has multiple lives, a nested collection per life."""
+        top = player_colls.get(uid)
+        if top is None:
+            top = bpy.data.collections.new(_player_label(roster, uid))
+            root_coll.children.link(top)
+            player_colls[uid] = top
+        if not label_suffix:
+            return top
+        key = (uid, life_idx)
+        sub = player_colls.get(key)
         if sub is None:
-            sub = bpy.data.collections.new(_player_label(roster, uid))
-            root_coll.children.link(sub)
-            player_colls[uid] = sub
+            sub = bpy.data.collections.new(
+                _player_label(roster, uid) + label_suffix)
+            top.children.link(sub)
+            player_colls[key] = sub
         return sub
 
-    def ensure_player(uid):
-        if uid in players:
-            return players[uid]
-        rig = rig_players.get(str(uid))
-        if not rig:
-            log("uid {} has no rig data — going fallback".format(uid))
-            return None
-        log("---- building player uid={} ({}) ----".format(uid, rig.get("name")))
+    def ensure_life(life_info):
+        """Build one armature for one life. Keyed by (uid, life_idx)."""
+        key = (life_info["uid"], life_info["life_idx"])
+        if key in players:
+            return players[key]
+        rig = life_info["rig"]
+        uid = life_info["uid"]
+        label_base = _player_label(roster, uid)
+        label = label_base + life_info["label_suffix"]
+        log("---- building player uid={} ({}) life {}/{} t=[{:.2f}..{}] ----"
+            .format(uid, rig.get("name"), life_info["life_idx"],
+                    life_info["n_lives"], life_info["fromT"],
+                    "end" if life_info["toT"] is None
+                          else "{:.2f}".format(life_info["toT"])))
         log("  rigType={} parts={} joints={}".format(
-            rig.get("rigType"), len(rig.get("parts", [])), len(rig.get("joints", []))))
-        built = build_player(rig, _player_label(roster, uid), scale,
-                             player_coll(uid), log,
+            rig.get("rigType"), len(rig.get("parts", [])),
+            len(rig.get("joints", []))))
+        coll = player_coll(uid, life_info["life_idx"], life_info["label_suffix"])
+        built = build_player(rig, label, scale, coll, log,
                              force_standard_r6=force_standard_r6,
                              assets=assets, import_meshes=import_meshes,
                              apply_clothing=apply_classic_clothing)
@@ -1883,19 +1976,33 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
             return None
         built["last_quat"] = {}
         built["arm"]["rocorder_user_id"] = str(uid)
-        players[uid] = built
-        bone_keycount[uid] = {name: 0 for name in built["R"]}
-        frame_seen[uid] = set()
-        part_count_mismatch[uid] = []
+        built["arm"]["rocorder_life_idx"] = life_info["life_idx"]
+        built["life_info"] = life_info
+        players[key] = built
+        # Per-life keyframe counters (one bone-count map per armature).
+        bone_keycount[key] = {nm: 0 for nm in built["R"]}
+        frame_seen[key] = set()
+        part_count_mismatch[key] = []
         return built
 
-    use_armatures = build_armature and bool(rig_players)
+    # Pick the active life for (uid, frame_time). Cached per-uid linear scan
+    # is fine — usually 1-3 lives per player. Returns life_info or None.
+    def active_life(uid, t):
+        lst = lives_by_uid.get(uid)
+        if not lst:
+            return None
+        for li in lst:
+            to_t = li["toT"]
+            if li["fromT"] <= t and (to_t is None or t < to_t):
+                return li
+        # If t is past all closed lives but before the start of any current
+        # life: shouldn't normally happen; route to last life as best-effort.
+        return lst[-1]
+
+    use_armatures = build_armature and bool(all_lives)
     if use_armatures:
-        for uid_key in rig_players:
-            try:
-                ensure_player(int(uid_key))
-            except ValueError:
-                log("WARN non-int uid_key in rig: {}".format(uid_key))
+        for li in all_lives:
+            ensure_life(li)
 
     last_frame = 1
     keyframes = 0
@@ -1935,7 +2042,17 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
             camera_keys += 3
 
         for uid, part_list in data.items():
-            built = ensure_player(uid) if use_armatures else None
+            # Find which life this frame belongs to (RIG/3). For RIG/2 there's
+            # exactly one life so this just returns it. For RIG/3 multi-life
+            # players, the frame routes to the armature whose [fromT, toT]
+            # contains `t`.
+            built = None
+            li = None
+            if use_armatures:
+                li = active_life(uid, t)
+                if li is not None:
+                    built = ensure_life(li)
+            keycount_key = (uid, li["life_idx"]) if li else None
 
             if built is not None:
                 order = built["order"]
@@ -1946,9 +2063,9 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
                 arm = built["arm"]
 
                 if len(part_list) != len(order):
-                    part_count_mismatch[uid].append(
+                    part_count_mismatch[keycount_key].append(
                         (frame_num, len(part_list), len(order)))
-                frame_seen[uid].add(frame_num)
+                frame_seen[keycount_key].add(frame_num)
 
                 pose = {}
                 for i, vals in enumerate(part_list):
@@ -1983,7 +2100,7 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
                     pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
                     keyframes += 2
                     bone_keys += 1
-                    bone_keycount[uid][name] += 1
+                    bone_keycount[keycount_key][name] += 1
                 continue
 
             # fallback (no rig / armature off)
@@ -2039,13 +2156,54 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     scene.frame_end = last_frame
     scene.frame_current = 1
 
+    # Per-life visibility keyframes. Only players with >1 life get them: the
+    # life is visible during [fromT, toT] and hidden outside. Without these,
+    # all of a player's lives would render simultaneously on top of each
+    # other. The visibility is keyed on hide_viewport and hide_render with
+    # CONSTANT (step) interpolation so it switches instantly at the boundary.
+    for (uid, life_idx), built in players.items():
+        li = built.get("life_info")
+        if not li or li["n_lives"] <= 1:
+            continue
+        arm = built["arm"]
+        fromT = li["fromT"]
+        toT = li["toT"]
+        # Frame numbers (clamped into scene range). +1 because frame_num
+        # in the frame loop is `int(round(t * fps)) + 1`.
+        f_from = max(1, int(round(fromT * fps)) + 1)
+        f_to = (int(round(toT * fps)) + 1) if toT is not None else (last_frame + 1)
+        # Helper: keyframe both hide_viewport and hide_render at `frame` with
+        # the given value, then force CONSTANT interpolation on those keys.
+        def _set_vis(obj, frame, hidden):
+            obj.hide_viewport = hidden
+            obj.hide_render = hidden
+            obj.keyframe_insert(data_path="hide_viewport", frame=frame)
+            obj.keyframe_insert(data_path="hide_render", frame=frame)
+        # Before life: hidden.
+        if f_from > 1:
+            _set_vis(arm, 1, True)
+        # Life begins.
+        _set_vis(arm, f_from, False)
+        # Life ends — only if it actually closed (toT not None).
+        if toT is not None and f_to <= last_frame + 1:
+            _set_vis(arm, f_to, True)
+        # Step interpolation so visibility flips instantly at the boundary.
+        if arm.animation_data and arm.animation_data.action:
+            for fc in arm.animation_data.action.fcurves:
+                if fc.data_path in ("hide_viewport", "hide_render"):
+                    for kp in fc.keyframe_points:
+                        kp.interpolation = "CONSTANT"
+
     # ============ END-OF-IMPORT DIAGNOSTICS ============
     log("")
     log("=" * 30 + " DIAGNOSTICS " + "=" * 30)
-    for uid, built in players.items():
-        log("uid {} ({}):".format(uid, _player_label(roster, uid)))
+    for key, built in players.items():
+        uid, life_idx = key
+        li = built.get("life_info") or {}
+        suffix = li.get("label_suffix", "")
+        log("uid {} ({}){}:".format(uid, _player_label(roster, uid), suffix))
 
-        kc = bone_keycount[uid]
+        kc = bone_keycount[key]
         zero_bones = [b for b, c in kc.items() if c == 0]
         if zero_bones:
             log("  *** {} BONES WITH ZERO KEYFRAMES (these are the 'missing' parts):".format(
@@ -2056,7 +2214,7 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
             log("  all {} bones got keyframes".format(len(kc)))
 
         # frame coverage / gap detection
-        seen = sorted(frame_seen[uid])
+        seen = sorted(frame_seen[key])
         if seen:
             gaps = []
             for a, b in zip(seen, seen[1:]):
@@ -2070,7 +2228,7 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
             if len(gaps) > 20:
                 log("    ... and {} more gaps".format(len(gaps) - 20))
 
-        mis = part_count_mismatch[uid]
+        mis = part_count_mismatch[key]
         if mis:
             log("  note: {} frames had fewer parts than the final count "
                 "(normal for parts that appear later — e.g. an equipped tool — "

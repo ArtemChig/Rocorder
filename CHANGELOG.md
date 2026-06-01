@@ -9,6 +9,49 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.18.0-alpha — 2026-06-02
+
+**Per-life splits.** When a player dies and respawns mid-recording, each
+life is now its own rig with its own armature in its own sub-collection,
+visibility keyframed so only the active life is visible at any frame.
+Before, the recorder kept extending the same rig — accessories from the
+old life stuck around, accessories from the new life piled on top, and
+the importer showed one giant messy armature. The user's "rivals death =
+mess of two rigs" complaint.
+
+- **Recorder.** New `Tracker:_rebuildRefs` closes the active life (sets its
+  `toT` to current session time) and starts a fresh one when the Character
+  is replaced. The live entry fields keep tracking the new life; the old
+  life is snapshotted into `entry.lifeHistory`.
+- **Tracker.currentT.** Recorder pushes session-relative seconds into
+  `tracker.currentT` each tick so life boundaries are timestamped the same
+  way frames are.
+- **New rig format `ROCORDER-RIG/3`.** Each player gets a `revisions[]`
+  array (one element per life). Each element is `{fromT, toT, rigType,
+  parts, joints, clothing, characterMeshes, externalParts}`. `toT = null`
+  means "still active at recording end". `.rec` frame format is unchanged
+  — frame columns reflect the part list of the active life, and the
+  importer maps each frame's time to the right life.
+- **Importer.** New `_expand_lives()` flattens RIG/3 into per-life entries
+  (or wraps a RIG/2 file as a single life — backward compatible). One
+  armature per life, sub-collection named `<player>_Life1`, `_Life2`, …
+  if the player has more than one life (single-life players unchanged).
+- **Visibility keyframing.** Multi-life players get `hide_viewport` +
+  `hide_render` keyframes at each life's `fromT` / `toT` with CONSTANT
+  interpolation, so the previous life vanishes the moment the new one
+  begins.
+- **Diagnostics.** Each life gets its own keycount / coverage block in the
+  import log.
+
+CLAUDE.md format-notes bumped to `RIG/3`. Importer keeps reading legacy
+`RIG/2` (treated as one life).
+
+Re-record to get per-life splits; existing recordings still import as a
+single life (backward-compatible).
+
+Coming next (separate commit): POV viewmodel capture for FPS games — see
+`BACKLOG.md`.
+
 ## 1.17.0-alpha — 2026-06-02
 
 **Texture alpha now blends OVER the body colour instead of cutting through
