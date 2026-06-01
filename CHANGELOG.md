@@ -9,6 +9,16 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.15.1-alpha — 2026-06-02
+
+- BACKLOG.md: added a P2 cluster covering Files-tab improvements (sort
+  recordings, "show in folder" navigation, asset-cache clearing) and the
+  cleaner-on-disk layout it enables (human-friendly filenames including
+  date / time / game name; per-recording subfolder so the 4 sidecar files
+  group together; shared `assets/` stays content-addressed; importer
+  backward-compat for the existing `replay_<id>_<ts>` flat layout). No
+  code change.
+
 ## 1.15.0-alpha — 2026-06-01
 
 **Capture `CharacterMesh` overrides** — fixes the "arms/legs are wrong
