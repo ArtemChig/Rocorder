@@ -9,6 +9,28 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.21-alpha — 2026-06-01
+
+Fix the Actor scaffold's "worker script never signaled ready" failure.
+The 1.9.18-1.9.20 setup created a `LocalScript` under an `Actor`
+parented to `workspace`. Two issues:
+
+- **LocalScript under `workspace` doesn't auto-execute.** LocalScripts
+  require a privileged ancestor (PlayerScripts, PlayerGui, Backpack,
+  ReplicatedFirst, etc.). Source was being written and read back fine,
+  but the script never started.
+- Two fixes layered:
+  1. Use `Script` with `RunContext = Enum.RunContext.Client` instead
+     of `LocalScript`. This is the modern Roblox API and runs from
+     any parent (including `workspace`).
+  2. Prefer parenting the `Actor` under `Players.LocalPlayer.
+     PlayerScripts` when available — there, even a plain `LocalScript`
+     would run as a safety net.
+
+If `Script.RunContext` doesn't exist on the user's Roblox build (pre-
+2023), `Script` falls back to legacy behavior but is still likely to
+run under a client executor's injection context.
+
 ## 1.9.20-alpha — 2026-06-01
 
 Two important fixes from analyzing 1.9.18's F9 console output:
