@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.14-alpha"
+local ROCORDER_VERSION = "1.9.15-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -429,6 +429,68 @@ do
     _G.ROCORDER_FRAME_DELTA_HOOK = function()
         pcall(function() conn:Disconnect() end)
     end
+end
+
+-- ============================================================================
+-- Parallel-Luau probe.
+--
+-- The remaining ~160 ms stalls during extraction come from Roblox's own
+-- CreateEditableMeshAsync / CreateEditableImageAsync calls — C-bound API
+-- that blocks the calling Luau thread while the engine loads + decodes the
+-- asset. Pacing AROUND those calls helps recovery but can't make them
+-- non-blocking.
+--
+-- Parallel Luau (`task.desynchronize()`) marks the current thread as
+-- "desynchronized" — running on a worker VM thread separate from the main
+-- game thread. While desynchronized, heavy calls don't stall the main
+-- thread. To re-enter Roblox-state-mutating APIs (like writefile via
+-- executor, or Instance property writes), the thread re-synchronizes.
+--
+-- Officially `task.desynchronize` requires the script to be parented to an
+-- Actor. From an executor coroutine (no Actor parent), this errors. We
+-- probe at module load to find out which world we're in:
+--   - Probe succeeds: worker calls desync before heavy ops, sync after.
+--   - Probe fails: worker stays serial as before. No code change.
+--
+-- Probe is non-blocking; runs in a spawned coroutine with a 1 s timeout.
+-- ============================================================================
+local PARALLEL_OK = false
+local PARALLEL_PROBE_ERR = nil
+do
+    local result
+    task.spawn(function()
+        local ok, err = pcall(function()
+            task.desynchronize()
+            task.synchronize()
+        end)
+        result = { ok = ok, err = err }
+    end)
+    local waited = 0
+    while result == nil and waited < 1.0 do
+        task.wait(0.05); waited = waited + 0.05
+    end
+    if result and result.ok then
+        PARALLEL_OK = true
+        print("[ROCORDER] parallel Luau available — extractor will desync "
+            .. "around heavy API calls to keep main thread smooth")
+    else
+        PARALLEL_PROBE_ERR = (result and tostring(result.err)) or "probe timed out"
+        print("[ROCORDER] parallel Luau unavailable: "
+            .. PARALLEL_PROBE_ERR .. " — extractor stays serial")
+    end
+end
+
+-- Safe desync/sync wrappers. No-ops when PARALLEL_OK is false. When ok,
+-- they're pcall'd so a runtime "not in actor" failure doesn't crash the
+-- worker — it just means this particular call isn't going to be parallel.
+local function _desyncSafe()
+    if not PARALLEL_OK then return false end
+    local ok = pcall(task.desynchronize)
+    return ok
+end
+local function _syncSafe()
+    if not PARALLEL_OK then return end
+    pcall(task.synchronize)
 end
 
 local EXTRACT_SLICE_SEC = 0.003   -- ~3 ms of work per frame, max
@@ -1041,24 +1103,42 @@ end
 
 -- Try the extractor path; if it fails or no live part remains, try a one-shot
 -- authenticated HTTP fetch. Returns true if the asset ended up on disk.
+--
+-- Parallel-Luau pattern (1.9.15+, gated by PARALLEL_OK probe at module load):
+--   - The heavy extraction work (CreateEditable*Async, ReadPixelsBuffer,
+--     JSON encode) runs in DESYNCHRONIZED context — off the main thread.
+--   - Before any executor file I/O (writefile), HTTP request, or game-state
+--     introspection (Players:GetPlayerByUserId), we SYNCHRONIZE back to
+--     the main thread.
+--   - If the probe says parallel isn't available, _desyncSafe/_syncSafe
+--     are no-ops and the worker runs entirely on the main thread as before.
 local function _processOne(entry, dbg)
-    local ref = _findLivePartRef(entry)
+    local ref = _findLivePartRef(entry)  -- Instance read, main thread
     local body, err
 
-    if ref then
-        if entry.kind == "mesh" then
-            local geom
-            geom, err = extractMeshFromPart(ref.inst)
-            if geom then
-                -- Chunked encode with pacing between subarrays; a single
-                -- HttpService:JSONEncode of a 500 KB mesh was a ~100 ms stall.
-                body, err = _encodeGeomChunked(geom)
+    -- Enter parallel context for the heavy extraction work. Wrap in pcall
+    -- so any thrown error still hits the resync below — leaving the worker
+    -- coroutine stuck desynchronized would silently break the next entry.
+    local desynced = _desyncSafe()
+    local extractOk, extractErr = pcall(function()
+        if ref then
+            if entry.kind == "mesh" then
+                local geom
+                geom, err = extractMeshFromPart(ref.inst)
+                if geom then
+                    -- Chunked encode with pacing between subarrays; a single
+                    -- HttpService:JSONEncode of a 500 KB mesh was a ~100 ms stall.
+                    body, err = _encodeGeomChunked(geom)
+                end
+            else
+                local imgRef = _imgRefFromPartInfo(ref.info, entry.id)
+                body, err = extractImageFromContent(imgRef)
             end
-        else
-            local imgRef = _imgRefFromPartInfo(ref.info, entry.id)
-            body, err = extractImageFromContent(imgRef)
         end
-    end
+    end)
+    -- Synchronize back to main thread before writefile / HTTP / Player APIs.
+    if desynced then _syncSafe() end
+    if not extractOk then err = err or tostring(extractErr) end
 
     -- Step 2 (REMOVED in 1.9.14, kept as comment for record): we briefly
     -- tried wrapping the URL in a live Decal and using Content.fromObject
