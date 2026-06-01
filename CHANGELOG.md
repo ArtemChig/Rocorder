@@ -9,6 +9,17 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.19-alpha — 2026-06-01
+
+- **Extractor backend logged at recording START.** A new line in the
+  debug log right after `START tickRate=...`:
+  - `EXTRACTOR backend=actor-parallel` when the 1.9.18 Actor scaffold
+    is live.
+  - `EXTRACTOR backend=serial (actor probe failed: <reason>)` when the
+    serial fallback is active.
+  Means you no longer need to read the Roblox dev console (F9) to tell
+  which path is running — the .debug.log captures it for every clip.
+
 ## 1.9.18-alpha — 2026-06-01
 
 Real Actor + Script scaffold for parallel extraction. Where 1.9.15 had

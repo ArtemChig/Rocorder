@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.18-alpha"
+local ROCORDER_VERSION = "1.9.19-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2420,6 +2420,14 @@ function Session:writeHeader(roster)
             self.cfg.TICK_RATE, self.cfg.POS_PRECISION, self.cfg.ROT_PRECISION,
             self.cfg.MAX_CATCHUP_SEC, self.cfg.MAX_DISTANCE,
             tostring(self.cfg.IR_ENABLED), self.cfg.IR_BUFFER_SEC))
+        -- Extractor backend status: did the Actor scaffold (1.9.18+) load,
+        -- or are we on the serial fallback? Persisted to the debug log so
+        -- we don't need the Roblox dev console to know which path is live.
+        self:debugLog(fmt("EXTRACTOR backend=%s%s",
+            _G.ROCORDER_ACTOR_OK and "actor-parallel" or "serial",
+            (_G.ROCORDER_ACTOR_OK == false and _G.ROCORDER_ACTOR_ERR)
+                and (" (actor probe failed: " .. _G.ROCORDER_ACTOR_ERR .. ")")
+                or ""))
     end
 end
 
