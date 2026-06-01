@@ -9,6 +9,38 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.14-alpha — 2026-06-01
+
+The 1.9.13 Decal-route experiment didn't work. Backed out so we don't
+waste 0.3 s per clothing failure on a doomed `PreloadAsync`.
+
+- **Reason it failed**: `Content.fromObject` exists on this Roblox
+  build but only accepts `EditableImage` / `EditableMesh` instances —
+  not Decals or any other Instance type. Debug log showed:
+  `Content.fromObject failed: invalid argument #1 to 'fromObject'
+  (Object expected, got table)` on every attempt. The trick is
+  chicken-and-egg: we'd need to already have an EditableImage to
+  wrap, which is what we're trying to create.
+- **Decal-route step removed from `_processOne` cascade**. Image
+  entries that the direct path doesn't handle now go straight to HTTP
+  fallback as in 1.9.12 and earlier — no 0.3 s wasted per failure.
+- **`_extractImageViaDecal` kept in source** as a comment-anchored
+  record of what we tried, in case Roblox extends `fromObject` later.
+
+Stutters: 1.9.13's log showed 24 stalls in 47 s, all uniform 160 ms
+(was 17 in 49 s with one 320 ms outlier). The fail-fast HTTP and
+adaptive-pace fixes worked — the 320 ms outlier is gone. What's left
+is `CreateEditableMeshAsync` / `CreateEditableImageAsync` blocking
+the main thread during their initial asset load. We can't pace inside
+those C-bound API calls. The remaining options to eliminate that
+final stall band are:
+
+1. **Parallel-Luau extractor**: move the worker coroutine into an
+   `Actor` so its API calls don't block the main thread. Substantial
+   restructure of the queue worker. Right architectural fix.
+2. **Accept current performance** and move to the next backlog item
+   (per-player include/exclude filter, then rig revisions).
+
 ## 1.9.13-alpha — 2026-06-01
 
 Experimental "Decal route" for clothing template extraction.

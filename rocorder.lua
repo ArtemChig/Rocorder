@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.13-alpha"
+local ROCORDER_VERSION = "1.9.14-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -1060,45 +1060,22 @@ local function _processOne(entry, dbg)
         end
     end
 
-    -- Step 2: experimental Decal route for image entries that the direct
-    -- path didn't handle. Clothing templates (ShirtTemplate / PantsTemplate)
-    -- always fall here because CreateEditableImageAsync rejects their IDs
-    -- by content-type — but the engine has already loaded their bytes for
-    -- rendering. Wrapping the URL in a live Decal and using
-    -- Content.fromObject MAY route around the type check. Cheap on failure
-    -- (host Part destroyed, fall through to HTTP).
-    local viaDecal = false
-    if not body and entry.kind == "image" then
-        local imgRef
-        if ref and ref.info then
-            imgRef = _imgRefFromPartInfo(ref.info, entry.id)
-        else
-            for _, r in ipairs(entry.partRefs) do
-                if r.info then
-                    imgRef = _imgRefFromPartInfo(r.info, entry.id)
-                    break
-                end
-            end
-            imgRef = imgRef or ("rbxassetid://" .. entry.id)
-        end
-        local decalBody, decalErr = _extractImageViaDecal(imgRef, dbg)
-        if decalBody then
-            body = decalBody
-            err = nil
-            viaDecal = true
-        else
-            err = err or decalErr
-        end
-    end
+    -- Step 2 (REMOVED in 1.9.14, kept as comment for record): we briefly
+    -- tried wrapping the URL in a live Decal and using Content.fromObject
+    -- to bypass the content-type check. The Decal trick failed because
+    -- Content.fromObject only accepts EditableImage / EditableMesh, not
+    -- arbitrary Instances ("Object expected, got table" in the log).
+    -- The helper `_extractImageViaDecal` is kept above as documentation
+    -- of what we tried, but it's no longer called. Falls straight through
+    -- to HTTP fallback as in 1.9.12 and earlier.
 
     if body then
         local path = (entry.kind == "mesh") and _geomPath(entry.id) or _imgPath(entry.id)
         if pcall(writefile, path, body) then
             _markEntryDone(entry, dbg)
             if dbg then
-                local tag = viaDecal and " via Decal route" or ""
-                dbg(fmt("  EXTRACT %s %s OK%s (%d bytes, queued for %.1fs)",
-                    entry.kind, entry.id, tag,
+                dbg(fmt("  EXTRACT %s %s OK (%d bytes, queued for %.1fs)",
+                    entry.kind, entry.id,
                     #body, os.clock() - entry.enqueuedAt))
             end
             return true
