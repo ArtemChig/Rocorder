@@ -9,6 +9,30 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.20-alpha — 2026-06-01
+
+Two important fixes from analyzing 1.9.18's F9 console output:
+
+- **`BindToClose` wrapped in pcall.** The line
+  `game:BindToClose(function() ... end)` near the bottom of the file
+  now throws `BindToClose can only be called on the server.` on
+  current Roblox client builds (apparently strict-mode enforcement
+  changed). The bare call was halting script load partway through —
+  everything after it (UI methods, `_destroy`, `PlayerRemoving`
+  handler) never ran. Best-effort pcall: works in Studio / server
+  context, silently no-ops on client executors.
+- **Removed the misleading parallel-Luau probe.** 1.9.15-1.9.19 had a
+  module-load probe that did `pcall(task.desynchronize); pcall(task.
+  synchronize)` and considered the absence of a thrown error as proof
+  that parallel Luau worked. It doesn't: Roblox just prints a warning
+  (`task.synchronize() should only be called from a script that is a
+  descendant of an Actor`) and treats the thread as still synchronized.
+  The pcall returns success either way. So
+  `[ROCORDER] parallel Luau available` was a lie. Removed the probe
+  and its `_desyncSafe` / `_syncSafe` helpers (already unused since
+  1.9.17). The Actor scaffold (`_G.ROCORDER_ACTOR_OK`) is the single
+  source of truth for whether parallel extraction is actually live.
+
 ## 1.9.19-alpha — 2026-06-01
 
 - **Extractor backend logged at recording START.** A new line in the

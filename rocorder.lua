@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.19-alpha"
+local ROCORDER_VERSION = "1.9.20-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -708,67 +708,15 @@ do
     end
 end
 
--- ============================================================================
--- Parallel-Luau probe.
---
--- The remaining ~160 ms stalls during extraction come from Roblox's own
--- CreateEditableMeshAsync / CreateEditableImageAsync calls — C-bound API
--- that blocks the calling Luau thread while the engine loads + decodes the
--- asset. Pacing AROUND those calls helps recovery but can't make them
--- non-blocking.
---
--- Parallel Luau (`task.desynchronize()`) marks the current thread as
--- "desynchronized" — running on a worker VM thread separate from the main
--- game thread. While desynchronized, heavy calls don't stall the main
--- thread. To re-enter Roblox-state-mutating APIs (like writefile via
--- executor, or Instance property writes), the thread re-synchronizes.
---
--- Officially `task.desynchronize` requires the script to be parented to an
--- Actor. From an executor coroutine (no Actor parent), this errors. We
--- probe at module load to find out which world we're in:
---   - Probe succeeds: worker calls desync before heavy ops, sync after.
---   - Probe fails: worker stays serial as before. No code change.
---
--- Probe is non-blocking; runs in a spawned coroutine with a 1 s timeout.
--- ============================================================================
-local PARALLEL_OK = false
-local PARALLEL_PROBE_ERR = nil
-do
-    local result
-    task.spawn(function()
-        local ok, err = pcall(function()
-            task.desynchronize()
-            task.synchronize()
-        end)
-        result = { ok = ok, err = err }
-    end)
-    local waited = 0
-    while result == nil and waited < 1.0 do
-        task.wait(0.05); waited = waited + 0.05
-    end
-    if result and result.ok then
-        PARALLEL_OK = true
-        print("[ROCORDER] parallel Luau available — extractor will desync "
-            .. "around heavy API calls to keep main thread smooth")
-    else
-        PARALLEL_PROBE_ERR = (result and tostring(result.err)) or "probe timed out"
-        print("[ROCORDER] parallel Luau unavailable: "
-            .. PARALLEL_PROBE_ERR .. " — extractor stays serial")
-    end
-end
-
--- Safe desync/sync wrappers. No-ops when PARALLEL_OK is false. When ok,
--- they're pcall'd so a runtime "not in actor" failure doesn't crash the
--- worker — it just means this particular call isn't going to be parallel.
-local function _desyncSafe()
-    if not PARALLEL_OK then return false end
-    local ok = pcall(task.desynchronize)
-    return ok
-end
-local function _syncSafe()
-    if not PARALLEL_OK then return end
-    pcall(task.synchronize)
-end
+-- The naive "desync from main thread" probe (1.9.15-1.9.19) was
+-- misleading: pcall(task.desynchronize) returns success even outside an
+-- Actor, but the call effectively does nothing — Roblox just prints a
+-- warning ("task.synchronize() should only be called from a script that
+-- is a descendant of an Actor") and treats the thread as still
+-- synchronized. So a "parallel Luau available" message would lie. The
+-- ONLY meaningful parallel path on a client is the Actor scaffold above
+-- (real Actor + LocalScript inside it). _G.ROCORDER_ACTOR_OK is the
+-- single source of truth for "is parallel extraction actually running?".
 
 -- ============================================================================
 -- Actor job dispatch.
@@ -4492,8 +4440,15 @@ rec.conns.input = UserInputService.InputBegan:Connect(function(input, processed)
     elseif kc == keyFromName(rec.cfg.HOTKEY_SAVE_REPLAY) then rec:SaveReplay() end
 end)
 
-game:BindToClose(function()
-    if rec.session then rec:Stop() end
+-- BindToClose is server-only — calling from a client (executor) context
+-- now throws on current Roblox versions. The pcall makes the call best-
+-- effort: if it works (server / Studio testing), we still get the
+-- graceful Stop on shutdown; if it doesn't (client executor), the rest
+-- of the script load isn't broken by the throw.
+pcall(function()
+    game:BindToClose(function()
+        if rec.session then rec:Stop() end
+    end)
 end)
 
 function rec:OpenUI()   UI:setVisible(true)  end
