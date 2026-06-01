@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 14, 1),
+    "version": (1, 14, 2),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.14.1-alpha"
+ROCORDER_VERSION = "1.14.2-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -1001,34 +1001,38 @@ _FACE_AXES = {
     "Bottom": (Vector((-1, 0, 0)), Vector((0, -1, 0))),  # -Z
 }
 
-# Exact coordinates measured from the official template (user-read pixel
-# corners + the 64px grid). Torso FRONT top-left = (231,74); right-limb L
-# top-left = (19,355); left-limb F top-left = (308,355).
+# Layout reverse-engineered from official template + user-read corners.
+# Cells are the standard Roblox 64×128 (sides) / 64×64 (caps) / 128×128
+# (torso front/back) / 128×64 (torso up/down), separated by a 2-px gap
+# between adjacent cells in each region. Anchors (user-measured):
+#   torso FRONT top-left = (231, 74)
+#   right-limb L top-left = (19, 355)        [F follows at 217 = 19+3*66]
+#   left-limb F top-left = (308, 355)
+# (F.bottomRight=(280,482) confirms F is 64×128 with inclusive-pixel reading
+# 217..280 / 355..482; gap of 2 = 66 - 64.)
 _TORSO_RECTS = {
-    "Right":  _px(167,  74,  64, 128),
-    "Front":  _px(231,  74, 128, 128),
-    "Left":   _px(359,  74,  64, 128),
-    "Back":   _px(423,  74, 128, 128),
-    "Top":    _px(231,  10, 128,  64),
-    "Bottom": _px(231, 202, 128,  64),
+    "Right":  _px(165,  74,  64, 128),    # FRONT.x - 2 - 64
+    "Front":  _px(231,  74, 128, 128),    # anchor
+    "Left":   _px(361,  74,  64, 128),    # FRONT.x + 128 + 2
+    "Back":   _px(427,  74, 128, 128),    # L.x + 64 + 2
+    "Top":    _px(231,   8, 128,  64),    # FRONT.y - 2 - 64
+    "Bottom": _px(231, 204, 128,  64),    # FRONT.y + 128 + 2
 }
-# Right limb cross: row L B R F (x = 19,83,147,211), F's U/D at x=211.
 _RIGHT_LIMB_RECTS = {
-    "Left":   _px( 19, 355, 64, 128),
-    "Back":   _px( 83, 355, 64, 128),
-    "Right":  _px(147, 355, 64, 128),
-    "Front":  _px(211, 355, 64, 128),
-    "Top":    _px(211, 291, 64,  64),
-    "Bottom": _px(211, 483, 64,  64),
+    "Left":   _px( 19, 355, 64, 128),     # anchor
+    "Back":   _px( 85, 355, 64, 128),     # +66 each
+    "Right":  _px(151, 355, 64, 128),
+    "Front":  _px(217, 355, 64, 128),
+    "Top":    _px(217, 289, 64,  64),     # F.y - 2 - 64
+    "Bottom": _px(217, 485, 64,  64),     # F.y + 128 + 2
 }
-# Left limb cross: row F L B R (x = 308,372,436,500), F's U/D at x=308.
 _LEFT_LIMB_RECTS = {
-    "Front":  _px(308, 355, 64, 128),
-    "Left":   _px(372, 355, 64, 128),
-    "Back":   _px(436, 355, 64, 128),
-    "Right":  _px(500, 355, 64, 128),
-    "Top":    _px(308, 291, 64,  64),
-    "Bottom": _px(308, 483, 64,  64),
+    "Front":  _px(308, 355, 64, 128),     # anchor
+    "Left":   _px(374, 355, 64, 128),     # +66 each
+    "Back":   _px(440, 355, 64, 128),
+    "Right":  _px(506, 355, 64, 128),
+    "Top":    _px(308, 289, 64,  64),
+    "Bottom": _px(308, 485, 64,  64),
 }
 
 

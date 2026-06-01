@@ -9,6 +9,17 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.14.2-alpha — 2026-06-01
+
+- **Classic-clothing region layout corrected (cell spacing).** 1.14.1 packed
+  cells edge-to-edge, but the user's measurement of right-arm F (top-left
+  217, bottom-right 280, 482) showed adjacent cells are separated by a **2-px
+  gap** in the template — not zero. So spacing from one cell's top-left to
+  the next is 66 px (= 64 cell + 2 gap), not 64. With L=19, this puts the
+  cells at 19, 85, 151, 217 ✓ — matching the user's corrected reading. All
+  18 rects rebuilt accordingly (anchors unchanged; cell sizes stay at the
+  Roblox-standard 64×128 / 64×64 / 128×128 / 128×64).
+
 ## 1.14.1-alpha — 2026-06-01
 
 - **Exact classic-clothing template coordinates.** 1.14.0's region rects were
