@@ -9,6 +9,35 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.16-alpha — 2026-06-01
+
+Recovers from the 1.9.15 regression. The parallel-Luau probe succeeded,
+but Roblox explicitly refuses `CreateEditableMeshAsync` and
+`CreateEditableImageAsync` in parallel context:
+
+```
+CreateEditableMeshAsync: Function AssetService.CreateEditableMeshAsync
+is not safe to call in parallel
+```
+
+The 1.9.15 log showed most mesh + image extractions failing with that
+error before fall-through to HTTP fallback (which thankfully rescued
+many of them — but inefficiently and with stalls).
+
+- **Sync briefly around the Create*Async calls only.** Inside
+  `extractMeshFromPart` and `extractImageFromContent`, we now
+  `_syncSafe()` just before the `CreateEditableMeshAsync` /
+  `CreateEditableImageAsync` call, then `_desyncSafe()` right after.
+  The Create*Async itself runs on the main thread (still blocks ~100 ms
+  for big assets — can't help that), but everything else (per-vertex
+  loops, GetFaces, ReadPixelsBuffer, JSON encode) continues to run in
+  parallel.
+- **Net win expected**: instead of one ~160 ms main-thread block per
+  asset, we get one ~100 ms block (the unavoidable Create*Async load
+  time) plus ~50-100 ms of work that happens off the main thread —
+  invisible. Reduces stall band from ~160 ms to ~100 ms, eliminates
+  the post-create-vert-loop chunk of main-thread time.
+
 ## 1.9.15-alpha — 2026-06-01
 
 Experimental: parallel-Luau extraction to eliminate the remaining
