@@ -35,6 +35,58 @@ data, no network.
 
 ---
 
+## P2 — Files-tab upgrades + cleaner recordings folder layout
+
+A grouped set of improvements to the recordings UI and how files are laid
+out on disk. Bundling them because they touch the same code paths and
+"better naming" is the linchpin — clean filenames make every other piece
+nicer (sort columns, breadcrumbs, file-explorer jumps, the cache list).
+
+- **Sort recordings in the Files tab.** Sortable columns: date, length,
+  size, game/place name, player count. Current order is whatever
+  `listfiles` returns — usually mtime-ish but not promised, and there's no
+  way to flip newest-vs-oldest or find the longest clip in a session.
+
+- **Navigate to a recording in the file explorer.** A button per row
+  ("Show in folder") that opens the OS file explorer with the recording's
+  `.rec` selected (Explorer / Finder / Nautilus). Lets the user grab a
+  recording's files without hunting the path.
+
+- **Clear cached assets / per-recording cache.** A button in the Files tab
+  to clear cached asset files (the `assets/` folder) — globally
+  ("clear all assets") and per-recording ("clear only assets this recording
+  references"). Useful when the auth cookie changes, a re-record-with-the-
+  UV-fix is wanted, or you want to free disk after a long IR session.
+  Confirmation prompt before destructive action.
+
+- **Better recording filenames.** Current scheme:
+  `replay_<placeId>_<unixSeconds>.rec` — opaque, hard to sort by anything
+  human-readable, the placeId says nothing about the game. Move to a
+  human-friendly pattern, e.g.:
+  `<YYYY-MM-DD>_<HH-MM-SS>__<game-name-slug>__<clip-or-session>.rec`
+  Examples:
+  - `2026-06-02_14-30-12__violence-district__clip.rec`
+  - `2026-06-02_14-30-12__violence-district__replay.rec` (saved IR)
+  Game name comes from `MarketplaceService:GetProductInfo(placeId).Name`,
+  cached locally so it isn't refetched per recording. Keep `placeId` and
+  `jobId` in the meta sidecar (they already are) — filenames don't need
+  them. Sort-by-date and group-by-game become trivial because the
+  filename itself encodes it.
+
+- **Cleaner recordings folder layout.** Instead of every recording's
+  `.rec` + `.rig.json` + `.meta.json` + `.debug.log` (4 files) littering one
+  folder, group them per recording in a subfolder named after the
+  recording: `ROCORDER/recordings/<recording-name>/{rec,rig.json,
+  meta.json,debug.log}`. The shared `assets/` folder stays at the
+  workspace root (it's content-addressed and cross-recording). One
+  per-recording folder = one drag-to-archive unit, easier to delete an old
+  session, and the Files tab lists subfolders instead of grouping by
+  filename prefix.
+
+- **Migration**: importer should still read old flat layout + old
+  `replay_<id>_<ts>` names (backward compat, no breakage on existing
+  files). New recordings use the new layout.
+
 ## P3 — Candidates / known limitations (noticed, not yet committed)
 
 - **Hide enclosed classic base-body boxes on layered-clothing avatars.** When
