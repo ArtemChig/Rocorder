@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.22-alpha"
+local ROCORDER_VERSION = "1.9.23-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -1447,6 +1447,25 @@ end
 -- through to HTTP fallback, losing the .geom.json output we want. Better
 -- to keep the existing 160 ms stalls than to lose every mesh extraction.
 local function _processOne(entry, dbg)
+    -- Hard dedup guard. A duplicate entry for the same id can exist due to a
+    -- race: entry A is popped (removed from Q.byId) and mid-extraction —
+    -- EXTRACTED not yet set, file not yet written — when a second enqueue
+    -- for the same id (e.g. a t-shirt that's BOTH a torso decal AND a
+    -- clothing entry) slips through the enqueue-time dedup and creates entry
+    -- B. By the time B is processed, A has finished. This guard makes B a
+    -- no-op instead of a second expensive CreateEditable*Async + write.
+    -- Counters stay balanced: B's owners got total+1 at enqueue, this gives
+    -- them done+1.
+    if EXTRACTED[entry.id] or _isCached(entry.id) then
+        EXTRACTED[entry.id] = true
+        _markEntryDone(entry, dbg)
+        if dbg then
+            dbg(fmt("  EXTRACT %s %s skipped (already extracted — duplicate entry)",
+                entry.kind, entry.id))
+        end
+        return true
+    end
+
     local ref = _findLivePartRef(entry)
     local body, err
 
@@ -2146,6 +2165,28 @@ end
 -- part, so 4 players × 20 parts × 15 pcalls = ~1200 pcalls/sec spent
 -- looking for content that arrived seconds ago and isn't going to change.
 -- The flag is reset on respawn so a swapped Character is re-scanned.
+-- Compare two partInfo asset fingerprints. Returns true if `new` carries any
+-- asset id that differs from `old` — covers BOTH "content arrived where there
+-- was none" (late mesh streaming) AND "content changed value" (mid-game skin /
+-- mesh swap; the game hands a player a new texture on the same part). The old
+-- version only caught the former, so skin swaps after the rig settled were
+-- silently missed and never extracted.
+local function _decalsKey(info)
+    if not (info and info.decals) then return "" end
+    local parts = {}
+    for _, d in ipairs(info.decals) do parts[#parts + 1] = tostring(d.texture) end
+    table.sort(parts)
+    return table.concat(parts, "|")
+end
+local function _assetFingerprintChanged(old, new)
+    if not old then return true end
+    if (new.meshId    or "") ~= (old.meshId    or "") then return true end
+    if (new.textureId or "") ~= (old.textureId or "") then return true end
+    if (new.colorMap  or "") ~= (old.colorMap  or "") then return true end
+    if _decalsKey(new) ~= _decalsKey(old) then return true end
+    return false
+end
+
 function Tracker:_rescanExistingAssets(entry, debugLog)
     if not EXTRACT_OK then return end
     if entry.rescanSettled then return end
@@ -2156,18 +2197,19 @@ function Tracker:_rescanExistingAssets(entry, debugLog)
             local old = entry.rig.parts[i]
             local oldName = (old and old.name) or r.name
             local new = partInfo(inst, oldName)
-            local upgraded = false
-            if new.meshId and not (old and old.meshId) then upgraded = true end
-            if new.textureId and not (old and old.textureId) then upgraded = true end
-            if new.colorMap and not (old and old.colorMap) then upgraded = true end
-            local oldDecals = (old and old.decals) or {}
-            if new.decals and #new.decals > #oldDecals then upgraded = true end
-            if upgraded then
-                foundNew = true
+            if _assetFingerprintChanged(old, new) then
+                -- only counts as "new work" (resets the settle counter) when
+                -- the new fingerprint actually carries an asset id we might
+                -- need; a part losing its texture shouldn't keep us scanning.
+                local hasAsset = new.meshId or new.textureId or new.colorMap
+                    or (new.decals and #new.decals > 0)
+                if hasAsset then foundNew = true end
                 if debugLog then
-                    debugLog(fmt("uid=%d part[%d] %s mesh content arrived (mesh=%s tex=%s)",
+                    debugLog(fmt("uid=%d part[%d] %s asset changed "
+                        .. "(mesh=%s tex=%s colorMap=%s) — re-extracting",
                         entry.uid, i - 1, new.name,
-                        tostring(new.meshId), tostring(new.textureId)))
+                        tostring(new.meshId), tostring(new.textureId),
+                        tostring(new.colorMap)))
                 end
                 entry.rig.parts[i] = new
                 enqueuePartAssets(inst, new, entry.uid, entry.displayName)
@@ -2186,6 +2228,39 @@ function Tracker:_rescanExistingAssets(entry, debugLog)
                     .. "for 3 consecutive scans)", entry.uid))
             end
         end
+    end
+end
+
+-- Re-read the player's Shirt / Pants / ShirtGraphic templates and re-enqueue
+-- if they changed. Clothing was previously enqueued only once at ENSURE, so a
+-- mid-game clothing swap (round start hands everyone a uniform, etc.) was
+-- never picked up. This is cheap (a handful of property reads), so it runs
+-- every throttled tick regardless of the part-rescan settle state.
+function Tracker:_rescanClothing(entry, char, debugLog)
+    if not EXTRACT_OK or not char then return end
+    local cur = {}
+    for _, inst in ipairs(char:GetChildren()) do
+        if inst:IsA("Shirt") then
+            local t = inst.ShirtTemplate; if t ~= "" then cur.shirt = t end
+        elseif inst:IsA("Pants") then
+            local t = inst.PantsTemplate; if t ~= "" then cur.pants = t end
+        elseif inst:IsA("ShirtGraphic") then
+            local t = inst.Graphic; if t ~= "" then cur.tshirt = t end
+        end
+    end
+    local function key(c)
+        if not c then return "" end
+        return table.concat({ tostring(c.shirt or ""), tostring(c.pants or ""),
+            tostring(c.tshirt or "") }, "|")
+    end
+    if key(cur) ~= key(entry.rig.clothing) then
+        if debugLog then
+            debugLog(fmt("uid=%d clothing changed (shirt=%s pants=%s tshirt=%s) "
+                .. "— re-extracting", entry.uid, tostring(cur.shirt),
+                tostring(cur.pants), tostring(cur.tshirt)))
+        end
+        entry.rig.clothing = cur
+        enqueueClothing(cur, entry.uid, entry.displayName)
     end
 end
 
@@ -2331,14 +2406,23 @@ function Tracker:snapshot(cfg, encode, debugLog)
                 if hasChar and char ~= entry.char then
                     self:_rebuildRefs(entry, p, encode, debugLog)
                 end
-                -- mid-recording equip & late mesh streaming: throttled
-                -- append-scan + asset rescan (~1/s). _rescanExistingAssets
-                -- catches Heads / accessories that captured as Block on
-                -- ENSURE because mesh content hadn't streamed in yet.
+                -- mid-recording equip & late mesh streaming & skin/rig swaps:
+                -- throttled (~1/s) append-scan + asset rescan + clothing
+                -- rescan. _rescanExistingAssets catches parts whose asset id
+                -- arrived late OR changed value (skin swap). _rescanClothing
+                -- catches mid-game clothing swaps. When _appendNewParts finds
+                -- genuinely new parts (the game inserting skin/tool meshes at
+                -- round start), we reopen the rescan settle window so changed
+                -- content on existing parts is re-checked alongside.
                 if hasChar and now - entry.lastScanClock >= 1.0 then
                     entry.lastScanClock = now
-                    self:_appendNewParts(entry, char, encode, debugLog)
+                    local added = self:_appendNewParts(entry, char, encode, debugLog)
+                    if added and added > 0 then
+                        entry.rescanSettled = false
+                        entry.consecutiveEmptyRescans = 0
+                    end
                     self:_rescanExistingAssets(entry, debugLog)
+                    self:_rescanClothing(entry, char, debugLog)
                 end
 
                 local inRange = true
