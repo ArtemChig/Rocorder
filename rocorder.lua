@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.10-alpha"
+local ROCORDER_VERSION = "1.9.11-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -556,27 +556,39 @@ end
 -- subarray encodes (verts / uvs / normals / faces) with paceExtractor()
 -- between them, so the work spreads across 2-4 frames instead of all
 -- happening in one.
+-- Manually encode a flat numeric array as JSON, pacing every CHUNK
+-- elements. HttpService:JSONEncode of a 30000-number array (10k-vert mesh's
+-- verts) blocks for ~20-40 ms in unbreakable C code; pacing AROUND that
+-- can't help. Doing tostring() in a Lua loop with periodic paceExtractor()
+-- yields lets us cut each encode into ~1 ms slices. tostring on a float
+-- produces JSON-valid number literals (digits, optional ., optional e exp).
+local _NUMARRAY_PACE_EVERY = 1000
+local function _encodeNumberArrayPaced(arr)
+    if not arr then return "null" end
+    local n = #arr
+    if n == 0 then return "[]" end
+    local pieces = table.create(n)
+    for i = 1, n do
+        pieces[i] = tostring(arr[i])
+        if i % _NUMARRAY_PACE_EVERY == 0 then paceExtractor() end
+    end
+    return "[" .. table.concat(pieces, ",") .. "]"
+end
+
 local function _encodeGeomChunked(geom)
     if type(geom) ~= "table" then return nil, "geom not a table" end
-    local pieces = { '{"format":"', geom.format or "ROCORDER-GEOM/1", '"' }
-    local function addArray(key, arr)
-        paceExtractor()
-        pieces[#pieces + 1] = ',"' .. key .. '":'
-        local ok, encoded = pcall(HttpService.JSONEncode, HttpService, arr)
-        if not ok or type(encoded) ~= "string" then
-            return false, "JSONEncode " .. key .. " failed: " .. tostring(encoded)
-        end
-        pieces[#pieces + 1] = encoded
-        return true
-    end
-    local ok, err
-    ok, err = addArray("verts",   geom.verts);   if not ok then return nil, err end
-    ok, err = addArray("uvs",     geom.uvs);     if not ok then return nil, err end
-    ok, err = addArray("normals", geom.normals); if not ok then return nil, err end
-    ok, err = addArray("faces",   geom.faces);   if not ok then return nil, err end
-    pieces[#pieces + 1] = "}"
+    -- format string is a literal; arrays go through the paced encoder.
     paceExtractor()
-    return table.concat(pieces)
+    local body = table.concat({
+        '{"format":"', geom.format or "ROCORDER-GEOM/1", '"',
+        ',"verts":',   _encodeNumberArrayPaced(geom.verts),
+        ',"uvs":',     _encodeNumberArrayPaced(geom.uvs),
+        ',"normals":', _encodeNumberArrayPaced(geom.normals),
+        ',"faces":',   _encodeNumberArrayPaced(geom.faces),
+        '}',
+    })
+    paceExtractor()
+    return body
 end
 
 -- Extract an image to raw RGBA8 bytes + a small text header. Filename ends in
@@ -961,11 +973,29 @@ local function _processOne(entry, dbg)
         err = err or lastErr
     end
 
-    _markEntryFailed(entry, ref == nil, dbg)
+    -- Was an in-engine extraction even possible? Clothing templates
+    -- (Shirt/Pants) enqueue with partInst = nil because they aren't
+    -- BaseParts — AssetService:CreateEditableImageAsync rejects their IDs,
+    -- so they ALWAYS go through HTTP. If THAT also failed it's an
+    -- inaccessible asset (off-sale UGC, private), not "player left".
+    local hadAnyPart = false
+    for _, r in ipairs(entry.partRefs) do
+        if r.inst then hadAnyPart = true; break end
+    end
+    local missed = hadAnyPart and (ref == nil)  -- true "player left"
+    _markEntryFailed(entry, missed, dbg)
     if dbg then
+        local tag
+        if not hadAnyPart then
+            tag = " (asset not publicly accessible — likely off-sale / "
+                .. "private clothing / restricted UGC)"
+        elseif ref == nil then
+            tag = " (player left before extraction)"
+        else
+            tag = ""
+        end
         dbg(fmt("  EXTRACT %s %s FAILED%s — %s",
-            entry.kind, entry.id,
-            (ref == nil) and " (player left before extraction)" or "",
+            entry.kind, entry.id, tag,
             tostring(err or "no path produced bytes")))
     end
     return false
