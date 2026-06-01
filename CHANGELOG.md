@@ -9,6 +9,41 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.9.23-alpha — 2026-06-01
+
+Two correctness fixes: no double-extraction, and mid-game rig/skin/clothing
+swaps are now caught.
+
+- **No asset is ever extracted twice.** A race could create a duplicate
+  queue entry: entry A is popped (removed from the dedup map) and is
+  mid-extraction — `EXTRACTED` not yet set, file not yet written — when a
+  second enqueue for the same id slips through (e.g. a t-shirt that's BOTH
+  a torso decal AND a clothing entry). The duplicate then re-ran the full
+  `CreateEditable*Async` + write ~10 s later (seen in the last log:
+  `1028594` extracted at t=0.4 and again at t=10.1). `_processOne` now has
+  a hard guard at the top: if the id is already extracted or cached, it's a
+  no-op (counters still reconciled). Nothing extracts or downloads twice.
+
+- **Mid-game skin / mesh swaps are detected.** `_rescanExistingAssets` only
+  caught assets that *appeared* where there were none (late streaming). If
+  a part's mesh/texture/colorMap *changed value* — which is exactly what
+  happens when a round starts and the game reskins a player — it was
+  silently missed. Now it compares full asset fingerprints and re-enqueues
+  on any change.
+
+- **Mid-game clothing swaps are detected.** Clothing was enqueued once at
+  ENSURE and never re-checked. New `_rescanClothing` re-reads each player's
+  Shirt / Pants / ShirtGraphic every throttled tick (cheap) and re-enqueues
+  if the template changed.
+
+- **The rescan window reopens when new parts appear.** When the game
+  inserts new skin/tool meshes mid-recording, `_appendNewParts` detects the
+  new parts and reopens the (previously-settled) rescan window so changed
+  content on *existing* parts is re-checked alongside. Combined with the
+  Character-swap path (`_rebuildRefs` already reopens), this covers the
+  "lobby → round start, everyone gets a new rig/skin/uniform" case for both
+  normal recording and Instant Replay.
+
 ## 1.9.22-alpha — 2026-06-01
 
 **Clothing templates now extract via the engine (EditableImage), bypassing
