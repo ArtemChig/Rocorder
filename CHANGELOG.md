@@ -9,6 +9,17 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.14.1-alpha — 2026-06-01
+
+- **Exact classic-clothing template coordinates.** 1.14.0's region rects were
+  eyeballed from the guide image and landed a few px off (visible UV
+  misalignment). Replaced with exact values computed from precise corner
+  reads off the official template + the 64px grid: torso FRONT (231,74),
+  right-limb L (19,355), left-limb F (308,355). All 18 face rects now sit on
+  the true cell boundaries, so the shirt/pants line up with the design.
+  (Per-face orientation unchanged — flip an entry in `_FACE_AXES` if a single
+  face still reads mirrored.)
+
 ## 1.14.0-alpha — 2026-06-01
 
 **Classic R6 2D clothing (Shirt / Pants) now wraps onto the box body** — the
