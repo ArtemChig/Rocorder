@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.9.20-alpha"
+local ROCORDER_VERSION = "1.9.21-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -482,10 +482,32 @@ do
     readyEvent.Name = "Ready"
     readyEvent.Parent = actor
 
-    actor.Parent = workspace
+    -- Choose a parent where script descendants will actually execute.
+    -- LocalScript under workspace DOES NOT auto-run; it requires a player
+    -- descendant ancestor (PlayerScripts, PlayerGui, Backpack, etc.) or a
+    -- few other privileged services. Prefer Players.LocalPlayer.
+    -- PlayerScripts if available; fall back to workspace (relies on the
+    -- Script.RunContext path below).
+    local actorParent = workspace
+    local lp = Players and Players.LocalPlayer
+    if lp then
+        local ps = lp:FindFirstChildOfClass("PlayerScripts")
+        if ps then actorParent = ps end
+    end
+    actor.Parent = actorParent
 
-    local workerScript = Instance.new("LocalScript")
+    -- Use `Script` with RunContext = Client rather than LocalScript. This
+    -- is the modern API and runs regardless of parent (LocalScripts won't
+    -- start under workspace). If Enum.RunContext doesn't exist on this
+    -- Roblox build (pre-2023ish), the assignment silently falls through
+    -- and we still have a regular Script — which only runs server-side
+    -- in legacy mode but under a client executor often gets injected
+    -- anyway.
+    local workerScript = Instance.new("Script")
     workerScript.Name = "Worker"
+    pcall(function()
+        workerScript.RunContext = Enum.RunContext.Client
+    end)
 
     -- Worker source. Inside an Actor's script, `task.desynchronize()` is
     -- a legitimate parallel context — and the editable APIs accept it.
