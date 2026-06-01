@@ -9,6 +9,39 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.15.3-alpha — 2026-06-02
+
+Two CharacterMesh rendering bugs the user spotted from the 1.15.2 import
+(both confirmed by inspecting the geom files): bodies were squashed/blocky
+and the shirt/pants textures splattered across the body wrong.
+
+- **Render CharacterMesh meshes at authored size (no bbox auto-fit).** The
+  importer was sending CharacterMesh through the MeshPart branch, which
+  stretches the mesh's bbox to match the BasePart's size. But CharacterMesh
+  meshes are sculpted at anatomical proportions (e.g. the captured torso
+  mesh bbox is ~1.33×1.85×0.84 while the BasePart is the standard R6
+  2×2×1) and Roblox renders them **as-is at the part's CFrame**, not
+  bbox-stretched. The mismatched stretch was distorting every body part
+  (torso wider, arms squished, legs stretched tall+thin) — exactly the
+  blocky/squashed look in the user's screenshot. Now CharacterMesh and
+  FileMesh both go through the `meshScale=[1,1,1]` path → meshes render at
+  the size they were sculpted.
+
+- **Don't substitute Shirt/Pants on CharacterMesh body parts.** 1.15.0
+  preferred the player's Shirt/Pants texture over the CharacterMesh's
+  `BaseTextureId` on body parts. That worked for the *old* "official"
+  CharacterMeshes (whose UVs happen to follow the R6 clothing template),
+  but game-authored CharacterMeshes (Violence District etc.) have
+  **sculpted-anatomical UVs that don't match the clothing template** —
+  painting the shirt across that layout splatters it nonsensically (the
+  texture screenshot the user shared). CharacterMesh parts now use their
+  own authored texture: `BaseTextureId` if present, otherwise plain
+  colour. The classic clothing-box wrapping still applies for *plain Block*
+  body parts (no CharacterMesh) — unchanged.
+
+These are importer-only changes; the rig.json from 1.15.2 already has the
+CharacterMesh data needed. Just reinstall the add-on and re-import.
+
 ## 1.15.2-alpha — 2026-06-02
 
 **1.15.0 CharacterMesh capture didn't survive the throttled rescan.** The
