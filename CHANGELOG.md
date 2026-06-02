@@ -9,6 +9,27 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.20.1-alpha — 2026-06-01
+
+Viewmodel weapon-swap splitting. The 1.20.0 import revealed the POV
+viewmodel had ballooned to **218 parts in a single life** —
+`HumanoidRootPart_2..14`, `LeftArm_2..14`, `Camera_2..14`, etc. Rivals
+tears down the entire hands+gun rig and builds a fresh one on every weapon
+swap, and since 1.19.7 locked onto the persistent container
+(`Workspace.ViewModels`), the recorder kept appending each rebuild's parts
+into one ever-growing entry. The spans hid the dead ones, but it was a
+218-object mess in one collection.
+
+Fix: the recorder now detects a rebuild — when (nearly) every part captured
+for the current viewmodel life has been destroyed — and rolls a **new
+life**, re-capturing the container's current contents. Each weapon draw is
+now its own bounded ~16–30 part rig in its own sub-collection, visibility
+keyframed to when it was equipped — the same per-life model players use on
+respawn, and the "separate them in different collections" the viewmodel
+work was meant to deliver. A minimum-life-age guard stops a 1-tick
+teardown blink from spawning micro-lives. Lock-on (no per-tick scanning)
+is preserved — re-capture only runs on an actual swap.
+
 ## 1.20.0-alpha — 2026-06-01
 
 Lifetime / per-part visibility. The first clean Rivals POV import revealed

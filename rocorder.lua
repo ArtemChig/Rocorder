@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.20.0-alpha"
+local ROCORDER_VERSION = "1.20.1-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -3153,6 +3153,10 @@ function Tracker:ensureViewmodel(vmodel, encode, debugLog)
     end
 
     self:_initSpans(entry, refs, encode)
+    entry.vmCoreRefs = {}
+    for _, r in ipairs(refs) do
+        if r.inst then entry.vmCoreRefs[#entry.vmCoreRefs + 1] = r.inst end
+    end
 
     if EXTRACT_OK then
         for i, r in ipairs(refs) do
@@ -3162,6 +3166,60 @@ function Tracker:ensureViewmodel(vmodel, encode, debugLog)
         end
     end
     return entry
+end
+
+-- Roll the viewmodel onto a new life by re-capturing its container's CURRENT
+-- contents. Called when every part we were tracking has been destroyed —
+-- Rivals (and most FPS games) tear down the entire hands+gun rig and build a
+-- fresh one on every weapon swap. Locked onto the persistent container we'd
+-- otherwise append each rebuild's parts forever (one Jun-01 test hit 218
+-- parts in a single "life" after ~14 swaps). Splitting on rebuild gives each
+-- weapon draw its own bounded rig in its own sub-collection — the same
+-- per-life model players already use on respawn. Returns true if a fresh rig
+-- was captured (false if the container is momentarily empty mid-teardown —
+-- caller just waits for the next tick).
+function Tracker:_viewmodelNewLife(entry, encode, debugLog)
+    local container = entry.char
+    if not container or not container.Parent then return false end
+    local rig, refs = captureViewmodelRig(container)
+    if not rig or not refs or #refs == 0 then return false end
+
+    local closeT = self.currentT or (entry.lifeFromT or 0)
+    entry.lifeHistory = entry.lifeHistory or {}
+    entry.lifeHistory[#entry.lifeHistory + 1] = {
+        fromT       = entry.lifeFromT or 0,
+        toT         = closeT,
+        rigType     = entry.rig.rigType,
+        parts       = entry.rig.parts,
+        partSpans   = self:_spansSnapshot(entry, closeT),
+        joints      = entry.rig.joints,
+        isViewmodel = true,
+        sourcePath  = entry.rig.sourcePath,
+    }
+    entry.rig         = rig
+    entry.refs        = refs
+    entry.last        = {}
+    entry.known       = {}
+    entry.partLost    = {}
+    entry.lifeFromT   = self.currentT or 0
+    entry.rescanSettled = false
+    entry.consecutiveEmptyRescans = 0
+    self:_initSpans(entry, refs, encode)
+    entry.vmCoreRefs = {}
+    for _, r in ipairs(refs) do
+        if r.inst then entry.vmCoreRefs[#entry.vmCoreRefs + 1] = r.inst end
+    end
+    if EXTRACT_OK then
+        for i, r in ipairs(refs) do
+            if r.inst then enqueuePartAssets(r.inst, rig.parts[i], VIEWMODEL_UID, "POV") end
+        end
+    end
+    if debugLog then
+        debugLog(fmt("viewmodel rebuilt (weapon swap) — life %d closed at "
+            .. "t=%.2fs, life %d started (%d parts)",
+            #entry.lifeHistory, closeT, #entry.lifeHistory + 1, #refs))
+    end
+    return true
 end
 
 function Tracker:snapshot(cfg, encode, debugLog)
@@ -3278,6 +3336,27 @@ function Tracker:snapshot(cfg, encode, debugLog)
             entry = nil
             if debugLog then
                 debugLog("viewmodel detached (previous Model gone)")
+            end
+        end
+
+        -- Rebuild detection (weapon swap). When every part captured for the
+        -- current life has been destroyed, the game tore the rig down to
+        -- build a new one — re-capture as a fresh life so each weapon draw is
+        -- its own bounded rig instead of accumulating into one giant entry.
+        -- Guarded by a minimum life age so a 1-tick all-dead blink between
+        -- teardown and rebuild doesn't spawn a micro-life.
+        if entry and entry.char and entry.char.Parent and entry.vmCoreRefs then
+            local core = #entry.vmCoreRefs
+            local alive = 0
+            for _, inst in ipairs(entry.vmCoreRefs) do
+                if inst and inst.Parent then alive = alive + 1 end
+            end
+            -- "Nearly all gone" rather than strictly zero, so one straggler /
+            -- shared part surviving the teardown still counts as a rebuild.
+            local deadEnough = alive <= math.max(0, math.floor(core * 0.1))
+            local lifeAge = (self.currentT or 0) - (entry.lifeFromT or 0)
+            if core > 0 and deadEnough and lifeAge > 0.2 then
+                self:_viewmodelNewLife(entry, encode, debugLog)
             end
         end
 
