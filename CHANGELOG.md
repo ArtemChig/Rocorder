@@ -9,6 +9,38 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.19.7-alpha — 2026-06-01
+
+1.19.6 landed the real fix — `ViewModelRoot` got rejected as static and
+the scan promptly found `Workspace.ViewModels` (29 parts, 15 joints, the
+live FPS rig). Gun parts started appending mid-recording
+(`SlidePrimary`, `BodyPrimary`, `MagazinePrimary`, `BoltPrimary`,
+`ReloadMagazinePrimary` — actual gun mechanism components), and the
+1.19.4 Decal-preload path picked up all the previously-failing
+composite-avatar clothing assets (`0 failed`). But two new problems
+showed up:
+
+1. **192 heartbeat stalls in a 46 s recording** — a 0.2 s stall every
+   ~0.2 s after detection. Root cause: `_findViewmodel()` ran every
+   tick (30 Hz), each call walking every scan-location descendant and
+   running `_viewmodelVerdict` on every Model found (which itself does
+   `inst:GetDescendants()` to count parts and check player-body
+   overlap). Once locked onto `Workspace.ViewModels` (30+ parts,
+   deeply nested), the per-tick cost hit ~0.2 s.
+
+2. **6 viewmodel lives across one recording**, flipping between
+   `Workspace.ViewModels` (parent) and `Workspace.ViewModels.FirstPerson`
+   (child). The verdict's 40-part ceiling kept flapping past the
+   threshold as Rivals tore down and rebuilt the rig on weapon swap, so
+   the find loop picked a different qualifying candidate each time.
+
+Both fixed by one change: lock on. Once a live entry exists, skip
+`_findViewmodel` entirely and reuse `entry.char` until self-heal drops
+it (Model `.Parent` goes nil). Animating the parent IS animating the
+child (same descendants captured), so locking onto the first match
+loses nothing. Eliminates the per-tick scan cost and stops the
+parent↔child flap producing the multi-life rig.
+
 ## 1.19.6-alpha — 2026-06-01
 
 1.19.5 shipped with the rejection-list logic but the keys didn't match,
