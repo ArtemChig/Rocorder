@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.19.3-alpha"
+local ROCORDER_VERSION = "1.19.4-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -1641,6 +1641,29 @@ local function _processOne(entry, dbg)
             dbg(fmt("  EXTRACT image %s via EditableImage (clothing/no-part path)",
                 entry.id))
         end
+
+        -- (4) Decal-preload fallback. Forces ContentProvider:PreloadAsync to
+        -- actually fetch the bytes if the client hasn't rendered them yet
+        -- (which happens on composite-rendered avatar clothing — the client
+        -- gets the pre-baked composite PNG, not the source shirt/pants, so
+        -- Content.fromUri above had nothing in cache to read). The Decal
+        -- path attaches a Decal whose Texture = rbxassetid://<id>, awaits
+        -- PreloadAsync, then EditableImages it through Content.fromObject.
+        -- Only meaningful for IMAGES — meshes will fail at "could not set
+        -- Decal.Texture" and we fall straight through to HTTP, same as
+        -- before.
+        if not body then
+            local b, e = _extractImageViaDecal("rbxassetid://" .. entry.id, dbg)
+            if b then
+                body = b; err = nil
+                if dbg then
+                    dbg(fmt("  EXTRACT image %s via Decal preload", entry.id))
+                end
+            elseif dbg then
+                dbg(fmt("  EXTRACT image %s Decal preload failed: %s",
+                    entry.id, tostring(e)))
+            end
+        end
     end
 
     if body then
@@ -3167,6 +3190,25 @@ function Tracker:snapshot(cfg, encode, debugLog)
             _viewmodelDiagnostic(debugLog, self._vmDiagGate)
         end
         if entry and entry.char == vmodel then
+            -- Mid-recording equip / late streaming: same throttled scan we
+            -- run for players. Real FPS viewmodels almost always swap parts
+            -- after first detection — a gun gets welded into the LeftItem /
+            -- RightItem placeholders when the player equips, or the engine
+            -- streams in MeshId / TextureID after the initial structure
+            -- appears. Previously we captured the part list ONCE in
+            -- ensureViewmodel and never looked again, so equipped weapons
+            -- never made it into the rig. Reuses _appendNewParts (new
+            -- BaseParts) and _rescanExistingAssets (late mesh / texture
+            -- streaming on existing refs) exactly like the player branch.
+            if now - (entry.lastScanClock or 0) >= 1.0 then
+                entry.lastScanClock = now
+                local added = self:_appendNewParts(entry, vmodel, encode, debugLog)
+                if added and added > 0 then
+                    entry.rescanSettled = false
+                    entry.consecutiveEmptyRescans = 0
+                end
+                self:_rescanExistingAssets(entry, debugLog)
+            end
             -- only emit when the viewmodel currently exists (Camera child
             -- present); when the viewmodel is detached we just skip the row
             -- for this frame — keeps it absent from any post-detach scenes.

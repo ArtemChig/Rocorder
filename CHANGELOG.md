@@ -9,6 +9,43 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.19.4-alpha — 2026-06-01
+
+Two viewmodel-and-asset findings from the first successful Rivals capture
+(`ViewModelRoot` detected at t=0.265, 8 bones × 272 keyframes — but no
+gun in the rig and the arms looked static).
+
+1. **Viewmodel never re-scanned for new parts mid-recording.** Players
+   already get a throttled `_appendNewParts` + `_rescanExistingAssets`
+   pass every ~1 s, which is how mid-game tool equips and late-streaming
+   skins make it into the rig. The viewmodel branch in `snapshot()` was
+   missing this entirely — `ensureViewmodel` captured the part list at
+   first sighting and bailed on every later tick. So in Rivals, the
+   `LeftItem` / `RightItem` placeholders were captured empty and the gun
+   model that gets welded in at weapon equip never entered the rig. Now
+   the same throttled scan runs on the viewmodel: equipped weapons get
+   appended as new bones, late-streaming asset IDs on existing parts get
+   re-enqueued. This is why "arms imported but no gun" — the gun parts
+   literally weren't in the rig.
+
+2. **Clothing extraction had no PreloadAsync hint.** The 1.9.22
+   clothing-via-EditableImage path tries 3 ref forms (stored URL,
+   `rbxassetid://<id>`, live `Shirt.ShirtTemplate`), all via
+   `Content.fromUri` → `CreateEditableImageAsync`. None of those force
+   the engine to actually fetch the bytes — they rely on the client
+   already having them cached. Composite-rendered avatar clothing breaks
+   that assumption: the client receives the pre-baked composite PNG,
+   not the source shirt/pants files, so all three ref forms find empty
+   cache and fail. Added a final fallback that uses the Decal preload
+   route (the same one `_extractImageViaDecal` already uses for sculpted
+   classic-clothing): attach a Decal with `Texture = rbxassetid://<id>`,
+   `ContentProvider:PreloadAsync` it (time-bounded 5 s), then extract
+   via `Content.fromObject` → `CreateEditableImageAsync`. Mesh assets
+   silently fail the Decal.Texture set and fall through to HTTP as
+   before, so this only kicks in for images. Won't recover assets that
+   are genuinely CDN-blocked (those still land in `_missing.txt`), but
+   covers the "engine could fetch this if we asked it to" gap.
+
 ## 1.19.3-alpha — 2026-06-01
 
 Rivals viewmodel detection, take three. The 1.19.2 diagnostic dump fired
