@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.19.6-alpha"
+local ROCORDER_VERSION = "1.19.7-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -3182,7 +3182,6 @@ function Tracker:snapshot(cfg, encode, debugLog)
     -- rigData → rig.json revisions) is shared with players.
     if cfg.CAPTURE_VIEWMODEL ~= false then
         self._vmRejectedPaths = self._vmRejectedPaths or {}
-        local vmodel = _findViewmodel(self._vmRejectedPaths)
         local entry = self.tracked[VIEWMODEL_UID]
         -- Self-heal: if the prior viewmodel is gone (Model destroyed or its
         -- char field no longer matches anything we'd accept), forget it so
@@ -3195,6 +3194,30 @@ function Tracker:snapshot(cfg, encode, debugLog)
                 debugLog("viewmodel detached (previous Model gone)")
             end
         end
+
+        -- Find a viewmodel candidate, but ONLY when we don't already have
+        -- a live entry. _findViewmodel walks every scan-location descendant
+        -- and runs the verdict heuristic on every Model it finds
+        -- (each verdict calls inst:GetDescendants() to count BaseParts /
+        -- Motor6Ds / MeshParts and check the player-body overlap set).
+        -- Once locked onto Workspace.ViewModels (Rivals' live FPS rig — 30+
+        -- parts, deeply nested), the per-tick cost was ~0.2 s per call,
+        -- producing 5 heartbeat stalls per second for the rest of the
+        -- recording (192 stalls in 46 s). Caching entry.char and reusing it
+        -- until self-heal drops it eliminates the cost entirely. Side
+        -- benefit: stops the swap-flap where the verdict's part-count
+        -- threshold flips us back and forth between a parent Model
+        -- (Workspace.ViewModels) and its child (Workspace.ViewModels.
+        -- FirstPerson) every few seconds, producing a messy 6-life rig.
+        -- Animating the parent IS animating the child (same descendants),
+        -- so locking on the first match loses nothing.
+        local vmodel
+        if entry then
+            vmodel = entry.char
+        else
+            vmodel = _findViewmodel(self._vmRejectedPaths)
+        end
+
         if vmodel then
             entry = self:ensureViewmodel(vmodel, encode, debugLog) or entry
         elseif debugLog then
