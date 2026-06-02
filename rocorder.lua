@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.19.4-alpha"
+local ROCORDER_VERSION = "1.19.5-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2292,7 +2292,7 @@ local function _viewmodelScanLocations()
     if _VM_SCAN_LOCATIONS then return _VM_SCAN_LOCATIONS end
     local locs = {}
     locs[#locs + 1] = { name = "workspace.Camera",
-        get = function() return workspace.CurrentCamera end, depth = 3 }
+        get = function() return workspace.CurrentCamera end, depth = 5 }
     locs[#locs + 1] = { name = "ReplicatedFirst",
         get = function()
             local ok, r = pcall(function() return game:GetService("ReplicatedFirst") end)
@@ -2313,7 +2313,12 @@ local function _viewmodelScanLocations()
     return locs
 end
 
-local function _findViewmodel()
+-- rejectedPaths (optional) is a table keyed by source-path string. Any
+-- candidate whose path matches is skipped — used by the static-template
+-- rejection in Tracker:snapshot so a sleeping storage rig (Rivals'
+-- PlayerScripts.Assets.Misc.ViewModelRoot is the example we keep tripping
+-- on) doesn't get re-picked tick after tick.
+local function _findViewmodel(rejectedPaths)
     local playerBodySet = {}
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Character then
@@ -2327,10 +2332,12 @@ local function _findViewmodel()
         local root = loc.get()
         _walkLimited(root, loc.depth, function(inst, fullPath)
             if inst:IsA("Model") then
+                local fp = loc.name .. fullPath:sub(#loc.name + 1, -1)
+                if rejectedPaths and rejectedPaths[fp] then return end
                 local ok = _viewmodelVerdict(inst, playerBodySet)
                 if ok then
                     foundModel = inst
-                    foundPath = loc.name .. fullPath:sub(#loc.name + 1, -1)
+                    foundPath = fp
                     return true   -- stop walking
                 end
             end
@@ -3168,7 +3175,8 @@ function Tracker:snapshot(cfg, encode, debugLog)
     -- with VIEWMODEL_UID as the key. Other tracker plumbing (life splits,
     -- rigData → rig.json revisions) is shared with players.
     if cfg.CAPTURE_VIEWMODEL ~= false then
-        local vmodel = _findViewmodel()
+        self._vmRejectedPaths = self._vmRejectedPaths or {}
+        local vmodel = _findViewmodel(self._vmRejectedPaths)
         local entry = self.tracked[VIEWMODEL_UID]
         -- Self-heal: if the prior viewmodel is gone (Model destroyed or its
         -- char field no longer matches anything we'd accept), forget it so
@@ -3225,6 +3233,63 @@ function Tracker:snapshot(cfg, encode, debugLog)
             entries[#entries+1] = tostring(VIEWMODEL_UID) .. ":" .. table.concat(parts, "|")
             entry.ticks += 1
             entry.lastSeenClock = now
+
+            -- Static-template detection. We keep tripping on Rivals'
+            -- `PlayerScripts.Assets.Misc.ViewModelRoot` — an anchored
+            -- storage rig sitting at a fixed map coordinate
+            -- (173.835, 17.000, -48.753 in the Jun-01 test). The actual
+            -- rendered viewmodel is wherever Rivals' render-step script
+            -- clones / drives the real one. CFrame sampling on the storage
+            -- rig produces 879 identical frames, so the import looks like
+            -- a static mannequin and the gun (which lives in the *real*
+            -- viewmodel, not the template) never makes it in.
+            --
+            -- Sample the root's position at first emit; after ~2 s of
+            -- ticks, if it hasn't budged by 0.001 stud, the verdict is
+            -- "this is a template" — add it to the rejected list, drop
+            -- the entry, and force the diagnostic dump so the user sees
+            -- the next candidate. The rejection survives the rest of the
+            -- session (per Tracker), so _findViewmodel walks past it
+            -- next tick and either finds something real or returns nil
+            -- (in which case the diagnostic dump shows what else exists).
+            if not entry._motionVerdict then
+                local rootRef = entry.refs[1]
+                local rootInst = rootRef and rootRef.inst
+                if rootInst and rootInst:IsA("BasePart") then
+                    local p = rootInst.Position
+                    if not entry._motionBaselinePos then
+                        entry._motionBaselinePos = p
+                        entry._motionBaselineTick = entry.ticks
+                    elseif entry.ticks - entry._motionBaselineTick >= 60 then
+                        -- ~2 s @ 30 Hz. Tick rate could differ; if a user
+                        -- runs at 10 Hz it's a longer real-time window
+                        -- (still fine — anchored templates never move at
+                        -- all, the verdict is unambiguous).
+                        local moved = (p - entry._motionBaselinePos).Magnitude > 0.001
+                        if moved then
+                            entry._motionVerdict = "moving"
+                        else
+                            entry._motionVerdict = "static"
+                            local path = (entry.rig and entry.rig.sourcePath) or "?"
+                            if debugLog then
+                                debugLog(fmt("viewmodel at %s appears STATIC "
+                                    .. "after %d ticks (root frozen at "
+                                    .. "%.3f,%.3f,%.3f) — likely storage "
+                                    .. "template, NOT the rendered FPS rig. "
+                                    .. "Adding to rejection list and re-scanning.",
+                                    path, entry.ticks - entry._motionBaselineTick,
+                                    p.X, p.Y, p.Z))
+                            end
+                            self._vmRejectedPaths[path] = true
+                            self.tracked[VIEWMODEL_UID] = nil
+                            -- Force the diagnostic dump on the next tick
+                            -- when no viewmodel is found, so the user sees
+                            -- what other candidates exist.
+                            self._vmDiagGate = { done = false }
+                        end
+                    end
+                end
+            end
         end
     end
 
