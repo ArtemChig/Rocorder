@@ -9,6 +9,34 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.19.3-alpha — 2026-06-01
+
+Rivals viewmodel detection, take three. The 1.19.2 diagnostic dump fired
+on the next test and pointed at the actual target:
+
+```
+LocalPlayer.PlayerScripts.Assets.Misc.ViewModelRoot  =>  has anchored part(s)
+```
+
+Rivals stores its FPS hands+gun at `PlayerScripts.Assets.Misc.ViewModelRoot`
+— the name literally contains "ViewModel" — but my heuristic rejected it
+because the template ships with anchored parts that the game un-anchors at
+weapon equip. So my strict "no anchored parts ever" rule was wrong for
+this (and probably most) games.
+
+Fix: **name-priority detection**. If a Model's name contains a viewmodel
+keyword (`viewmodel`, `viewmodelroot`, `fpscamera`, `armmodel`, `armsmodel`,
+`firstperson`, `fpsrig`, `fpsmodel`, `view_model`), we trust the name and
+skip the anchored / Motor6D / MeshPart requirements. Hard rejects still
+apply (no Humanoid, no dummy/preview/placeholder name, no parts shared
+with a player Character, ≤40 parts). Models that don't match a keyword
+still go through the original strict heuristic.
+
+Also: `captureViewmodelRig` no longer filters out anchored parts. If a
+viewmodel ships some of its template parts anchored, capture them anyway —
+their CFrame is recorded each tick, so they simply don't move if they
+stay anchored, which is correct.
+
 ## 1.19.2-alpha — 2026-06-02
 
 Two viewmodel-detection bugs from 1.19.1's first Rivals run:

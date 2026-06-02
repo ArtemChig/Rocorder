@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.19.2-alpha"
+local ROCORDER_VERSION = "1.19.3-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2177,17 +2177,35 @@ end
 -- ============================================================================
 local VIEWMODEL_UID = -1  -- sentinel; player UserIds are always positive
 
--- Returns (verdict, reason_string) so we can both detect AND diagnose. A
--- candidate must be a Model that has BaseParts + Motor6Ds + at least one
--- MeshPart, none anchored, no BaseParts shared with any player's Character,
--- AND has no Humanoid (real FPS viewmodels don't — anything with a
--- Humanoid is a character preview / NPC dummy / emote dummy). Also rejects
--- Models with too many parts (>40, real viewmodels are hands + gun = ~5-20).
--- The reason string is "ok" on accept or a short failure tag otherwise.
+-- Returns (verdict, reason_string) so we can both detect AND diagnose.
+--
+-- Two acceptance paths:
+--   1. Name-priority: if the Model's name contains a viewmodel keyword
+--      ("viewmodel", "viewmodelroot", "armmodel", "fpscamera", etc.), we
+--      trust the name. Anchored parts and missing Motor6Ds are allowed
+--      because games often ship the viewmodel as a template that gets
+--      unanchored / welded at runtime when a weapon is equipped (Rivals
+--      does this with `PlayerScripts.Assets.Misc.ViewModelRoot`).
+--   2. Heuristic: a Model that has BaseParts + Motor6Ds + at least one
+--      MeshPart, none anchored, no BaseParts shared with any player's
+--      Character, no Humanoid, sensible name, sensible part count.
+local _VM_NAME_KEYWORDS = {
+    "viewmodel", "view_model", "viewmodelroot", "fpscamera", "armmodel",
+    "armsmodel", "firstperson", "fpsrig", "fpsmodel",
+}
+local function _nameMatchesViewmodel(name)
+    local lname = name:lower()
+    for _, kw in ipairs(_VM_NAME_KEYWORDS) do
+        if lname:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
 local function _viewmodelVerdict(inst, playerBodySet)
     if not inst then return false, "nil" end
     if not inst:IsA("Model") then return false, "not Model" end
-    -- Cheap structural rejects first.
+    -- Always reject Humanoid-bearing Models (those are characters / NPCs /
+    -- emote dummies, never real FPS viewmodels).
     if inst:FindFirstChildOfClass("Humanoid") then
         return false, "has Humanoid (character/dummy, not a viewmodel)"
     end
@@ -2196,6 +2214,7 @@ local function _viewmodelVerdict(inst, playerBodySet)
             or lname:find("placeholder") then
         return false, "name suggests dummy/preview"
     end
+    -- Count parts + flags regardless of which path accepts.
     local hasMotor6D, hasMeshPart, hasBasePart = false, false, false
     local anchored, sharedWithPlayer = false, false
     local nParts, nMesh, nMotor = 0, 0, 0
@@ -2209,14 +2228,23 @@ local function _viewmodelVerdict(inst, playerBodySet)
             hasMotor6D = true; nMotor = nMotor + 1
         end
     end
+    -- Hard rejects (apply to BOTH paths).
     if sharedWithPlayer then return false, "shares parts with a Player.Character" end
-    if anchored then return false, "has anchored part(s)" end
     if not hasBasePart then return false, "no BaseParts" end
-    if not hasMeshPart then return false, "no MeshPart" end
-    if not hasMotor6D then return false, "no Motor6D" end
     if nParts > 40 then
         return false, fmt("too many parts (%d > 40, looks like a full character)", nParts)
     end
+    -- Path 1: name match. Skip the anchored / Motor6D / MeshPart checks
+    -- because games often have the viewmodel start anchored and un-anchor
+    -- it when the weapon equips.
+    if _nameMatchesViewmodel(inst.Name) then
+        return true, fmt("ok by name (parts=%d mesh=%d motor=%d anchored=%s)",
+            nParts, nMesh, nMotor, tostring(anchored))
+    end
+    -- Path 2: strict heuristic.
+    if anchored then return false, "has anchored part(s)" end
+    if not hasMeshPart then return false, "no MeshPart" end
+    if not hasMotor6D then return false, "no Motor6D" end
     return true, fmt("ok (parts=%d mesh=%d motor=%d)", nParts, nMesh, nMotor)
 end
 
@@ -2351,7 +2379,13 @@ local function captureViewmodelRig(vmodel)
         return cand
     end
     for _, desc in ipairs(vmodel:GetDescendants()) do
-        if desc:IsA("BasePart") and not desc.Anchored then
+        if desc:IsA("BasePart") then
+            -- Anchored parts kept: in name-matched viewmodels (Rivals
+            -- ViewModelRoot etc.) the template ships with anchored parts
+            -- that the game un-anchors at weapon equip. We want to capture
+            -- them from the start so the armature has the right bone set.
+            -- Their CFrame is still recorded each tick; if they stay
+            -- anchored they simply never move, which is correct.
             local nm = uniqueName(desc.Name)
             rig.parts[#rig.parts + 1] = partInfo(desc, nm)
             refs[#refs + 1] = { name = nm, inst = desc }
