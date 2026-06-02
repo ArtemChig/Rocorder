@@ -9,6 +9,27 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.19.6-alpha — 2026-06-01
+
+1.19.5 shipped with the rejection-list logic but the keys didn't match,
+so the rejection never stuck. The log showed 11 cycles of "detected →
+static after 60 ticks → adding to rejection list → re-detected" for the
+same `ViewModelRoot` over a 26 s recording (one cycle every 2 s). The
+diagnostic dump never fired because *something* was always detected.
+
+The mismatch: `captureViewmodelRig` stores `rig.sourcePath =
+vmodel:GetFullName()` (e.g. `Players.foidgrapst67.PlayerScripts...
+ViewModelRoot`) and the snapshot loop added that string to the
+rejection set, but `_findViewmodel` was building its own synthetic
+`<loc.name>.<descendant chain>` for the comparison (e.g.
+`LocalPlayer.PlayerScripts...ViewModelRoot`). Different strings, never
+equal, rejection ignored.
+
+Fix: `_findViewmodel` now keys the rejection check on
+`inst:GetFullName()` directly. Same string both sides → rejection
+actually sticks → after the first 2 s verdict the path stays skipped
+and the diagnostic dump fires.
+
 ## 1.19.5-alpha — 2026-06-01
 
 The 1.19.4 fixes shipped but the user's next Rivals test still showed

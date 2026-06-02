@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.19.5-alpha"
+local ROCORDER_VERSION = "1.19.6-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2332,12 +2332,18 @@ local function _findViewmodel(rejectedPaths)
         local root = loc.get()
         _walkLimited(root, loc.depth, function(inst, fullPath)
             if inst:IsA("Model") then
-                local fp = loc.name .. fullPath:sub(#loc.name + 1, -1)
-                if rejectedPaths and rejectedPaths[fp] then return end
+                -- Rejection key MUST be inst:GetFullName() — that's what
+                -- captureViewmodelRig stores as rig.sourcePath and what
+                -- Tracker:snapshot adds to rejectedPaths when it verdicts
+                -- a candidate as static. The old synthetic
+                -- `loc.name + path` string never matched, so rejected
+                -- templates kept getting re-locked on every tick.
+                local key = inst:GetFullName()
+                if rejectedPaths and rejectedPaths[key] then return end
                 local ok = _viewmodelVerdict(inst, playerBodySet)
                 if ok then
                     foundModel = inst
-                    foundPath = fp
+                    foundPath = loc.name .. fullPath:sub(#loc.name + 1, -1)
                     return true   -- stop walking
                 end
             end
