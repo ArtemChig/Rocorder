@@ -9,6 +9,45 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.19.5-alpha — 2026-06-01
+
+The 1.19.4 fixes shipped but the user's next Rivals test still showed
+static arms and no gun. Reading the actual `.rec` for the viewmodel rows
+nailed it: at t=0.054, t=13.354, and t=29.388, every part is at the
+same world position (e.g. root at `173.835, 17.000, -48.753` for all
+879 frames). The detection wasn't off — it was just locked onto the
+wrong Model. `PlayerScripts.Assets.Misc.ViewModelRoot` is Rivals'
+**storage template** sitting at a fixed map coordinate, never animated.
+The actual rendered viewmodel lives elsewhere (probably under
+`workspace.Camera` or a render-stepped clone), and we never looked for
+it because the first match wins.
+
+Three changes:
+
+1. **Static-template detection.** Each tick the viewmodel branch
+   samples the root part's position. After ~60 ticks (~2 s at 30 Hz)
+   with zero motion, the entry is verdict'd `static`, the source path
+   is added to a per-Tracker rejection list, the entry is dropped, and
+   the diagnostic gate is reset so it re-fires on the next empty scan.
+
+2. **`_findViewmodel` honors a rejection set.** Once a path is
+   rejected as a static template, the scanner walks past it without
+   re-locking. So after the 2 s verdict, the next tick either finds a
+   different (real) candidate or returns nil and the diagnostic dump
+   prints — either way the user makes progress next recording.
+
+3. **`workspace.Camera` scan depth raised from 3 to 5.** Live
+   viewmodels parented under Camera can sit a couple Folders deep;
+   depth 3 wasn't enough to reach them. Other scan locations
+   unchanged.
+
+Next test should produce one of:
+- A "viewmodel at PlayerScripts...ViewModelRoot appears STATIC" line,
+  followed by detection of a different (real) viewmodel, OR
+- The same STATIC line followed by a fresh diagnostic dump listing
+  every Model the scan considered — that'll point at where Rivals
+  actually puts the live FPS rig.
+
 ## 1.19.4-alpha — 2026-06-01
 
 Two viewmodel-and-asset findings from the first successful Rivals capture
