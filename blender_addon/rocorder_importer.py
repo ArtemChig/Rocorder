@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 19, 7),
+    "version": (1, 20, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.19.7-alpha"
+ROCORDER_VERSION = "1.20.0-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)
@@ -1316,6 +1316,7 @@ def _build_part_object(part, name, place, scale, assets, import_meshes,
         mesh.materials.append(m)
 
     obj = bpy.data.objects.new(name, mesh)
+    obj["rocorder_part_name"] = name   # used by the per-part visibility pass
     collection.objects.link(obj)
     vg = obj.vertex_groups.new(name=name)
     vg.add(list(range(len(mesh.vertices))), 1.0, "REPLACE")
@@ -1326,6 +1327,77 @@ def _build_part_object(part, name, place, scale, assets, import_meshes,
     mod.use_vertex_groups = True
     obj["rocorder_bone"] = name
     return obj, kind
+
+
+# ----------------------------------------------------------------------------
+# Per-part visibility (lifetime) — keyframe hide_viewport + hide_render so a
+# part is only visible during the time windows it actually existed in-game.
+# Drives three things: dead lives' parts/accessories disappear, equipped tools
+# come and go, and POV viewmodel guns vanish when swapped instead of floating.
+# ----------------------------------------------------------------------------
+def _merge_frame_intervals(iv):
+    """Merge overlapping/adjacent (f_start, f_end|None) intervals. None = open
+    to the end (absorbs everything after it)."""
+    if not iv:
+        return iv
+    iv = sorted(iv, key=lambda x: x[0])
+    merged = [iv[0]]
+    for s, e in iv[1:]:
+        ls, le = merged[-1]
+        if le is None:
+            break  # already open to end
+        if s <= le:
+            merged[-1] = (ls, None if e is None else max(le, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _windows_to_frame_intervals(windows, fps):
+    """Convert [(fromT, toT|None), ...] in seconds to merged frame intervals
+    [(f_start, f_end|None), ...]. f_end is the first hidden frame (exclusive);
+    None means visible to the end of the recording."""
+    out = []
+    for wf, wt in windows:
+        f_start = max(1, int(round((wf or 0.0) * fps)) + 1)
+        f_end = None if wt is None else (int(round(wt * fps)) + 1)
+        if f_end is not None and f_end <= f_start:
+            continue  # zero/negative length — skip
+        out.append((f_start, f_end))
+    return _merge_frame_intervals(out)
+
+
+def _keyframe_visibility(obj, windows, fps, last_frame):
+    """Keyframe hide_viewport + hide_render (CONSTANT interp) so `obj` is
+    visible only during `windows` (list of (fromT, toT|None) seconds)."""
+    iv = _windows_to_frame_intervals(windows, fps)
+
+    # Always-visible fast path: one interval covering [<=1 .. end]. Leave the
+    # object un-keyframed (no clutter for the common whole-recording part).
+    if len(iv) == 1 and iv[0][0] <= 1 and iv[0][1] is None:
+        return
+
+    def setvis(frame, hidden):
+        obj.hide_viewport = hidden
+        obj.hide_render = hidden
+        obj.keyframe_insert(data_path="hide_viewport", frame=frame)
+        obj.keyframe_insert(data_path="hide_render", frame=frame)
+
+    if not iv:
+        setvis(1, True)  # never present → hidden the whole time
+    else:
+        if iv[0][0] > 1:
+            setvis(1, True)
+        for f_start, f_end in iv:
+            setvis(f_start, False)
+            if f_end is not None and f_end <= last_frame:
+                setvis(f_end, True)
+
+    if obj.animation_data and obj.animation_data.action:
+        for fc in obj.animation_data.action.fcurves:
+            if fc.data_path in ("hide_viewport", "hide_render"):
+                for kp in fc.keyframe_points:
+                    kp.interpolation = "CONSTANT"
 
 
 # ----------------------------------------------------------------------------
@@ -1367,6 +1439,7 @@ def _expand_lives(rig_players, log):
                     "displayName": display,
                     "rigType": rev.get("rigType"),
                     "parts": rev.get("parts", []),
+                    "partSpans": rev.get("partSpans"),
                     "joints": rev.get("joints", []),
                     "clothing": rev.get("clothing"),
                     "characterMeshes": rev.get("characterMeshes"),
@@ -2167,43 +2240,54 @@ def import_replay(context, filepath, scale, set_fps, build_armature,
     scene.frame_end = last_frame
     scene.frame_current = 1
 
-    # Per-life visibility keyframes. Only players with >1 life get them: the
-    # life is visible during [fromT, toT] and hidden outside. Without these,
-    # all of a player's lives would render simultaneously on top of each
-    # other. The visibility is keyed on hide_viewport and hide_render with
-    # CONSTANT (step) interpolation so it switches instantly at the boundary.
+    # Visibility / lifetime keyframes. Each part object is shown only during
+    # the presence spans the recorder captured for it (RIG/3 partSpans), so:
+    #   - a dead life's parts + accessories disappear at the death boundary,
+    #   - tools equipped/dropped mid-life come and go,
+    #   - POV viewmodel guns vanish when swapped instead of floating forever.
+    # Keyed on BOTH hide_viewport and hide_render (CONSTANT interp) so the
+    # viewport isn't flooded with hidden-in-render-only junk. Older recordings
+    # with no partSpans fall back to the whole-life window (so multi-life
+    # players still hide correctly; single-life parts stay always-visible).
+    vis_part_keyed = 0
     for (uid, life_idx), built in players.items():
         li = built.get("life_info")
-        if not li or li["n_lives"] <= 1:
-            continue
-        arm = built["arm"]
-        fromT = li["fromT"]
-        toT = li["toT"]
-        # Frame numbers (clamped into scene range). +1 because frame_num
-        # in the frame loop is `int(round(t * fps)) + 1`.
-        f_from = max(1, int(round(fromT * fps)) + 1)
-        f_to = (int(round(toT * fps)) + 1) if toT is not None else (last_frame + 1)
-        # Helper: keyframe both hide_viewport and hide_render at `frame` with
-        # the given value, then force CONSTANT interpolation on those keys.
-        def _set_vis(obj, frame, hidden):
-            obj.hide_viewport = hidden
-            obj.hide_render = hidden
-            obj.keyframe_insert(data_path="hide_viewport", frame=frame)
-            obj.keyframe_insert(data_path="hide_render", frame=frame)
-        # Before life: hidden.
-        if f_from > 1:
-            _set_vis(arm, 1, True)
-        # Life begins.
-        _set_vis(arm, f_from, False)
-        # Life ends — only if it actually closed (toT not None).
-        if toT is not None and f_to <= last_frame + 1:
-            _set_vis(arm, f_to, True)
-        # Step interpolation so visibility flips instantly at the boundary.
-        if arm.animation_data and arm.animation_data.action:
-            for fc in arm.animation_data.action.fcurves:
-                if fc.data_path in ("hide_viewport", "hide_render"):
-                    for kp in fc.keyframe_points:
-                        kp.interpolation = "CONSTANT"
+        rig = (li.get("rig") if li else None) or {}
+        rig_parts = rig.get("parts") or []
+        part_spans = rig.get("partSpans")
+        fromT = float(li["fromT"]) if li else 0.0
+        toT = li["toT"] if li else None
+        n_lives = li["n_lives"] if li else 1
+
+        # Map part NAME -> its spans. parts[] and partSpans[] are parallel in
+        # the rig record; mapping by name (not index) is robust against the
+        # name-filtering and bone-rename steps build_player applies.
+        spans_by_name = {}
+        if part_spans is not None:
+            for j, p in enumerate(rig_parts):
+                nm = p.get("name")
+                if nm is not None and j < len(part_spans):
+                    spans_by_name[nm] = part_spans[j]
+
+        for obj in built["part_objs"]:
+            name = obj.get("rocorder_part_name")
+            if part_spans is not None and name in spans_by_name:
+                raw = spans_by_name[name] or []
+                windows = [(s[0], (s[1] if len(s) > 1 else None)) for s in raw]
+            else:
+                windows = [(fromT, toT)]  # backward compat: whole-life window
+            had_anim = bool(obj.animation_data and obj.animation_data.action)
+            _keyframe_visibility(obj, windows, fps, last_frame)
+            now_anim = bool(obj.animation_data and obj.animation_data.action)
+            if now_anim and not had_anim:
+                vis_part_keyed += 1
+
+        # Armature object: hide its skeleton outside the life window so a dead
+        # life's bones don't clutter the viewport (render ignores bare rigs).
+        if n_lives > 1:
+            _keyframe_visibility(built["arm"], [(fromT, toT)], fps, last_frame)
+
+    log("visibility: {} part objects got lifetime keyframes".format(vis_part_keyed))
 
     # ============ END-OF-IMPORT DIAGNOSTICS ============
     log("")

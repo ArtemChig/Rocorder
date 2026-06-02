@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.19.7-alpha"
+local ROCORDER_VERSION = "1.20.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -2846,6 +2846,100 @@ function Tracker:_rescanClothing(entry, char, debugLog)
     end
 end
 
+----------------------------------------------------------------
+-- Per-part presence spans (1.20.0) — the "lifetime" feature.
+--
+-- A part isn't necessarily present for the whole of its rig's life: tools
+-- get equipped/unequipped, and a POV viewmodel re-welds a fresh gun on every
+-- weapon swap (the old gun's parts are destroyed, new ones attach). Without
+-- presence tracking the importer kept every part visible forever — dead
+-- players' accessories lingered and every gun the player ever held floated
+-- in the scene at its last position.
+--
+-- We record, per part, the [from, to] time windows during which it actually
+-- existed. The importer keyframes hide_viewport + hide_render from these so a
+-- part vanishes (in viewport AND render) the moment it's destroyed.
+--
+-- PART_SETTLE: a freshly-appeared part stays hidden for this long. Gun parts
+-- stream in + weld over ~0.3 s; capturing that transient shows a scatter of
+-- unwelded meshes snapping together. Delaying the visible-span start hides the
+-- assembly and the gun simply pops in complete. Parts that vanish before the
+-- settle elapses are dropped entirely (pure assembly flicker).
+local PART_SETTLE = 0.12
+
+-- Open/close a part's presence span on a present<->absent transition. Also
+-- maintains entry.partLost[i] (previously only updated when debugLog was on).
+function Tracker:_updateSpan(entry, i, lost)
+    if entry.partLost[i] == lost then return end
+    entry.partSpans    = entry.partSpans or {}
+    entry.partSpanOpen = entry.partSpanOpen or {}
+    if not lost then
+        -- Becoming present mid-life: open a span, delayed by the settle window
+        -- so the unwelded/assembling transient isn't shown.
+        entry.partSpanOpen[i] = (self.currentT or 0) + PART_SETTLE
+    else
+        -- Becoming absent: close the open span (unless it never outlived the
+        -- settle delay, in which case it was pure assembly flicker — drop it).
+        local openAt = entry.partSpanOpen[i]
+        if openAt ~= nil then
+            local closeAt = self.currentT or 0
+            if closeAt > openAt then
+                local spans = entry.partSpans[i]
+                if not spans then spans = {}; entry.partSpans[i] = spans end
+                spans[#spans + 1] = { f = openAt, t = closeAt }
+            end
+            entry.partSpanOpen[i] = nil
+        end
+    end
+    entry.partLost[i] = lost
+end
+
+-- Initialise span state for a freshly-built ref list. Parts present at life
+-- start get a span opened at lifeFromT with NO settle (they should show from
+-- the first frame); absent refs wait for _updateSpan to open theirs (with
+-- settle) if/when they appear.
+function Tracker:_initSpans(entry, refs, encode)
+    entry.partSpans    = {}
+    entry.partSpanOpen = {}
+    for i, r in ipairs(refs) do
+        if r.inst then entry.known[r.inst] = true end
+        local present = r.inst and r.inst:IsA("BasePart")
+        entry.last[i] = present and encode(r.inst.CFrame) or "0,0,0,0,0,0,1"
+        if present then
+            entry.partLost[i]    = false
+            entry.partSpanOpen[i] = entry.lifeFromT or 0
+        else
+            entry.partLost[i]    = true
+        end
+    end
+end
+
+-- Build a parts-aligned array of presence spans for serialization. Each entry
+-- is a list of spans; a span is {from} (still open — visible to the end of the
+-- recording) or {from, to} (closed). closeT closes any still-open span at that
+-- time (use the life's toT when closing a life); pass nil for the live life so
+-- open spans stay open. Non-mutating — safe to call from rigData mid-IR.
+function Tracker:_spansSnapshot(entry, closeT)
+    local out = {}
+    local refs = entry.refs or {}
+    for i = 1, #refs do
+        local list = {}
+        for _, s in ipairs((entry.partSpans or {})[i] or {}) do
+            list[#list + 1] = { s.f, s.t }
+        end
+        local openAt = (entry.partSpanOpen or {})[i]
+        if openAt ~= nil then
+            if closeT == nil then
+                list[#list + 1] = { openAt }            -- open to end
+            elseif closeT > openAt then
+                list[#list + 1] = { openAt, closeT }    -- closed at life end
+            end
+        end
+        out[i] = list
+    end
+    return out
+end
+
 -- Rebuild the part references after a respawn (new Character = new Instances).
 -- Re-captures the new character, then re-points each existing index's `inst`
 -- by name so frame indices stay aligned; genuinely new parts are appended.
@@ -2863,12 +2957,15 @@ function Tracker:_rebuildRefs(entry, player, encode, debugLog)
     local ok, newRig, newRefs = pcall(captureRig, player)
     if not ok or not newRig or not newRefs then return end
 
-    -- Snapshot the closing life into history.
+    -- Snapshot the closing life into history (with its parts' presence spans
+    -- closed at the death time).
+    local closeT = self.currentT or (entry.lifeFromT or 0)
     local closedLife = {
         fromT          = entry.lifeFromT or 0,
-        toT            = self.currentT or (entry.lifeFromT or 0),
+        toT            = closeT,
         rigType        = entry.rig.rigType,
         parts          = entry.rig.parts,
+        partSpans      = self:_spansSnapshot(entry, closeT),
         joints         = entry.rig.joints,
         clothing       = entry.rig.clothing,
         characterMeshes = entry.rig.characterMeshes,
@@ -2887,12 +2984,7 @@ function Tracker:_rebuildRefs(entry, player, encode, debugLog)
     entry.lifeFromT   = self.currentT or 0
     entry.rescanSettled = false
     entry.consecutiveEmptyRescans = 0
-    for i, r in ipairs(newRefs) do
-        if r.inst then entry.known[r.inst] = true end
-        entry.last[i] = (r.inst and r.inst:IsA("BasePart"))
-            and encode(r.inst.CFrame) or "0,0,0,0,0,0,1"
-        if not r.inst then entry.partLost[i] = true end
-    end
+    self:_initSpans(entry, newRefs, encode)
 
     -- Enqueue assets for the new life (the closed life's assets are already
     -- extracted / cached; new life may have different mesh/clothing).
@@ -2954,12 +3046,7 @@ function Tracker:ensure(player, encode, debugLog)
         lifeFromT      = self.currentT or 0,
         lifeHistory    = {},
     }
-    for i, r in ipairs(refs) do
-        if r.inst then entry.known[r.inst] = true end
-        entry.last[i] = (r.inst and r.inst:IsA("BasePart"))
-            and encode(r.inst.CFrame) or "0,0,0,0,0,0,1"
-        if not r.inst then entry.partLost[i] = true end
-    end
+    self:_initSpans(entry, refs, encode)
     self.tracked[uid] = entry
 
     -- Enqueue every asset for the global extractor worker. The worker pops
@@ -3017,11 +3104,13 @@ function Tracker:ensureViewmodel(vmodel, encode, debugLog)
 
     if entry then
         -- Model swap = new life. Same shape as Tracker:_rebuildRefs.
+        local closeT = self.currentT or (entry.lifeFromT or 0)
         local closedLife = {
             fromT          = entry.lifeFromT or 0,
-            toT            = self.currentT or (entry.lifeFromT or 0),
+            toT            = closeT,
             rigType        = entry.rig.rigType,
             parts          = entry.rig.parts,
+            partSpans      = self:_spansSnapshot(entry, closeT),
             joints         = entry.rig.joints,
             isViewmodel    = true,
             sourcePath     = entry.rig.sourcePath,
@@ -3063,12 +3152,7 @@ function Tracker:ensureViewmodel(vmodel, encode, debugLog)
         end
     end
 
-    for i, r in ipairs(refs) do
-        if r.inst then entry.known[r.inst] = true end
-        entry.last[i] = (r.inst and r.inst:IsA("BasePart"))
-            and encode(r.inst.CFrame) or "0,0,0,0,0,0,1"
-        if not r.inst then entry.partLost[i] = true end
-    end
+    self:_initSpans(entry, refs, encode)
 
     if EXTRACT_OK then
         for i, r in ipairs(refs) do
@@ -3157,11 +3241,13 @@ function Tracker:snapshot(cfg, encode, debugLog)
                         else
                             s = entry.last[i] or "0,0,0,0,0,0,1"
                         end
-                        if lost ~= entry.partLost[i] and debugLog then
-                            debugLog(fmt("uid=%d part[%d] %s %s", p.UserId, i-1,
-                                (entry.rig.parts[i] and entry.rig.parts[i].name) or "?",
-                                lost and "LOST (using cache)" or "REGAINED"))
-                            entry.partLost[i] = lost
+                        if lost ~= entry.partLost[i] then
+                            if debugLog then
+                                debugLog(fmt("uid=%d part[%d] %s %s", p.UserId, i-1,
+                                    (entry.rig.parts[i] and entry.rig.parts[i].name) or "?",
+                                    lost and "LOST (using cache)" or "REGAINED"))
+                            end
+                            self:_updateSpan(entry, i, lost)
                         end
                         parts[i] = s
                     end
@@ -3257,6 +3343,12 @@ function Tracker:snapshot(cfg, encode, debugLog)
                     parts[i] = encode(pt.CFrame); entry.last[i] = parts[i]
                 else
                     parts[i] = entry.last[i] or "0,0,0,0,0,0,1"
+                end
+                -- Presence spans: a swapped-away gun's parts go absent here and
+                -- their span closes, so the importer hides them instead of
+                -- leaving the old gun floating at its last pose.
+                if lost ~= entry.partLost[i] then
+                    self:_updateSpan(entry, i, lost)
                 end
             end
             entries[#entries+1] = tostring(VIEWMODEL_UID) .. ":" .. table.concat(parts, "|")
@@ -3360,6 +3452,7 @@ function Tracker:rigData(filenameForRef, sinceClock)
                 toT             = nil,
                 rigType         = e.rig.rigType,
                 parts           = e.rig.parts,
+                partSpans       = self:_spansSnapshot(e, nil),
                 joints          = e.rig.joints,
                 clothing        = e.rig.clothing,
                 characterMeshes = e.rig.characterMeshes,

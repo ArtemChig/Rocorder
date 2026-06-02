@@ -13,6 +13,37 @@ orientation per the official 585×559 template; tune `_FACE_AXES` /
 
 ---
 
+## P1 — Paint classic Shirt/Pants onto R15 MeshPart bodies (avatar composite)
+
+Rivals (and most modern games) use **R15 MeshPart bodies** (`UpperTorso`,
+`LeftUpperArm`, `RightHand`, …) wearing classic 2D **Shirt/Pants**. We
+record the clothing IDs and now extract their textures fine (1.19.4
+Decal-preload path), but the importer never *applies* them to R15 bodies —
+the clothing path in `_build_part_object` only matches **R6** part names
+(`"Torso"`, `"Left Arm"`, …) with a `charMesh` flag. So R15 bodies render
+with only their base skin texture (`14523777036`), and the user sees
+"body colors, no clothing".
+
+Why it's not a trivial wrap: classic clothing is authored for the R6
+585×559 template. Roblox's avatar **composite** server re-projects that
+onto the **R15** body's own UV layout (a different template). Applying the
+R6 shirt directly via the R15 mesh's authored UVs would be misaligned.
+
+Two possible approaches:
+1. **Recorder-side capture of the composite.** If the composited body
+   texture is reachable at record time (e.g. via the rendered MeshPart
+   appearance / an EditableImage of what the client actually shows),
+   capture that and treat it as the body texture — no reprojection needed.
+   Needs investigation: the MeshPart's `TextureID` stays the base skin, so
+   the composite is applied at a layer we haven't found an API for yet.
+2. **Importer-side reprojection.** Replicate Roblox's R6→R15 clothing
+   template mapping and bake shirt/pants onto the R15 body UVs. Correct but
+   substantial (need the per-part R6-region → R15-UV correspondence).
+
+Approach 1 is preferred if the composite is reachable. Start there.
+
+---
+
 ## P2 — Bundle the exact classic-head mesh (replace the sphere approximation)
 
 Right now a classic Head (a Block part with SpecialMesh `MeshType=Head`,

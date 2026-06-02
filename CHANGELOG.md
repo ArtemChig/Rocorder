@@ -9,6 +9,45 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.20.0-alpha — 2026-06-01
+
+Lifetime / per-part visibility. The first clean Rivals POV import revealed
+three related problems, all from parts being kept visible forever:
+
+- every gun the player ever drew floated in the scene at its last pose
+  (the viewmodel only ever *appends* parts, never removes them),
+- a dead player's accessories stayed visible through their next life
+  (per-life visibility only hid the armature, not the part meshes, and
+  only in some cases),
+- and a freshly-drawn weapon showed a scatter of half-welded meshes for a
+  few frames before snapping together.
+
+Fixed end-to-end with per-part presence tracking:
+
+- **Recorder** now records, per part, the time windows it actually existed
+  (`partSpans`, a new backward-compatible field on each `.rig.json`
+  revision). A part that's destroyed (gun swapped, accessory removed,
+  player died) gets its span closed at that instant.
+- **Importer** keyframes `hide_viewport` AND `hide_render` (CONSTANT
+  interpolation) from those spans, so every part — body, accessory, gun —
+  is visible only while it existed in-game. Applies to the viewport too,
+  not just render, so the scene isn't flooded with hidden-in-render junk.
+- **Assembly settle**: a part that appears mid-recording stays hidden for
+  ~0.12 s so the unwelded streaming-in transient isn't shown — the gun
+  pops in complete. Parts that vanish within that window are dropped as
+  pure flicker.
+- Side benefit: players are now hidden until the frame they were actually
+  captured, instead of showing a T-pose at the origin for the first
+  second.
+
+Backward compatible: older recordings without `partSpans` keep the old
+behavior (multi-life players hide per-life; single-life parts stay
+visible).
+
+Still open: classic Shirt/Pants aren't yet painted onto R15 MeshPart
+bodies (they're recorded + extracted, but the importer's clothing path
+only matches R6 body-part names). Tracked in BACKLOG.
+
 ## 1.19.7-alpha — 2026-06-01
 
 1.19.6 landed the real fix — `ViewModelRoot` got rejected as static and
