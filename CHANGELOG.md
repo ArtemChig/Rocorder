@@ -9,6 +9,55 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.24.0-alpha — 2026-06-02
+
+Files-tab P2 cluster, fully shipped — the BACKLOG item that had been
+parked the longest. Three things together: new naming + new layout,
+plus the Files-tab upgrades the layout enabled.
+
+**Recording filenames are now human-readable.** Old:
+`replay_117398147513099_1780360977.rec`. New:
+`2026-06-02_20-49-37__rivals__session.rec` (or `__clip.rec` for IR
+saves). Time-first so a lexical sort gives chronological order; game
+slug from `MarketplaceService:GetProductInfo(placeId).Name`, cached so
+each game name is fetched once per session. Slug is lowercased and
+filesystem-safe (non-alphanums collapse to `-`).
+
+**Per-recording subfolder layout.** Each recording now lives in its own
+folder: `ROCORDER/recordings/<base>/<base>.{rec,rig.json,meta.json,
+debug.log}`. One drag-to-archive unit; deleting a folder removes the
+whole recording. The shared `ROCORDER/assets/` cache stays at the
+workspace root (content-addressed, cross-recording). **Old flat-layout
+recordings still listed** — the Files-tab scan reads both `ROCORDER/
+*.rec` and `ROCORDER/recordings/*/*.rec`, so existing files don't go
+missing on upgrade.
+
+**Sort the Files tab.** Header dropdown (uses the 1.23.0 picker)
+with Newest / Oldest / Game / Duration / Size. The sort is cheap —
+re-orders the cached list and re-renders, doesn't re-read the disk.
+Defaults to Newest.
+
+**"Folder" button per row.** Copies the recording's containing folder
+path to clipboard via `setclipboard`, with a notification telling the
+user where to paste. Falls back to a longer notification with the path
+in-text if the executor lacks the clipboard function. The folder path
+also shows as faint text below the row's game/size line so users can
+see the layout at a glance.
+
+**"Clear" button per row + "Clear all" banner.** Two-step confirm-on-
+second-click pattern: first click flips the button to red "Confirm?",
+second click within 3 s executes. Per-row Clear reads the recording's
+rig.json, collects every asset id it references, and deletes just
+those files from `ROCORDER/assets/`. Clear-all wipes the whole assets
+cache. Both also reset the in-memory `EXTRACTED` dedup set so future
+recordings can re-extract. The banner shows the cached-asset file
+count so the user can see how much they're freeing.
+
+**Migration**: Lua-side reads both layouts; Blender importer is
+layout-agnostic (it loads a `.rec` from an absolute path and looks for
+sister files in the same folder, which both layouts satisfy). No
+re-imports or moves needed.
+
 ## 1.23.1-alpha — 2026-06-02
 
 Second pass on the UI from the live session in 1.23.0.
