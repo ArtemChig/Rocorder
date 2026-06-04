@@ -9,6 +9,38 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.21.0-alpha — 2026-06-01
+
+New `Asset Extract Timing` setting (Settings → Capture) with three modes,
+addressing the in-game stutter from live asset extraction. Default
+changes from unthrottled to "Quiet" — same correctness, less stutter.
+
+- **Quiet (new default)** — during recording, the queue worker only
+  extracts when the last heartbeat dt is well under target (< 5 ms).
+  When the game's under load, the worker waits and tries again next
+  iteration. Outside recording (or after Stop) it runs flat-out. Same
+  correctness as before, much less perceived lag during competitive
+  play. The post-stop sweep mops up anything not yet finished, so
+  nothing's lost.
+
+- **Live** — the previous behaviour. No throttle, extracts as fast as
+  the queue can pop. Faster completion, may stutter under load. Pick
+  this if you don't care about in-game smoothness (e.g. recording in
+  Studio or a lobby).
+
+- **Defer** — the queue worker pauses while a recording session is
+  active. Asset refs are still enqueued in real time (so we remember
+  *what* to extract), but no extraction happens until Stop, when the
+  worker resumes and drains the queue using the same EditableMesh /
+  EditableImage path it'd use mid-recording. The post-record HTTP sweep
+  runs in parallel as a fallback. Zero in-game stutter, at the cost of
+  relying on the client content cache surviving from draw-time until
+  Stop — usually fine for short clips, less so for hour-long sessions
+  with lots of swapped weapons and gone-too-long accessories.
+
+  IR buffering doesn't trigger Defer (it isn't a session in the
+  Start/Stop sense), so an always-on IR setup keeps extracting normally.
+
 ## 1.20.1-alpha — 2026-06-01
 
 Viewmodel weapon-swap splitting. The 1.20.0 import revealed the POV
