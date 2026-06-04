@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.20.1-alpha"
+local ROCORDER_VERSION = "1.21.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -196,6 +196,17 @@ local SETTING_DEFS = {
         .. "the executor's authenticated session (works where Blender's "
         .. "anonymous downloads get 401'd).",
       group="Capture" },
+    { key="EXTRACT_MODE",    type="choice", default="Quiet", label="Asset Extract Timing",
+      desc="When to extract meshes/textures from the engine. "
+        .. "Quiet: during recording but only when the frame has budget "
+        .. "(default — minimises stutter, fully reliable). "
+        .. "Live: during recording, no throttle (faster completion, may "
+        .. "stutter in competitive games). "
+        .. "Defer: queue refs during recording, extract everything at Stop "
+        .. "(zero in-game stutter, but assets evicted from the client cache "
+        .. "between draw and Stop may fail — usually fine for short clips).",
+      group="Capture",
+      choices={ "Quiet", "Live", "Defer" } },
     { key="POS_PRECISION",   type="number", default=3,    label="Position Decimals",
       desc="Decimal places for positions (studs).",                group="Capture",
       min=0,   max=6,   int=true, advanced=true },
@@ -1819,6 +1830,33 @@ local function _startExtractorWorker()
                     Q.activeId = nil; Q.activeKind = nil; Q.activePlayer = nil
                     task.wait(0.1)
                     return
+                end
+
+                -- Extraction-timing mode (1.20.2). Defer: while a recording
+                -- session is active, hold the queue and don't extract — we'll
+                -- drain everything at Stop via the existing post-record
+                -- ASSET DOWNLOAD phase. Lets competitive players record with
+                -- zero in-game stutter at the cost of relying on the client
+                -- content cache surviving from draw-time until Stop (usually
+                -- fine; old briefly-seen stuff is the only real risk).
+                local mode = (rec and rec.cfg and rec.cfg.EXTRACT_MODE) or "Quiet"
+                if mode == "Defer" and rec.session then
+                    task.wait(0.2)
+                    return
+                end
+
+                -- Quiet: extract during recording, but only when the last
+                -- heartbeat dt is well under the target (5 ms). The client is
+                -- genuinely idle and an extraction won't be perceived as a
+                -- frame hitch. If the frame is slow (game under load), wait
+                -- and try again. Doesn't apply outside recording (post-stop
+                -- batch download has its own pacing) or in Live mode.
+                if mode == "Quiet" and rec and rec.session then
+                    local dt = _G.ROCORDER_FRAME_DELTA or (1 / 60)
+                    if dt > 0.005 then
+                        task.wait(0.05)
+                        return
+                    end
                 end
 
                 local entry = table.remove(Q.queue, 1)
