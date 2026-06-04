@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.23.1-alpha"
+local ROCORDER_VERSION = "1.24.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -58,7 +58,13 @@ end
 
 local FOLDER = "ROCORDER"
 local ASSETS_FOLDER = FOLDER .. "/assets"
+-- New (1.24.0) per-recording subfolder root. Each recording lives in its own
+-- folder under here so one drag = one full session (.rec + .rig.json +
+-- .meta.json + .debug.log). Old-layout flat recordings in FOLDER itself stay
+-- readable (the Files tab scans both locations).
+local RECORDINGS_FOLDER = FOLDER .. "/recordings"
 if not isfolder(FOLDER) then makefolder(FOLDER) end
+if not isfolder(RECORDINGS_FOLDER) then pcall(makefolder, RECORDINGS_FOLDER) end
 
 -- Executor HTTP request function (for authenticated asset downloads). These
 -- run in the real client session, so they reach assets Blender's anonymous
@@ -78,6 +84,12 @@ local readCustomAsset = readcustomasset    -- direct bytes (rare)
 local readAsset       = readasset           -- some forks
 local getAssetBytes   = (Xeno and Xeno.getAssetBytes) or get_asset_bytes
 local _diagPrinted    = false
+
+-- Clipboard write (1.24.0, "Show in folder" button). Most modern executors
+-- expose `setclipboard` directly; some use `toclipboard` or namespace it.
+-- All of these accept a single string argument.
+local setClipboard = setclipboard or (syn and syn.write_clipboard)
+    or toclipboard or set_clipboard
 
 -- Try every in-memory path we know about. The DIAG on first call now ALWAYS
 -- prints — success, error, or wrong type — so we can see what the executor
@@ -353,6 +365,39 @@ local function lookupGameName(placeId)
     end
     gameNameCache[placeId] = false  -- negative cache (don't keep retrying)
     return nil
+end
+
+-- Filesystem-safe slug for a free-form name. Lowercases, replaces runs of
+-- non-alphanumerics with `-`, trims leading/trailing `-`, caps length so
+-- filenames stay sane on Windows. Always returns a non-empty string.
+local function slugifyName(s)
+    if not s or s == "" then return "unknown" end
+    s = tostring(s):lower():gsub("[^%w]+", "-")
+    s = s:gsub("^%-+", ""):gsub("%-+$", "")
+    if s == "" then return "unknown" end
+    if #s > 40 then s = s:sub(1, 40):gsub("%-+$", "") end
+    return s
+end
+
+-- Build a recording's base name in the new (1.24.0) human-readable scheme:
+--   2026-06-02_14-30-12__violence-district__session
+--   2026-06-02_14-30-12__violence-district__clip
+-- Time first so a lexical sort gives chronological order. Game slug second
+-- so the filename tells you what game it came from at a glance. Kind last
+-- to distinguish full sessions from IR saves. The old `replay_<placeId>_
+-- <unixSeconds>` scheme is still readable from disk (Files tab handles
+-- both) but no longer produced.
+local function newRecordingBase(kind)
+    local datepart = os.date("%Y-%m-%d_%H-%M-%S", os.time())
+    local slug = slugifyName(
+        lookupGameName(game.PlaceId) or ("place-" .. tostring(game.PlaceId)))
+    return datepart .. "__" .. slug .. "__" .. (kind or "session")
+end
+
+-- New-layout folder for a recording: ROCORDER/recordings/<base>/
+-- Created on demand by Session.new / Replay:save.
+local function recordingFolderPath(base)
+    return RECORDINGS_FOLDER .. "/" .. base
 end
 
 local function matrixToQuat(m00,m01,m02,m10,m11,m12,m20,m21,m22)
@@ -3601,9 +3646,20 @@ end
 local Session = {}; Session.__index = Session
 
 function Session.new(folder, cfg, debugEnabled)
-    local base = fmt("replay_%d_%d", game.PlaceId, os.time())
+    -- New (1.24.0) layout: each recording gets its own subfolder under
+    -- ROCORDER/recordings/, named with a human-readable
+    -- <date>_<time>__<game-slug>__session pattern. The `folder` argument
+    -- is the workspace root (FOLDER); we ignore it for output paths and
+    -- write to the per-recording subfolder we create here. Old recordings
+    -- with the flat `replay_<placeId>_<unix>.rec` layout remain readable
+    -- via the Files-tab dual-scan in rec:GetRecordings.
+    local base = newRecordingBase("session")
+    local recFolder = recordingFolderPath(base)
+    if not isfolder(RECORDINGS_FOLDER) then pcall(makefolder, RECORDINGS_FOLDER) end
+    if not isfolder(recFolder) then pcall(makefolder, recFolder) end
     local self = setmetatable({
-        folder        = folder,
+        folder        = recFolder,    -- write target = per-recording subfolder
+        base          = base,
         filename      = base .. ".rec",
         rigFilename   = base .. ".rig.json",
         debugFilename = base .. ".debug.log",
@@ -3815,7 +3871,14 @@ function Replay:save(folder, cfg, rigData, lastSeconds)
 
     local t0 = kept[1].t
     local clipDuration = newestT - t0
-    local base = fmt("replay_%d_%d_clip", game.PlaceId, os.time())
+    -- 1.24.0: human-readable name + per-clip subfolder, same as Session.new.
+    local base = newRecordingBase("clip")
+    local recFolder = recordingFolderPath(base)
+    if not isfolder(RECORDINGS_FOLDER) then pcall(makefolder, RECORDINGS_FOLDER) end
+    if not isfolder(recFolder) then pcall(makefolder, recFolder) end
+    -- Redirect later writes to the subfolder by overriding the `folder`
+    -- argument we received.
+    folder = recFolder
     local recName = base .. ".rec"
     local rigName = base .. ".rig.json"
 
@@ -4428,69 +4491,161 @@ end
 function rec:GetRecordings()
     if not listfiles then return {} end
     local out = {}
-    local ok, files = pcall(listfiles, FOLDER)
-    if not ok or type(files) ~= "table" then return out end
 
-    for _, path in ipairs(files) do
+    -- Build info row for one .rec file at any layout. `dir` is the folder
+    -- the .rec lives in (FOLDER for old flat layout, ROCORDER/recordings/
+    -- <base> for new subfolder layout).
+    local function processRecPath(path, dir)
         local norm = path:gsub("\\", "/")
         local name = norm:match("([^/]+)$") or norm
-        if name:sub(-4) == ".rec" then
-            local base = name:gsub("%.rec$", "")
-            local metaPath = FOLDER .. "/" .. base .. ".meta.json"
+        if name:sub(-4) ~= ".rec" then return end
+        local base = name:gsub("%.rec$", "")
+        local metaPath = dir .. "/" .. base .. ".meta.json"
 
-            -- prefer the small meta sidecar for almost everything; only fall
-            -- back to scanning the (potentially huge) .rec header when the
-            -- meta file is missing (in-progress recording or pre-1.2 file).
-            local meta = _readJSONFile(metaPath)
-            local size = meta and meta.byteCount or 0
-            local header = nil
-            if not meta then
-                local h, sz = _readHeaderFromRec(path)
-                header = h
-                size = sz
-            else
-                -- size from meta is the bytes-at-stop; check live file size if
-                -- a session is still appending. We don't trust meta size for
-                -- in-progress recordings, but we don't have a cheap stat call;
-                -- the cache below picks up changes between refreshes.
-            end
+        -- prefer the small meta sidecar for almost everything; only fall
+        -- back to scanning the (potentially huge) .rec header when the
+        -- meta file is missing (in-progress recording or pre-1.2 file).
+        local meta = _readJSONFile(metaPath)
+        local size = meta and meta.byteCount or 0
+        local header = nil
+        if not meta then
+            local h, sz = _readHeaderFromRec(path)
+            header = h
+            size = sz
+        end
 
-            -- info row used by the Files tab
-            local info = {
-                name        = name,
-                path        = path,
-                size        = size,
-                startedAt   = (meta and meta.startedAt) or (header and header.startedAt),
-                durationSec = meta and meta.durationSec or nil,
-                frameCount  = meta and meta.frameCount  or nil,
-                placeId     = (meta and meta.placeId)   or (header and header.placeId),
-                placeName   = (meta and meta.placeName) or (header and header.placeName),
-                sources     = (meta and meta.sources)   or (header and header.sources),
-                isClip      = header and header.source == "instant-replay"
-                            or (meta and meta.source == "instant-replay") or false,
-                hasMeta     = meta ~= nil,
-            }
-            -- if we don't know the place name but have the id, try to look it
-            -- up (cheap if cached, async-ish if not — pcall keeps yields safe)
-            if not info.placeName and info.placeId then
-                info.placeName = lookupGameName(info.placeId)
+        local info = {
+            name        = name,
+            base        = base,
+            path        = path,
+            folder      = dir,        -- 1.24.0: for "Show in folder" + per-rec clear
+            size        = size,
+            startedAt   = (meta and meta.startedAt) or (header and header.startedAt),
+            durationSec = meta and meta.durationSec or nil,
+            frameCount  = meta and meta.frameCount  or nil,
+            placeId     = (meta and meta.placeId)   or (header and header.placeId),
+            placeName   = (meta and meta.placeName) or (header and header.placeName),
+            sources     = (meta and meta.sources)   or (header and header.sources),
+            isClip      = (header and header.source == "instant-replay")
+                        or (meta and meta.source == "instant-replay") or false,
+            hasMeta     = meta ~= nil,
+        }
+        if not info.placeName and info.placeId then
+            info.placeName = lookupGameName(info.placeId)
+        end
+        out[#out + 1] = info
+    end
+
+    -- Old flat layout: ROCORDER/replay_<placeId>_<unix>.rec + sister files.
+    -- We keep reading these so pre-1.24 recordings stay listed and deletable.
+    local ok, files = pcall(listfiles, FOLDER)
+    if ok and type(files) == "table" then
+        for _, path in ipairs(files) do processRecPath(path, FOLDER) end
+    end
+
+    -- New subfolder layout: ROCORDER/recordings/<base>/<base>.rec etc.
+    -- One folder per recording. We list children of the recordings root,
+    -- then list each child folder's contents.
+    if isfolder and isfolder(RECORDINGS_FOLDER) then
+        local ok2, subs = pcall(listfiles, RECORDINGS_FOLDER)
+        if ok2 and type(subs) == "table" then
+            for _, subPath in ipairs(subs) do
+                local subNorm = subPath:gsub("\\", "/")
+                local ok3, inner = pcall(listfiles, subPath)
+                if ok3 and type(inner) == "table" then
+                    for _, p in ipairs(inner) do processRecPath(p, subNorm) end
+                end
             end
-            out[#out + 1] = info
         end
     end
+
+    -- Default sort: newest first. The Files tab re-sorts by other keys on
+    -- demand; new naming sorts chronologically as a lexical side-effect,
+    -- and old `replay_<placeId>_<unix>` sorts by recency too (the unix
+    -- suffix is monotonic).
     table.sort(out, function(a, b) return a.name > b.name end)
     return out
 end
 
 function rec:DeleteRecording(name)
     if not delfile then return false, "executor lacks delfile" end
-    local sister = name:gsub("%.rec$", "")
-    pcall(delfile, FOLDER .. "/" .. name)
-    pcall(delfile, FOLDER .. "/" .. sister .. ".rig.json")
-    pcall(delfile, FOLDER .. "/" .. sister .. ".debug.log")
-    pcall(delfile, FOLDER .. "/" .. sister .. ".meta.json")
+    local base = name:gsub("%.rec$", "")
+
+    -- New layout: delete the per-recording subfolder's 4 files (and the
+    -- folder itself if the executor exposes delfolder).
+    local recFolder = recordingFolderPath(base)
+    if isfolder and isfolder(recFolder) then
+        pcall(delfile, recFolder .. "/" .. base .. ".rec")
+        pcall(delfile, recFolder .. "/" .. base .. ".rig.json")
+        pcall(delfile, recFolder .. "/" .. base .. ".debug.log")
+        pcall(delfile, recFolder .. "/" .. base .. ".meta.json")
+        -- Try to remove the now-empty folder so the Files tab doesn't show a
+        -- ghost entry. delfolder is not universal (older executors lack it);
+        -- the pcall just swallows the error if it's missing.
+        pcall(function() (delfolder or rmfolder)(recFolder) end)
+    end
+
+    -- Old flat layout fallback — harmless if the files don't exist there.
+    pcall(delfile, FOLDER .. "/" .. base .. ".rec")
+    pcall(delfile, FOLDER .. "/" .. base .. ".rig.json")
+    pcall(delfile, FOLDER .. "/" .. base .. ".debug.log")
+    pcall(delfile, FOLDER .. "/" .. base .. ".meta.json")
     self:_invalidateRecordingsCache(name)
     return true
+end
+
+-- Clear cached assets. Two modes:
+--   ClearAssets()           — wipes ROCORDER/assets/ entirely (global cache)
+--   ClearAssets(recording)  — wipes only the assets a single recording
+--                             references (read from its rig.json)
+-- Both modes reset the in-memory EXTRACTED dedup set for the affected ids
+-- so they'll be re-fetched on the next recording / import. Returns the
+-- number of files deleted, or 0 on failure.
+function rec:ClearAssets(rec_info)
+    if not delfile or not listfiles or not isfolder then return 0 end
+    if not isfolder(ASSETS_FOLDER) then return 0 end
+
+    if rec_info then
+        -- Per-recording: load its rig.json, collect ids, delete just those.
+        local rigPath = (rec_info.folder or FOLDER) .. "/"
+            .. (rec_info.base or rec_info.name:gsub("%.rec$", "")) .. ".rig.json"
+        local rig = _readJSONFile(rigPath)
+        if not rig or not rig.players then return 0 end
+        local ids = {}
+        for _, p in pairs(rig.players) do
+            local revs = p.revisions
+            if revs then
+                for _, rev in ipairs(revs) do collectAssetIds(rev, ids) end
+            else
+                collectAssetIds(p, ids)
+            end
+        end
+        local n = 0
+        for id in pairs(ids) do
+            local path = ASSETS_FOLDER .. "/" .. id
+            if isfile and isfile(path) then
+                if pcall(delfile, path) then n = n + 1 end
+            end
+            -- Also the alternate .geom.json / .png companions
+            for _, ext in ipairs({ ".geom.json", ".png" }) do
+                local p = ASSETS_FOLDER .. "/" .. id .. ext
+                if isfile and isfile(p) then pcall(delfile, p) end
+            end
+            EXTRACTED[id] = nil
+        end
+        return n
+    end
+
+    -- Global wipe: every file under ROCORDER/assets/. Reset the in-memory
+    -- dedup set entirely.
+    local ok, files = pcall(listfiles, ASSETS_FOLDER)
+    if not ok or type(files) ~= "table" then return 0 end
+    local n = 0
+    for _, p in ipairs(files) do
+        if pcall(delfile, p) then n = n + 1 end
+    end
+    for k in pairs(EXTRACTED) do EXTRACTED[k] = nil end
+    return n
 end
 
 function rec:SetSetting(key, value)
@@ -5399,37 +5554,159 @@ local function buildSettingsView(parent)
     return { view = view, controls = controls }
 end
 
+-- Sort options for the Files tab list. Each comparator runs in
+-- `table.sort(out, comparator)`. Newest-first relies on the new lexical
+-- filename pattern being chronological; for old-layout files the unix
+-- suffix gives the same monotonic order.
+local FILES_SORT_ORDER = { "Newest", "Oldest", "Game", "Duration", "Size" }
+local FILES_SORTERS = {
+    Newest   = function(a, b) return (a.startedAt or 0) > (b.startedAt or 0) end,
+    Oldest   = function(a, b) return (a.startedAt or 0) < (b.startedAt or 0) end,
+    Game     = function(a, b)
+        local aName = (a.placeName or "~"):lower()
+        local bName = (b.placeName or "~"):lower()
+        if aName ~= bName then return aName < bName end
+        return (a.startedAt or 0) > (b.startedAt or 0)
+    end,
+    Duration = function(a, b) return (a.durationSec or 0) > (b.durationSec or 0) end,
+    Size     = function(a, b) return (a.size or 0) > (b.size or 0) end,
+}
+
+-- A small two-step "Click → Confirm?" pattern shared by destructive buttons
+-- (Delete, Clear assets). First click flips the button to a Confirm? state
+-- in red; a second click within 3 s executes the action. Clicking elsewhere
+-- or letting the timeout elapse resets. Avoids the modal-dialog overhead
+-- for actions we want to be reversible-by-mistake-proof but not annoying.
+local function confirmableButton(btn, idleText, confirmText, idleBg, confirmBg, onConfirm)
+    local armed, armedAt = false, 0
+    local function reset()
+        armed = false
+        btn.Text = idleText
+        btn.BackgroundColor3 = idleBg
+    end
+    btn.MouseButton1Click:Connect(function()
+        if armed and (os.clock() - armedAt) <= 3.0 then
+            reset()
+            onConfirm()
+        else
+            armed = true; armedAt = os.clock()
+            btn.Text = confirmText
+            btn.BackgroundColor3 = confirmBg
+            task.delay(3.0, function()
+                if armed and (os.clock() - armedAt) >= 3.0 then reset() end
+            end)
+        end
+    end)
+end
+
 local function buildFilesView(parent)
     local view = mk("Frame", { BackgroundTransparency = 1,
         Size = UDim2.fromScale(1, 1) }, parent)
     pad(view, 16); vlist(view, 10)
 
+    -- ----- Header row: title + Sort dropdown + Refresh ----------------
     local header = mk("Frame", { BackgroundTransparency = 1,
         Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 1 }, view)
     mk("TextLabel", { Text = "Recordings", Font = THEME.fontBold, TextSize = 16,
         TextColor3 = THEME.text, BackgroundTransparency = 1,
-        Size = UDim2.new(0.5, 0, 1, 0),
+        Size = UDim2.new(0, 130, 1, 0),
         TextXAlignment = Enum.TextXAlignment.Left }, header)
+
+    local currentSort = "Newest"
+    -- Sort dropdown — reuses _showChoiceDropdown so it looks/behaves like
+    -- the choice settings on the Settings tab (same anchor, same outside-
+    -- click dismissal, same chevron).
+    local sortBtn = mk("TextButton", {
+        Text = "", AutoButtonColor = false, BorderSizePixel = 0,
+        BackgroundColor3 = THEME.bg,
+        Position = UDim2.new(1, -212, 0.5, -14),
+        Size = UDim2.fromOffset(120, 28),
+    }, header); corner(sortBtn, 4); stroke(sortBtn, THEME.border, 1)
+    local sortLbl = mk("TextLabel", { Text = "Sort: Newest",
+        Font = THEME.fontReg, TextSize = 12, TextColor3 = THEME.text,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(10, 0),
+        Size = UDim2.new(1, -28, 1, 0),
+        TextXAlignment = Enum.TextXAlignment.Left }, sortBtn)
+    mk("TextLabel", { Text = "\xE2\x96\xBE",
+        Font = THEME.fontBold, TextSize = 13, TextColor3 = THEME.subtext,
+        BackgroundTransparency = 1,
+        Position = UDim2.new(1, -22, 0, 0),
+        Size = UDim2.fromOffset(20, 28),
+        TextXAlignment = Enum.TextXAlignment.Center }, sortBtn)
+
     local refresh = mk("TextButton", { Text = "Refresh", Font = THEME.fontBold,
         TextSize = 13, TextColor3 = Color3.new(1,1,1),
         BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AutoButtonColor = false,
         Position = UDim2.new(1, -88, 0.5, -14),
         Size = UDim2.fromOffset(80, 28) }, header); corner(refresh, 4)
 
+    -- ----- Assets-cache banner ---------------------------------------
+    -- Compact strip above the list showing the cached-asset count and a
+    -- Clear-all button (confirm-on-second-click).
+    local assetsBanner = mk("Frame", { BackgroundColor3 = THEME.panel,
+        BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 40),
+        LayoutOrder = 2 }, view)
+    corner(assetsBanner, 6); pad(assetsBanner, 14, 8, 14, 8)
+    local assetsLbl = mk("TextLabel", { Text = "Asset cache: …",
+        Font = THEME.fontReg, TextSize = 12, TextColor3 = THEME.subtext,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -130, 1, 0),
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center }, assetsBanner)
+    local clearAllBtn = mk("TextButton", { Text = "Clear all",
+        Font = THEME.fontBold, TextSize = 12, TextColor3 = Color3.new(1,1,1),
+        BackgroundColor3 = THEME.standby, BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Position = UDim2.new(1, -120, 0.5, -13),
+        Size = UDim2.fromOffset(120, 26) }, assetsBanner); corner(clearAllBtn, 4)
+    confirmableButton(clearAllBtn, "Clear all", "Confirm?",
+        THEME.standby, THEME.danger, function()
+            local n = rec:ClearAssets()
+            notify("ROCORDER", fmt("Cleared %d cached asset files.", n), 3)
+            assetsLbl.Text = "Asset cache: empty"
+        end)
+
+    -- Refresh the cache count whenever populate() runs.
+    local function refreshAssetsBanner()
+        if not (listfiles and isfolder) then
+            assetsLbl.Text = "Asset cache: (executor lacks file listing)"
+            return
+        end
+        if not isfolder(ASSETS_FOLDER) then
+            assetsLbl.Text = "Asset cache: empty"
+            return
+        end
+        local ok, files = pcall(listfiles, ASSETS_FOLDER)
+        local n = (ok and type(files) == "table") and #files or 0
+        if n == 0 then
+            assetsLbl.Text = "Asset cache: empty"
+        else
+            assetsLbl.Text = fmt("Asset cache: %d files in ROCORDER/assets/", n)
+        end
+    end
+
+    -- ----- Recordings list ------------------------------------------
+    -- Height = view height minus (header 32 + gap 10 + assetsBanner 40 +
+    -- gap 10) = 92. Anything more leaves an unused strip at the bottom;
+    -- anything less clips the last row's scrollbar thumb.
     local scroll = mk("ScrollingFrame", { BackgroundTransparency = 1,
-        Size = UDim2.new(1, 0, 1, -42), LayoutOrder = 2,
+        Size = UDim2.new(1, 0, 1, -92), LayoutOrder = 3,
         CanvasSize = UDim2.new(0,0,0,0),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollBarThickness = 6, ScrollBarImageColor3 = THEME.border,
         BorderSizePixel = 0 }, view)
     vlist(scroll, 6); pad(scroll, 0, 0, 8, 0)
 
-    local function populate()
+    local cachedFiles = {}   -- last `rec:GetRecordings()` result
+
+    local function renderList()
         for _, c in ipairs(scroll:GetChildren()) do
             if c:IsA("Frame") then c:Destroy() end
         end
-        local files = rec:GetRecordings()
-        if #files == 0 then
+        local sorter = FILES_SORTERS[currentSort] or FILES_SORTERS.Newest
+        table.sort(cachedFiles, sorter)
+        if #cachedFiles == 0 then
             local empty = mk("Frame", { BackgroundColor3 = THEME.panel,
                 BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 60) }, scroll)
             corner(empty, 6); pad(empty, 12)
@@ -5441,18 +5718,25 @@ local function buildFilesView(parent)
                 TextYAlignment = Enum.TextYAlignment.Top }, empty)
             return
         end
-        for _, f in ipairs(files) do
+        for _, f in ipairs(cachedFiles) do
             local row = mk("Frame", { BackgroundColor3 = THEME.panel,
-                BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 78) }, scroll)
+                BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 88) }, scroll)
             corner(row, 6); pad(row, 14, 10, 14, 10)
 
-            -- top row: filename + delete button
+            -- Action button column on the right — three small stacked
+            -- buttons: Folder (copy path), Clear (per-rec asset clear),
+            -- Delete (existing). Each is 76px wide; column reserves 88px
+            -- so the file/date/game labels truncate cleanly to their left.
+            local BTN_W = 76
+            local CTRL_RES = BTN_W + 12
+
+            -- top row: filename
             mk("TextLabel", { Text = f.name, Font = THEME.fontBold, TextSize = 13,
                 TextColor3 = THEME.text, BackgroundTransparency = 1,
-                Size = UDim2.new(1, -88, 0, 18),
+                Size = UDim2.new(1, -CTRL_RES, 0, 18),
                 TextXAlignment = Enum.TextXAlignment.Left,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
-            -- a subtle "CLIP" pill on instant-replay clips so they're identifiable
+            -- CLIP pill on instant-replay clips
             if f.isClip then
                 local clipPill = mk("TextLabel", { Text = "CLIP",
                     Font = THEME.fontBold, TextSize = 10,
@@ -5460,66 +5744,124 @@ local function buildFilesView(parent)
                     BorderSizePixel = 0,
                     TextXAlignment = Enum.TextXAlignment.Center,
                     TextYAlignment = Enum.TextYAlignment.Center,
-                    Position = UDim2.new(1, -134, 0, 0),
+                    Position = UDim2.new(1, -CTRL_RES - 50, 0, 0),
                     Size = UDim2.fromOffset(46, 18) }, row)
                 corner(clipPill, 4); stroke(clipPill, THEME.accent, 1)
             end
 
-            -- middle row: duration · date
+            -- duration · date
             local duration = f.durationSec and humanDuration(f.durationSec)
                           or (f.hasMeta and "0s" or "?")
             local dateStr  = f.startedAt and os.date("%Y-%m-%d %H:%M", f.startedAt)
                           or "unknown date"
             mk("TextLabel", {
-                Text = duration .. "  ·  " .. dateStr,
+                Text = duration .. "  \xE2\x80\xA2  " .. dateStr,
                 Font = THEME.fontMono, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
                 Position = UDim2.fromOffset(0, 22),
-                Size = UDim2.new(1, -88, 0, 16),
+                Size = UDim2.new(1, -CTRL_RES, 0, 16),
                 TextXAlignment = Enum.TextXAlignment.Left }, row)
 
-            -- bottom row: game name · size
+            -- game · size
             local gameStr = f.placeName
                          or (f.placeId and fmt("placeId %d", f.placeId))
                          or "unknown place"
             mk("TextLabel", {
-                Text = gameStr .. "  ·  " .. humanBytes(f.size or 0),
+                Text = gameStr .. "  \xE2\x80\xA2  " .. humanBytes(f.size or 0),
                 Font = THEME.fontReg, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
                 Position = UDim2.fromOffset(0, 42),
-                Size = UDim2.new(1, -88, 0, 16),
+                Size = UDim2.new(1, -CTRL_RES, 0, 16),
                 TextXAlignment = Enum.TextXAlignment.Left,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
 
-            -- delete button (anchored right, centered vertically)
-            local del = mk("TextButton", { Text = "Delete",
-                Font = THEME.fontBold, TextSize = 12, TextColor3 = Color3.new(1,1,1),
-                BackgroundColor3 = THEME.danger, BorderSizePixel = 0,
-                AutoButtonColor = false,
-                Position = UDim2.new(1, -82, 1, -34),
-                Size = UDim2.fromOffset(76, 26) }, row); corner(del, 4)
-            del.MouseEnter:Connect(function()
-                TweenService:Create(del, HOVER_TWEEN,
-                    { BackgroundColor3 = THEME.dangerHi }):Play()
-            end)
-            del.MouseLeave:Connect(function()
-                TweenService:Create(del, HOVER_TWEEN,
-                    { BackgroundColor3 = THEME.danger }):Play()
-            end)
-            del.MouseButton1Click:Connect(function()
-                rec:DeleteRecording(f.name)
-                -- Optimistic UI update: drop just this row instead of
-                -- re-populating the whole list (which made every other
-                -- recording flicker out + back in).
-                row:Destroy()
-                local any = false
-                for _, c in ipairs(scroll:GetChildren()) do
-                    if c:IsA("Frame") then any = true; break end
+            -- Folder path label (very small, gray) — shows where it lives on
+            -- disk, makes the new subfolder layout discoverable.
+            mk("TextLabel", { Text = (f.folder or FOLDER),
+                Font = THEME.fontMono, TextSize = 10,
+                TextColor3 = THEME.subtext, BackgroundTransparency = 1,
+                Position = UDim2.fromOffset(0, 62),
+                Size = UDim2.new(1, -CTRL_RES, 0, 14),
+                TextTransparency = 0.35,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd }, row)
+
+            -- Helper for a 76x22 stacked action button.
+            local function actionBtn(text, y, bg)
+                local b = mk("TextButton", { Text = text,
+                    Font = THEME.fontBold, TextSize = 11,
+                    TextColor3 = Color3.new(1, 1, 1),
+                    BackgroundColor3 = bg, BorderSizePixel = 0,
+                    AutoButtonColor = false,
+                    Position = UDim2.new(1, -BTN_W, 0, y),
+                    Size = UDim2.fromOffset(BTN_W, 22) }, row)
+                corner(b, 4); return b
+            end
+
+            -- Folder: copies the recording's containing folder path. If
+            -- setclipboard isn't available, fall back to a notify with the
+            -- path so the user can still read it.
+            local folderBtn = actionBtn("Folder", 0, THEME.tabActive)
+            folderBtn.MouseButton1Click:Connect(function()
+                local p = f.folder or FOLDER
+                if setClipboard then
+                    pcall(setClipboard, p)
+                    notify("ROCORDER",
+                        "Path copied. Find it under your executor's workspace folder.", 4)
+                else
+                    notify("ROCORDER", "Path: " .. p, 8)
                 end
-                if not any then populate() end  -- show empty state
             end)
+
+            -- Clear: drop this recording's referenced asset files. Doesn't
+            -- touch the recording itself — only the cache it pulled into
+            -- ROCORDER/assets/. Two-step confirm.
+            local clearBtn = actionBtn("Clear", 28, THEME.tabActive)
+            confirmableButton(clearBtn, "Clear", "Confirm?",
+                THEME.tabActive, THEME.danger, function()
+                    local n = rec:ClearAssets(f)
+                    notify("ROCORDER",
+                        fmt("Cleared %d cached asset(s) for this recording.", n), 3)
+                    refreshAssetsBanner()
+                end)
+
+            -- Delete: full recording wipe. Two-step confirm.
+            local del = actionBtn("Delete", 56, THEME.danger)
+            confirmableButton(del, "Delete", "Confirm?",
+                THEME.danger, THEME.dangerHi, function()
+                    rec:DeleteRecording(f.name)
+                    row:Destroy()
+                    -- Drop the entry from the cached list so a re-sort
+                    -- doesn't bring it back.
+                    for i, item in ipairs(cachedFiles) do
+                        if item.name == f.name then
+                            table.remove(cachedFiles, i); break
+                        end
+                    end
+                    local any = false
+                    for _, c in ipairs(scroll:GetChildren()) do
+                        if c:IsA("Frame") then any = true; break end
+                    end
+                    if not any then renderList() end
+                    refreshAssetsBanner()
+                end)
         end
     end
+
+    local function populate()
+        cachedFiles = rec:GetRecordings()
+        refreshAssetsBanner()
+        renderList()
+    end
+
+    sortBtn.MouseButton1Click:Connect(function()
+        _showChoiceDropdown(sortBtn, FILES_SORT_ORDER, currentSort, function(v)
+            currentSort = v
+            sortLbl.Text = "Sort: " .. v
+            renderList()  -- cheap — same cached files, new order
+        end)
+    end)
+
     refresh.MouseButton1Click:Connect(populate)
     UI.refreshFiles = populate
     return { view = view, populate = populate }
