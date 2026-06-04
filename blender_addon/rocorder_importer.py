@@ -1,14 +1,14 @@
 bl_info = {
     "name": "ROCORDER Replay Importer",
     "author": "ROCORDER",
-    "version": (1, 24, 2),
+    "version": (1, 24, 3),
     "blender": (3, 0, 0),
     "location": "File > Import > Roblox Replay (.rec)",
     "description": "Import ROCORDER .rec replays as skinned, animated armatures",
     "warning": "Alpha — file formats and options may still change",
     "category": "Import-Export",
 }
-ROCORDER_VERSION = "1.24.2-alpha"
+ROCORDER_VERSION = "1.24.3-alpha"
 
 # ============================================================================
 # Skinning math (why bone visuals can be anything without breaking animation)

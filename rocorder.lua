@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.24.2-alpha"
+local ROCORDER_VERSION = "1.24.3-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -4701,13 +4701,22 @@ function rec:UniqueAssetsFor(rec_info, refCount, mustBeCached)
     if mustBeCached == nil then mustBeCached = true end
     local mine = self:_recordingAssetIds(rec_info)
     local unique, n = {}, 0
+    local skipShared, skipNotCached = 0, 0
     for id in pairs(mine) do
-        if (refCount[id] or 0) <= 1 then
-            if (not mustBeCached) or _isCached(id) then
-                unique[id] = true; n = n + 1
-            end
+        local rc = refCount[id] or 0
+        if rc > 1 then
+            skipShared = skipShared + 1
+        elseif mustBeCached and not _isCached(id) then
+            skipNotCached = skipNotCached + 1
+        else
+            unique[id] = true; n = n + 1
         end
     end
+    print(fmt("[ROCORDER unique] rec=%s: %d in rig, %d shared (skipped), "
+        .. "%d not-cached (skipped, mustBeCached=%s), %d truly unique",
+        (rec_info and rec_info.base) or "?",
+        (function() local c = 0; for _ in pairs(mine) do c = c + 1 end; return c end)(),
+        skipShared, skipNotCached, tostring(mustBeCached), n))
     return unique, n
 end
 
@@ -4726,15 +4735,34 @@ function rec:ClearAssets(idSet)
 
     if idSet then
         local n = 0
+        local idCount = 0
+        local missing = 0
         for id in pairs(idSet) do
-            for _, ext in ipairs({ "", ".geom.json", ".png" }) do
+            idCount = idCount + 1
+            local deletedAny = false
+            -- _isCached probes <id>.geom.json (meshes), <id>.rgba (images,
+            -- the actual on-disk format), <id> (bare bin). PNG was a guess
+            -- from 1.24.x — the image extractor writes .rgba, so the
+            -- previous extension list (.png) silently left every image
+            -- cached after a Clear, which kept _isCached returning true
+            -- and the button label stuck at "Clear N unique".
+            for _, ext in ipairs({ "", ".geom.json", ".rgba" }) do
                 local p = ASSETS_FOLDER .. "/" .. id .. ext
                 if isfile and isfile(p) then
-                    if pcall(delfile, p) then n = n + 1 end
+                    if pcall(delfile, p) then
+                        n = n + 1; deletedAny = true
+                        print(fmt("[ROCORDER clear] deleted %s", p))
+                    end
                 end
+            end
+            if not deletedAny then
+                missing = missing + 1
+                print(fmt("[ROCORDER clear] id %s — no files on disk", id))
             end
             EXTRACTED[id] = nil
         end
+        print(fmt("[ROCORDER clear] summary: %d ids requested, %d files "
+            .. "deleted, %d ids had no on-disk files", idCount, n, missing))
         return n
     end
 
@@ -5653,6 +5681,47 @@ local function buildSettingsView(parent)
     end)
     refreshAdvanced()
 
+    -- Reset to defaults — a danger-styled, confirm-on-second-click button
+    -- at the very bottom of the Settings list. Iterates SETTING_DEFS and
+    -- calls SetSetting for each, then walks every control's refresh()
+    -- closure to push the new value back into the visible UI. Sources tab
+    -- controls (managed separately) also need a refresh sweep so their
+    -- ON/OFF buttons re-sync.
+    local resetBtn = mk("TextButton", { Text = "Reset to defaults",
+        Font = THEME.fontBold, TextSize = 13,
+        TextColor3 = Color3.new(1, 1, 1),
+        BackgroundColor3 = THEME.danger, BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Size = UDim2.new(1, -6, 0, 36),
+        LayoutOrder = 10000,
+    }, view); corner(resetBtn, 6)
+    confirmableButton(resetBtn, "Reset to defaults", "Confirm reset?",
+        THEME.danger, THEME.dangerHi, function()
+            for _, d in ipairs(SETTING_DEFS) do
+                rec:SetSetting(d.key, d.default)
+            end
+            -- Re-sync every visible control on both tabs. Three shapes:
+            --   * bool/choice — table {btn, refresh}, call refresh()
+            --   * number      — bare TextBox Instance, set .Text
+            --   * key         — bare TextButton Instance, set .Text
+            for key, c in pairs(controls) do
+                local d = defByKey(key)
+                if d then
+                    if type(c) == "table" and c.refresh then
+                        c.refresh()
+                    elseif typeof(c) == "Instance" then
+                        c.Text = tostring(rec.cfg[key])
+                    end
+                end
+            end
+            if UI.sourcesCtl and UI.sourcesCtl.controls then
+                for _, c in pairs(UI.sourcesCtl.controls) do
+                    if c.refresh then c.refresh() end
+                end
+            end
+            notify("ROCORDER", "All settings reset to defaults.", 3)
+        end)
+
     return { view = view, controls = controls }
 end
 
@@ -5736,26 +5805,32 @@ local function buildFilesView(parent)
     }, header); corner(sortBtn, 4); stroke(sortBtn, THEME.border, 1)
     pad(sortBtn, 10, 0, 10, 0)
 
-    -- Direction toggle. Image-free, uses the explicit Unicode arrows
-    -- "\xE2\x86\x93" (↓) / "\xE2\x86\x91" (↑) which Gotham does render.
-    -- Square 28×28 so it matches the refresh hit target visually.
+    -- Direction toggle. Uses ↓ (U+2193) / ↑ (U+2191), which Gotham does
+    -- render (unlike the curved-arrow glyphs U+21BB / U+21BA). 32×28 so
+    -- the glyph has horizontal breathing room — at 28×28 the bold arrow
+    -- sat tight against the button's rounded edges.
     local dirBtn = mk("TextButton", {
-        Text = "\xE2\x86\x93", Font = THEME.fontBold, TextSize = 16,
+        Text = "\xE2\x86\x93", Font = THEME.fontBold, TextSize = 18,
         TextColor3 = THEME.text, BackgroundColor3 = THEME.bg,
         BorderSizePixel = 0, AutoButtonColor = false,
-        Position = UDim2.new(1, -76, 0.5, -14),
-        Size = UDim2.fromOffset(28, 28),
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        Position = UDim2.new(1, -80, 0.5, -14),
+        Size = UDim2.fromOffset(32, 28),
     }, header); corner(dirBtn, 4); stroke(dirBtn, THEME.border, 1)
 
-    -- Refresh — a circular-arrow icon that rotates 360° on click. The
-    -- rotation is the visible acknowledgment of the click, fixing the
-    -- 1.24.1 confusion where pressing Refresh produced no visual change
-    -- if the disk state was already current.
+    -- Refresh — 🔄 emoji (U+1F504, "CLOCKWISE DOWNWARDS AND UPWARDS OPEN
+    -- CIRCLE ARROWS") that spins 360° on click. The 1.24.2 "↻" (U+21BB)
+    -- rendered as a blank box in Gotham. Emoji code points route through
+    -- Roblox's system emoji fallback, which works consistently on
+    -- Windows desktop.
     local refresh = mk("TextButton", {
-        Text = "\xE2\x86\xBB", Font = THEME.fontBold, TextSize = 18,
+        Text = "\xF0\x9F\x94\x84", Font = THEME.fontBold, TextSize = 16,
         TextColor3 = Color3.new(1, 1, 1),
         BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
         AutoButtonColor = false,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Center,
         Position = UDim2.new(1, -36, 0.5, -14),
         Size = UDim2.fromOffset(36, 28) }, header); corner(refresh, 4)
 
@@ -5858,34 +5933,11 @@ local function buildFilesView(parent)
                 AutomaticSize = Enum.AutomaticSize.Y }, scroll)
             corner(row, 6); pad(row, 14, 12, 14, 12)
 
-            -- Place icon — left-side 48×48 thumbnail of the game. Pulled
-            -- from MarketplaceService:GetProductInfo(placeId).IconImageAssetId
-            -- via lookupGameIcon (cached). Falls back to a flat panel of
-            -- the accent color when the icon isn't known yet (the lookup
-            -- is sync but the first call yields; subsequent calls are
-            -- instant from cache). Text labels start at x=58 (icon 48 +
-            -- 10 gap).
-            local TEXT_X = 58
-            local iconHolder = mk("Frame", {
-                BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
-                Position = UDim2.fromOffset(0, 0),
-                Size = UDim2.fromOffset(48, 48) }, row)
-            corner(iconHolder, 6); stroke(iconHolder, THEME.border, 1)
-            local iconId = f.placeId and lookupGameIcon(f.placeId)
-            if iconId then
-                local img = mk("ImageLabel", {
-                    BackgroundTransparency = 1,
-                    Image = "rbxassetid://" .. tostring(iconId),
-                    ScaleType = Enum.ScaleType.Fit,
-                    Size = UDim2.fromScale(1, 1) }, iconHolder)
-                corner(img, 6)
-            end
-
-            -- filename
+            -- filename — full width minus the CLIP pill on the right.
             mk("TextLabel", { Text = f.name, Font = THEME.fontBold, TextSize = 13,
                 TextColor3 = THEME.text, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(TEXT_X, 0),
-                Size = UDim2.new(1, -(TEXT_X + 56), 0, 18),
+                Position = UDim2.fromOffset(0, 0),
+                Size = UDim2.new(1, -56, 0, 18),
                 TextXAlignment = Enum.TextXAlignment.Left,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
             if f.isClip then
@@ -5909,11 +5961,29 @@ local function buildFilesView(parent)
                 Text = duration .. "  \xE2\x80\xA2  " .. dateStr,
                 Font = THEME.fontMono, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(TEXT_X, 22),
-                Size = UDim2.new(1, -TEXT_X, 0, 16),
+                Position = UDim2.fromOffset(0, 22),
+                Size = UDim2.new(1, 0, 0, 16),
                 TextXAlignment = Enum.TextXAlignment.Left }, row)
 
-            -- game · size
+            -- game · size, with a small 18×18 icon to the LEFT of the
+            -- game name. The icon is inline with this metadata line
+            -- instead of taking the whole left column of the card.
+            local ICON_W, ICON_GAP = 18, 6
+            local iconId = f.placeId and lookupGameIcon(f.placeId)
+            local iconHolder = mk("Frame", {
+                BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
+                Position = UDim2.fromOffset(0, 42),
+                Size = UDim2.fromOffset(ICON_W, ICON_W) }, row)
+            corner(iconHolder, 3); stroke(iconHolder, THEME.border, 1)
+            if iconId then
+                local img = mk("ImageLabel", {
+                    BackgroundTransparency = 1,
+                    Image = "rbxassetid://" .. tostring(iconId),
+                    ScaleType = Enum.ScaleType.Fit,
+                    Size = UDim2.fromScale(1, 1) }, iconHolder)
+                corner(img, 3)
+            end
+
             local gameStr = f.placeName
                          or (f.placeId and fmt("placeId %d", f.placeId))
                          or "unknown place"
@@ -5921,20 +5991,19 @@ local function buildFilesView(parent)
                 Text = gameStr .. "  \xE2\x80\xA2  " .. humanBytes(f.size or 0),
                 Font = THEME.fontReg, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(TEXT_X, 42),
-                Size = UDim2.new(1, -TEXT_X, 0, 16),
+                Position = UDim2.fromOffset(ICON_W + ICON_GAP, 42),
+                Size = UDim2.new(1, -(ICON_W + ICON_GAP), 0, 18),
                 TextXAlignment = Enum.TextXAlignment.Left,
+                TextYAlignment = Enum.TextYAlignment.Center,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
 
             -- ---- Action toolbar (horizontal, bottom) ----
-            -- Was 3 buttons stacked vertically on the right; this lays
-            -- them out left-to-right at the bottom of the card so they
-            -- read like a normal action bar. Aligned to TEXT_X so the
-            -- buttons start at the same x as the recording name above,
-            -- which reads as "this is the card body's content column".
+            -- Horizontal action bar along the bottom of the card.
+            -- Folder is a small icon (📂); Clear shows the unique-asset
+            -- count; Delete keeps its danger-styled text.
             local toolbar = mk("Frame", { BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(TEXT_X, 72),
-                Size = UDim2.new(1, -TEXT_X, 0, 28) }, row)
+                Position = UDim2.fromOffset(0, 72),
+                Size = UDim2.new(1, 0, 0, 28) }, row)
             hlist(toolbar, 8)
 
             -- Folder icon button. Copies the global shell-friendly path
