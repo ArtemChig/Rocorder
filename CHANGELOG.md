@@ -9,6 +9,46 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.24.2-alpha — 2026-06-02
+
+Files-tab polish round from the live UI test:
+
+- **Refresh button is now a circular-arrow icon that spins on click.**
+  The text "Refresh" button gave no visible feedback when the disk
+  state was unchanged, so it read as broken. Same behaviour as before
+  (calls populate), but now the click is acknowledged with a 360°
+  Rotation tween.
+- **Sort UI redesigned.** Was a click-cycle dropdown with a chevron that
+  rendered as tofu in Gotham. Now two side-by-side controls:
+  `Sort: <field>` dropdown (Date / Game / Duration / Size, no chevron
+  glyph — the whole filled-rounded button reads as clickable) +
+  a 28×28 ↓/↑ direction toggle. Picking a new field resets the
+  direction to its natural default (a→z for Game, newest/longest/
+  largest first elsewhere).
+- **Asset cache count is bold.** RichText `<b>%d</b>` on the banner so
+  the file count is the first thing the eye lands on.
+- **Game icons.** Each recording row now shows the place's icon (48×48
+  thumbnail to the left of the recording name) via
+  `MarketplaceService:GetProductInfo(placeId).IconImageAssetId`.
+  Lookup piggybacks on the existing place-info cache, so the first
+  render pre-warms both the game name AND the icon in one call.
+  Placeholder square shows when the icon isn't yet known.
+- **Clear button now reflects what'll actually be deleted.**
+  `rec:UniqueAssetsFor` defaults `mustBeCached = true` — only counts
+  ids that are *currently on disk* AND unique to this recording. Was
+  the cause of "Clear 19 unique" still saying 19 after a successful
+  clear: the ids were still unique to that recording's rig.json, the
+  files just weren't there anymore. Now the count drops to 0 after
+  clearing and the button greys out.
+- **Clear notification reports the unique-id count, not the file
+  count.** Each id can have up to 3 companion files on disk (`<id>`,
+  `<id>.geom.json`, `<id>.png`), so "Cleared 10 files" for 19 ids was
+  confusing. Now matches the button label: "Cleared N unique
+  asset(s)".
+- **Header button spacing tightened.** Sort / direction / refresh now
+  cluster tightly to the right of the header instead of leaving a
+  44px gap between the direction toggle and refresh.
+
 ## 1.24.1-alpha — 2026-06-02
 
 Polish pass on the 1.24.0 Files tab + a long-standing FPS-game pain point:

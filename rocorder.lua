@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.24.1-alpha"
+local ROCORDER_VERSION = "1.24.2-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -390,22 +390,42 @@ end
 
 -- MarketplaceService:GetProductInfo yields and makes an HTTP call. Cache the
 -- result so we don't refetch on every recording, replay save, or Files refresh.
-local gameNameCache = {}
-local function lookupGameName(placeId)
-    if gameNameCache[placeId] ~= nil then
-        local v = gameNameCache[placeId]
-        if v == false then return nil end
-        return v
+-- Place-info cache (1.24.2). One MarketplaceService:GetProductInfo call per
+-- placeId yields both the Name (for filename slug + Files-tab display) and
+-- the IconImageAssetId (for the game thumbnail next to the recording row).
+-- `false` marks a hard failure so we don't retry forever.
+local placeInfoCache = {}
+
+local function _fetchPlaceInfo(placeId)
+    if not placeId then return nil end
+    if placeInfoCache[placeId] ~= nil then
+        local v = placeInfoCache[placeId]
+        return v ~= false and v or nil
     end
     local ok, info = pcall(function()
         return MarketplaceService:GetProductInfo(placeId)
     end)
-    if ok and type(info) == "table" and info.Name and info.Name ~= "" then
-        gameNameCache[placeId] = info.Name
-        return info.Name
+    if not (ok and type(info) == "table") then
+        placeInfoCache[placeId] = false
+        return nil
     end
-    gameNameCache[placeId] = false  -- negative cache (don't keep retrying)
-    return nil
+    local entry = {
+        name = (info.Name and info.Name ~= "") and info.Name or nil,
+        iconId = (type(info.IconImageAssetId) == "number"
+            and info.IconImageAssetId > 0) and info.IconImageAssetId or nil,
+    }
+    placeInfoCache[placeId] = entry
+    return entry
+end
+
+local function lookupGameName(placeId)
+    local entry = _fetchPlaceInfo(placeId)
+    return entry and entry.name or nil
+end
+
+local function lookupGameIcon(placeId)
+    local entry = _fetchPlaceInfo(placeId)
+    return entry and entry.iconId or nil
 end
 
 -- Filesystem-safe slug for a free-form name. Lowercases, replaces runs of
@@ -4671,13 +4691,21 @@ end
 
 -- Asset ids that this recording references AND no other recording does.
 -- Caller passes a precomputed refCount map (from _buildAssetRefCount) so
--- N rows = 1 disk pass instead of N². Returns {set, count}.
-function rec:UniqueAssetsFor(rec_info, refCount)
+-- N rows = 1 disk pass instead of N². When `mustBeCached` is true (the
+-- default for the Files-tab Clear button) we additionally require the id
+-- to currently exist in the on-disk cache — otherwise the button label
+-- would still say "Clear 19 unique" right after a successful Clear, when
+-- the unique ids still uniquely belong to the recording but the files
+-- they point to are gone. Returns {set, count}.
+function rec:UniqueAssetsFor(rec_info, refCount, mustBeCached)
+    if mustBeCached == nil then mustBeCached = true end
     local mine = self:_recordingAssetIds(rec_info)
     local unique, n = {}, 0
     for id in pairs(mine) do
         if (refCount[id] or 0) <= 1 then
-            unique[id] = true; n = n + 1
+            if (not mustBeCached) or _isCached(id) then
+                unique[id] = true; n = n + 1
+            end
         end
     end
     return unique, n
@@ -5628,22 +5656,23 @@ local function buildSettingsView(parent)
     return { view = view, controls = controls }
 end
 
--- Sort options for the Files tab list. Each comparator runs in
--- `table.sort(out, comparator)`. Newest-first relies on the new lexical
--- filename pattern being chronological; for old-layout files the unix
--- suffix gives the same monotonic order.
-local FILES_SORT_ORDER = { "Newest", "Oldest", "Game", "Duration", "Size" }
-local FILES_SORTERS = {
-    Newest   = function(a, b) return (a.startedAt or 0) > (b.startedAt or 0) end,
-    Oldest   = function(a, b) return (a.startedAt or 0) < (b.startedAt or 0) end,
-    Game     = function(a, b)
-        local aName = (a.placeName or "~"):lower()
-        local bName = (b.placeName or "~"):lower()
-        if aName ~= bName then return aName < bName end
-        return (a.startedAt or 0) > (b.startedAt or 0)
-    end,
-    Duration = function(a, b) return (a.durationSec or 0) > (b.durationSec or 0) end,
-    Size     = function(a, b) return (a.size or 0) > (b.size or 0) end,
+-- Files-tab sort: a field plus a direction toggle (ascending/descending).
+-- Each field returns a comparable scalar; the comparator wraps the field
+-- getter and flips on direction. Decoupling the two lets the user pick
+-- e.g. "Date ascending" or "Size descending" without the dropdown
+-- needing N×2 entries.
+local FILES_SORT_FIELDS = { "Date", "Game", "Duration", "Size" }
+local FILES_SORT_GETTERS = {
+    Date     = function(f) return f.startedAt or 0 end,
+    Game     = function(f) return (f.placeName or "~"):lower() end,
+    Duration = function(f) return f.durationSec or 0 end,
+    Size     = function(f) return f.size or 0 end,
+}
+-- Sensible default direction per field — picking a new field resets the
+-- direction to what most users want there. Game alphabetical (a→z);
+-- everything else "largest / newest / longest first".
+local FILES_SORT_DEFAULT_ASC = {
+    Date = false, Game = true, Duration = false, Size = false,
 }
 
 -- A small two-step "Click → Confirm?" pattern shared by destructive buttons
@@ -5678,7 +5707,11 @@ local function buildFilesView(parent)
         Size = UDim2.fromScale(1, 1) }, parent)
     pad(view, 16); vlist(view, 10)
 
-    -- ----- Header row: title + Sort dropdown + Refresh ----------------
+    -- ----- Header row: title + sort dropdown + direction toggle + refresh icon
+    -- All actions cluster to the right with consistent 28×28 hit targets so
+    -- they read as a toolbar. The old "Refresh" text button replaced with a
+    -- circular-arrow icon that spins on click so the click is visibly
+    -- acknowledged even when the disk state hasn't changed.
     local header = mk("Frame", { BackgroundTransparency = 1,
         Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 1 }, view)
     mk("TextLabel", { Text = "Recordings", Font = THEME.fontBold, TextSize = 16,
@@ -5686,34 +5719,45 @@ local function buildFilesView(parent)
         Size = UDim2.new(0, 130, 1, 0),
         TextXAlignment = Enum.TextXAlignment.Left }, header)
 
-    local currentSort = "Newest"
-    -- Sort dropdown — reuses _showChoiceDropdown so it looks/behaves like
-    -- the choice settings on the Settings tab (same anchor, same outside-
-    -- click dismissal, same chevron).
-    local sortBtn = mk("TextButton", {
-        Text = "", AutoButtonColor = false, BorderSizePixel = 0,
-        BackgroundColor3 = THEME.bg,
-        Position = UDim2.new(1, -212, 0.5, -14),
-        Size = UDim2.fromOffset(120, 28),
-    }, header); corner(sortBtn, 4); stroke(sortBtn, THEME.border, 1)
-    local sortLbl = mk("TextLabel", { Text = "Sort: Newest",
-        Font = THEME.fontReg, TextSize = 12, TextColor3 = THEME.text,
-        BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(10, 0),
-        Size = UDim2.new(1, -28, 1, 0),
-        TextXAlignment = Enum.TextXAlignment.Left }, sortBtn)
-    mk("TextLabel", { Text = "\xE2\x96\xBE",
-        Font = THEME.fontBold, TextSize = 13, TextColor3 = THEME.subtext,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(1, -22, 0, 0),
-        Size = UDim2.fromOffset(20, 28),
-        TextXAlignment = Enum.TextXAlignment.Center }, sortBtn)
+    local currentSort = "Date"
+    local sortAscending = false   -- default: newest / largest first
 
-    local refresh = mk("TextButton", { Text = "Refresh", Font = THEME.fontBold,
-        TextSize = 13, TextColor3 = Color3.new(1,1,1),
-        BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AutoButtonColor = false,
-        Position = UDim2.new(1, -88, 0.5, -14),
-        Size = UDim2.fromOffset(80, 28) }, header); corner(refresh, 4)
+    -- Sort dropdown — short label "Sort: <field>" without a chevron glyph
+    -- (Gotham renders it as tofu on some game / language combos). The
+    -- whole button being filled-and-rounded reads as "click for a list"
+    -- on its own; we don't need the chevron to communicate it.
+    local sortBtn = mk("TextButton", {
+        Text = "Sort: Date", Font = THEME.fontReg, TextSize = 12,
+        TextColor3 = THEME.text, BackgroundColor3 = THEME.bg,
+        BorderSizePixel = 0, AutoButtonColor = false,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Position = UDim2.new(1, -200, 0.5, -14),
+        Size = UDim2.fromOffset(116, 28),
+    }, header); corner(sortBtn, 4); stroke(sortBtn, THEME.border, 1)
+    pad(sortBtn, 10, 0, 10, 0)
+
+    -- Direction toggle. Image-free, uses the explicit Unicode arrows
+    -- "\xE2\x86\x93" (↓) / "\xE2\x86\x91" (↑) which Gotham does render.
+    -- Square 28×28 so it matches the refresh hit target visually.
+    local dirBtn = mk("TextButton", {
+        Text = "\xE2\x86\x93", Font = THEME.fontBold, TextSize = 16,
+        TextColor3 = THEME.text, BackgroundColor3 = THEME.bg,
+        BorderSizePixel = 0, AutoButtonColor = false,
+        Position = UDim2.new(1, -76, 0.5, -14),
+        Size = UDim2.fromOffset(28, 28),
+    }, header); corner(dirBtn, 4); stroke(dirBtn, THEME.border, 1)
+
+    -- Refresh — a circular-arrow icon that rotates 360° on click. The
+    -- rotation is the visible acknowledgment of the click, fixing the
+    -- 1.24.1 confusion where pressing Refresh produced no visual change
+    -- if the disk state was already current.
+    local refresh = mk("TextButton", {
+        Text = "\xE2\x86\xBB", Font = THEME.fontBold, TextSize = 18,
+        TextColor3 = Color3.new(1, 1, 1),
+        BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Position = UDim2.new(1, -36, 0.5, -14),
+        Size = UDim2.fromOffset(36, 28) }, header); corner(refresh, 4)
 
     -- ----- Assets-cache banner ---------------------------------------
     -- Compact strip above the list showing the cached-asset count and a
@@ -5741,10 +5785,13 @@ local function buildFilesView(parent)
             assetsLbl.Text = "Asset cache: empty"
         end)
 
-    -- Refresh the cache count whenever populate() runs.
+    -- Cache count gets a bold callout in RichText so the number is the
+    -- first thing the eye lands on. RichText is no-op for the
+    -- error/empty messages so leave it enabled for all branches.
+    assetsLbl.RichText = true
     local function refreshAssetsBanner()
         if not (listfiles and isfolder) then
-            assetsLbl.Text = "Asset cache: (executor lacks file listing)"
+            assetsLbl.Text = "Asset cache: <i>executor lacks file listing</i>"
             return
         end
         if not isfolder(ASSETS_FOLDER) then
@@ -5756,7 +5803,8 @@ local function buildFilesView(parent)
         if n == 0 then
             assetsLbl.Text = "Asset cache: empty"
         else
-            assetsLbl.Text = fmt("Asset cache: %d files in ROCORDER/assets/", n)
+            assetsLbl.Text = fmt("Asset cache: <b>%d</b> files in "
+                .. "ROCORDER/assets/", n)
         end
     end
 
@@ -5779,8 +5827,18 @@ local function buildFilesView(parent)
         for _, c in ipairs(scroll:GetChildren()) do
             if c:IsA("Frame") then c:Destroy() end
         end
-        local sorter = FILES_SORTERS[currentSort] or FILES_SORTERS.Newest
-        table.sort(cachedFiles, sorter)
+        -- Composed comparator: field getter + direction toggle. Stable
+        -- secondary sort by startedAt so ties (e.g. same place name) order
+        -- chronologically rather than randomly.
+        local getter = FILES_SORT_GETTERS[currentSort]
+            or FILES_SORT_GETTERS.Date
+        table.sort(cachedFiles, function(a, b)
+            local av, bv = getter(a), getter(b)
+            if av == bv then
+                return (a.startedAt or 0) > (b.startedAt or 0)
+            end
+            if sortAscending then return av < bv else return av > bv end
+        end)
         if #cachedFiles == 0 then
             local empty = mk("Frame", { BackgroundColor3 = THEME.panel,
                 BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 60) }, scroll)
@@ -5794,22 +5852,40 @@ local function buildFilesView(parent)
             return
         end
         for _, f in ipairs(cachedFiles) do
-            -- One card per recording. AutomaticSize.Y lets the bottom
-            -- padding actually breathe under the action toolbar (was
-            -- clipped flat against the last button in the 3-stacked
-            -- design). Metadata sits in the upper area, the action
-            -- toolbar runs along the bottom.
             local row = mk("Frame", { BackgroundColor3 = THEME.panel,
                 BorderSizePixel = 0,
                 Size = UDim2.new(1, 0, 0, 0),
                 AutomaticSize = Enum.AutomaticSize.Y }, scroll)
             corner(row, 6); pad(row, 14, 12, 14, 12)
 
+            -- Place icon — left-side 48×48 thumbnail of the game. Pulled
+            -- from MarketplaceService:GetProductInfo(placeId).IconImageAssetId
+            -- via lookupGameIcon (cached). Falls back to a flat panel of
+            -- the accent color when the icon isn't known yet (the lookup
+            -- is sync but the first call yields; subsequent calls are
+            -- instant from cache). Text labels start at x=58 (icon 48 +
+            -- 10 gap).
+            local TEXT_X = 58
+            local iconHolder = mk("Frame", {
+                BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
+                Position = UDim2.fromOffset(0, 0),
+                Size = UDim2.fromOffset(48, 48) }, row)
+            corner(iconHolder, 6); stroke(iconHolder, THEME.border, 1)
+            local iconId = f.placeId and lookupGameIcon(f.placeId)
+            if iconId then
+                local img = mk("ImageLabel", {
+                    BackgroundTransparency = 1,
+                    Image = "rbxassetid://" .. tostring(iconId),
+                    ScaleType = Enum.ScaleType.Fit,
+                    Size = UDim2.fromScale(1, 1) }, iconHolder)
+                corner(img, 6)
+            end
+
             -- filename
             mk("TextLabel", { Text = f.name, Font = THEME.fontBold, TextSize = 13,
                 TextColor3 = THEME.text, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(0, 0),
-                Size = UDim2.new(1, -56, 0, 18),
+                Position = UDim2.fromOffset(TEXT_X, 0),
+                Size = UDim2.new(1, -(TEXT_X + 56), 0, 18),
                 TextXAlignment = Enum.TextXAlignment.Left,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
             if f.isClip then
@@ -5833,8 +5909,8 @@ local function buildFilesView(parent)
                 Text = duration .. "  \xE2\x80\xA2  " .. dateStr,
                 Font = THEME.fontMono, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(0, 22),
-                Size = UDim2.new(1, 0, 0, 16),
+                Position = UDim2.fromOffset(TEXT_X, 22),
+                Size = UDim2.new(1, -TEXT_X, 0, 16),
                 TextXAlignment = Enum.TextXAlignment.Left }, row)
 
             -- game · size
@@ -5845,23 +5921,20 @@ local function buildFilesView(parent)
                 Text = gameStr .. "  \xE2\x80\xA2  " .. humanBytes(f.size or 0),
                 Font = THEME.fontReg, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(0, 42),
-                Size = UDim2.new(1, 0, 0, 16),
+                Position = UDim2.fromOffset(TEXT_X, 42),
+                Size = UDim2.new(1, -TEXT_X, 0, 16),
                 TextXAlignment = Enum.TextXAlignment.Left,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
 
             -- ---- Action toolbar (horizontal, bottom) ----
             -- Was 3 buttons stacked vertically on the right; this lays
             -- them out left-to-right at the bottom of the card so they
-            -- read like a normal action bar. Folder is a small icon
-            -- button (📂); Clear shows the unique-asset count so the
-            -- user knows exactly what they're freeing; Delete keeps its
-            -- explicit text + danger styling. y=72 leaves a clear
-            -- visual gap between the bottom metadata line and the
-            -- toolbar.
+            -- read like a normal action bar. Aligned to TEXT_X so the
+            -- buttons start at the same x as the recording name above,
+            -- which reads as "this is the card body's content column".
             local toolbar = mk("Frame", { BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(0, 72),
-                Size = UDim2.new(1, 0, 0, 28) }, row)
+                Position = UDim2.fromOffset(TEXT_X, 72),
+                Size = UDim2.new(1, -TEXT_X, 0, 28) }, row)
             hlist(toolbar, 8)
 
             -- Folder icon button. Copies the global shell-friendly path
@@ -5919,13 +5992,25 @@ local function buildFilesView(parent)
                 confirmableButton(clearBtn, clearText, "Confirm?",
                     THEME.tabActive, THEME.danger, function()
                         local unique = rec:UniqueAssetsFor(f, refCount)
-                        local n = rec:ClearAssets(unique)
+                        -- Count BEFORE deletion. Each id can have up to 3
+                        -- companion files on disk (`<id>`, `<id>.geom.json`,
+                        -- `<id>.png`), so the deleted-files total often
+                        -- doesn't match the id count — but the user pressed
+                        -- "Clear N unique", so what they want to see is "N
+                        -- cleared", matching the label.
+                        local idCount = 0
+                        for _ in pairs(unique) do idCount = idCount + 1 end
+                        rec:ClearAssets(unique)
                         notify("ROCORDER",
-                            fmt("Cleared %d cached file(s).", n), 3)
+                            fmt("Cleared %d unique asset(s).", idCount), 3)
                         refreshAssetsBanner()
-                        -- Once cleared, this row's unique count is 0; re-render
-                        -- so the button label/state updates. Cheap.
-                        refCount = rec:_buildAssetRefCount(cachedFiles)
+                        -- After delete, the on-disk files for these ids are
+                        -- gone. UniqueAssetsFor's mustBeCached filter will
+                        -- now exclude them, so the next renderList shows
+                        -- "No unique assets" on this row. Cheap rebuild —
+                        -- refCount is unchanged (rig.json content unaffected)
+                        -- but we run the full populate to keep the cache
+                        -- banner count and per-row labels in sync.
                         renderList()
                     end)
             end
@@ -5969,14 +6054,42 @@ local function buildFilesView(parent)
     end
 
     sortBtn.MouseButton1Click:Connect(function()
-        _showChoiceDropdown(sortBtn, FILES_SORT_ORDER, currentSort, function(v)
+        _showChoiceDropdown(sortBtn, FILES_SORT_FIELDS, currentSort, function(v)
             currentSort = v
-            sortLbl.Text = "Sort: " .. v
+            sortBtn.Text = "Sort: " .. v
+            -- Reset to the field's natural direction (a→z for Game,
+            -- newest/largest first elsewhere) so the user doesn't have to
+            -- click the arrow after picking a new field.
+            local defAsc = FILES_SORT_DEFAULT_ASC[v]
+            if defAsc ~= nil then
+                sortAscending = defAsc
+                dirBtn.Text = sortAscending
+                    and "\xE2\x86\x91" or "\xE2\x86\x93"
+            end
             renderList()  -- cheap — same cached files, new order
         end)
     end)
 
-    refresh.MouseButton1Click:Connect(populate)
+    -- Asc/desc toggle. Arrow points the way the values flow: ↓ = high
+    -- to low (descending, the default), ↑ = low to high (ascending).
+    dirBtn.MouseButton1Click:Connect(function()
+        sortAscending = not sortAscending
+        dirBtn.Text = sortAscending and "\xE2\x86\x91" or "\xE2\x86\x93"
+        renderList()
+    end)
+
+    -- Refresh: spin the icon 360° so the click is visibly acknowledged
+    -- regardless of whether the disk state changed. Tween targets the
+    -- button itself; we add 360 each time so the spin compounds cleanly
+    -- if the user mashes the button.
+    refresh.MouseButton1Click:Connect(function()
+        local target = refresh.Rotation + 360
+        TweenService:Create(refresh,
+            TweenInfo.new(0.5, Enum.EasingStyle.Quad,
+                Enum.EasingDirection.Out),
+            { Rotation = target }):Play()
+        populate()
+    end)
     UI.refreshFiles = populate
     return { view = view, populate = populate }
 end
