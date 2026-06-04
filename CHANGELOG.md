@@ -9,6 +9,49 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.22.0-alpha — 2026-06-02
+
+Instant Replay alignment with everything we built since IR shipped, plus
+Defer mode now works correctly for IR.
+
+**Bug fix — IR clip time-domain desync.** This was bad and undiagnosed
+since per-life splits and per-part spans landed. IR clip .rec files are
+written with frame times normalized to `[0, duration]` (subtracting the
+oldest frame's timestamp), but the rig.json was being written verbatim
+with `fromT` / `toT` / `partSpans` still in absolute session-relative
+time. Result: importer would key frame `t=5` looking for a life whose
+`fromT` is 47.3 — every revision looked empty, per-part visibility keyed
+off the wrong frames, lives that ended just before the clip window
+appeared as zombie armatures. `Replay:save` now shifts all rig data into
+clip-local time as a final step, dropping revisions whose window doesn't
+overlap the clip, clamping fromT/toT/partSpans into `[0, duration]`, and
+dropping players whose every revision was outside the window. Deep-copies
+the revision tables first because they're shared by reference with
+`tracker.lifeHistory` — mutating in place would corrupt the live tracker.
+
+**Defer mode now applies to IR.** Earlier I (correctly) implemented
+Defer for full Start→Stop recordings but said it couldn't sensibly apply
+to IR. That was wrong. The fix: Defer pauses the queue worker whenever
+"capturing" — `rec.session` set OR `IR_ENABLED + rec.replay` — and
+SaveReplay now runs a targeted synchronous drain just before writing the
+clip. The drain walks the saved-window rigData with `collectAssetIds`,
+pops only those IDs from the queue, and processes them via the
+high-quality EditableMesh path. Typical cost: ~1–4 s extra at SaveReplay
+for a 30 s clip's ~20–80 referenced assets. Leftover queue entries from
+outside the window stay paused (they'll drain at the next save if
+re-referenced, or vanish on script reload).
+
+**Quiet mode now applies to IR too.** Same one-line generalisation —
+the frame-budget gate fires during IR buffering as well as full sessions.
+No behavioral change for full recordings; IR-only setups get the same
+"only extract when the frame's genuinely idle" treatment.
+
+Verified by an audit pass across the eight features added since IR
+landed: per-life splits, viewmodel POV, partSpans, camera capture,
+extract modes, mid-recording rescan, viewmodel rebuild detection, and
+time-domain handling. The two real bugs were the time-shift miss and
+Defer's IR gap; everything else was correct.
+
 ## 1.21.0-alpha — 2026-06-01
 
 New `Asset Extract Timing` setting (Settings → Capture) with three modes,

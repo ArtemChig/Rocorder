@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.21.0-alpha"
+local ROCORDER_VERSION = "1.22.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -1832,26 +1832,33 @@ local function _startExtractorWorker()
                     return
                 end
 
-                -- Extraction-timing mode (1.20.2). Defer: while a recording
-                -- session is active, hold the queue and don't extract — we'll
-                -- drain everything at Stop via the existing post-record
-                -- ASSET DOWNLOAD phase. Lets competitive players record with
-                -- zero in-game stutter at the cost of relying on the client
-                -- content cache surviving from draw-time until Stop (usually
-                -- fine; old briefly-seen stuff is the only real risk).
+                -- Extraction-timing mode (1.20.2, IR-extended 1.21.1).
+                -- "capturing" = a full Start/Stop session is active OR
+                -- Instant Replay is buffering. Both modes throttle/pause
+                -- whenever capture is happening; outside capture the worker
+                -- runs flat-out.
+                --
+                -- Defer: hold the queue entirely while capturing. For full
+                -- recordings the queue drains at Stop (rec.session goes nil,
+                -- the worker resumes via EditableMesh, and _downloadAssets
+                -- runs HTTP fallback in parallel). For IR-only, the
+                -- targeted-drain in rec:SaveReplay extracts JUST the assets
+                -- referenced in the saved window (so we never stall the
+                -- save by draining hours of accumulated queue).
+                --
+                -- Quiet: same gate, softer action — extract during capture
+                -- but only when the last heartbeat dt is well under target
+                -- (< 5 ms = frame is genuinely idle). Game under load? Wait
+                -- and try next iteration. Same correctness as Live, much
+                -- less perceived stutter during competitive play.
                 local mode = (rec and rec.cfg and rec.cfg.EXTRACT_MODE) or "Quiet"
-                if mode == "Defer" and rec.session then
+                local capturing = rec and (rec.session
+                    or (rec.cfg and rec.cfg.IR_ENABLED and rec.replay))
+                if mode == "Defer" and capturing then
                     task.wait(0.2)
                     return
                 end
-
-                -- Quiet: extract during recording, but only when the last
-                -- heartbeat dt is well under the target (5 ms). The client is
-                -- genuinely idle and an extraction won't be perceived as a
-                -- frame hitch. If the frame is slow (game under load), wait
-                -- and try again. Doesn't apply outside recording (post-stop
-                -- batch download has its own pacing) or in Live mode.
-                if mode == "Quiet" and rec and rec.session then
+                if mode == "Quiet" and capturing then
                     local dt = _G.ROCORDER_FRAME_DELTA or (1 / 60)
                     if dt > 0.005 then
                         task.wait(0.05)
@@ -3806,10 +3813,92 @@ function Replay:save(folder, cfg, rigData, lastSeconds)
     if #kept == 0 then return nil, "no frames in window" end
 
     local t0 = kept[1].t
+    local clipDuration = newestT - t0
     local base = fmt("replay_%d_%d_clip", game.PlaceId, os.time())
     local recName = base .. ".rec"
     local rigName = base .. ".rig.json"
-    rigData.recFile = recName
+
+    -- ============================================================
+    -- Time-shift the rig data into clip-local time [0, duration].
+    -- ============================================================
+    -- The frames we write below have been normalized to start at 0
+    -- (`f.t - t0`), but the rigData we received still has revision
+    -- `fromT` / `toT` and per-part `partSpans` in session-relative
+    -- (or script-relative in IR-only mode) absolute time. Without
+    -- shifting, the importer would key off frame t=5 looking for a
+    -- revision whose fromT is, say, 47.3 — every life would appear
+    -- empty and per-part visibility would key off the wrong frames.
+    --
+    -- We must NOT mutate the incoming rigData in place — its
+    -- revision tables are shared by reference with the tracker's
+    -- live `entry.lifeHistory` (see Tracker:_rebuildRefs +
+    -- Tracker:rigData), so mutating would corrupt the tracker for
+    -- subsequent recordings or rigData calls. Build a shallow clone
+    -- down to the partSpans level instead.
+    local function _shiftSpan(s)
+        local a = math.max(0, (s[1] or 0) - t0)
+        if s[2] == nil then return { a } end
+        local b = math.min(clipDuration, s[2] - t0)
+        if b <= a then return nil end  -- entirely outside window
+        return { a, b }
+    end
+    local shiftedRig = {
+        format     = rigData.format,
+        recFile    = recName,
+        capturedAt = rigData.capturedAt,
+        players    = {},
+    }
+    for uidStr, p in pairs(rigData.players or {}) do
+        local revs = p.revisions or {}
+        local kept_revs = {}
+        for _, rev in ipairs(revs) do
+            local rFrom = rev.fromT or 0
+            local rTo = rev.toT  -- may be nil (live life)
+            -- Drop revisions whose window doesn't overlap [t0, newestT].
+            local startsAfterClip = rFrom > newestT
+            local endsBeforeClip  = (rTo ~= nil) and (rTo < t0)
+            if not (startsAfterClip or endsBeforeClip) then
+                local newRev = {
+                    fromT           = math.max(0, rFrom - t0),
+                    toT             = (rTo == nil) and nil
+                                       or math.min(clipDuration, rTo - t0),
+                    rigType         = rev.rigType,
+                    parts           = rev.parts,
+                    joints          = rev.joints,
+                    clothing        = rev.clothing,
+                    characterMeshes = rev.characterMeshes,
+                    externalParts   = rev.externalParts,
+                    isViewmodel     = rev.isViewmodel,
+                    sourcePath      = rev.sourcePath,
+                }
+                if rev.partSpans then
+                    local newSpans = {}
+                    for i, partList in ipairs(rev.partSpans) do
+                        local newList = {}
+                        for _, span in ipairs(partList) do
+                            local sh = _shiftSpan(span)
+                            if sh then newList[#newList + 1] = sh end
+                        end
+                        newSpans[i] = newList
+                    end
+                    newRev.partSpans = newSpans
+                end
+                kept_revs[#kept_revs + 1] = newRev
+            end
+        end
+        -- Skip players whose every revision was dropped (entry was in the
+        -- player list only because of an older sighting outside the window).
+        if #kept_revs > 0 then
+            shiftedRig.players[uidStr] = {
+                userId      = p.userId,
+                name        = p.name,
+                displayName = p.displayName,
+                revisions   = kept_revs,
+            }
+        end
+    end
+    rigData = shiftedRig
+    -- ============================================================
 
     -- roster taken from the rigData we received
     local roster = {}
@@ -3989,6 +4078,72 @@ end
 -- using the executor's authenticated session. Runs in a coroutine so it never
 -- blocks. Blender then reads these local files instead of hitting the (401'd)
 -- anonymous CDN. `logSink` is the just-finished session (for its debug log).
+-- Defer-mode IR drain (1.21.1). Take the rigData that's about to be written
+-- alongside an IR clip and extract every asset it references RIGHT NOW —
+-- synchronously, on the calling thread — by popping matching entries out of
+-- the queue and processing them. Skips IDs already on disk or already
+-- EXTRACTED by a prior drain.
+--
+-- Why synchronously: SaveReplay's pcall is the user's "save this moment"
+-- action; the rig.json we're about to write references these assets. If we
+-- left them in the queue and trusted the worker to catch up, the clip would
+-- import with missing meshes (or fall through to HTTP which 401s for most
+-- restricted UGC). The user accepts a small save-time delay in exchange for
+-- zero in-game stutter — that's the whole point of Defer.
+--
+-- Bounded cost: only IDs referenced in the saved window get drained (typical
+-- range: 20-80 assets for a 30s clip), at ~50 ms each via EditableMesh =
+-- ~1-4 s of save delay. Leftover queue entries from outside the window
+-- stay paused for the next drain.
+function rec:_drainQueueForRigData(rigData)
+    local Q = _G.ROCORDER_EXTRACT_QUEUE
+    if not Q or not rigData or not rigData.players then return end
+
+    -- Collect IDs from every revision (lives in lifeHistory + the live one).
+    local needed = {}
+    for _, p in pairs(rigData.players) do
+        for _, rev in ipairs(p.revisions or {}) do
+            collectAssetIds(rev, needed)  -- rev has parts+clothing, same shape
+        end
+    end
+
+    local dbg = _G.ROCORDER_CURRENT_DBG
+    local drained, alreadyDone, notQueued = 0, 0, 0
+    for id in pairs(needed) do
+        if EXTRACTED[id] or _isCached(id) then
+            alreadyDone = alreadyDone + 1
+        else
+            local entry = Q.byId[id]
+            if entry then
+                Q.byId[id] = nil
+                -- Pop the entry out of Q.queue (linear scan — N is at most a
+                -- few hundred in practice and this runs once per IR save).
+                for i, e in ipairs(Q.queue) do
+                    if e == entry then
+                        table.remove(Q.queue, i)
+                        break
+                    end
+                end
+                local ok, err = pcall(_processOne, entry, dbg)
+                if not ok and dbg then
+                    pcall(dbg, fmt("  IR drain: EXTRACT %s %s threw: %s",
+                        entry.kind, entry.id, tostring(err)))
+                end
+                drained = drained + 1
+                task.wait()  -- yield once per asset so the game keeps breathing
+            else
+                notQueued = notQueued + 1
+            end
+        end
+    end
+
+    if dbg then
+        pcall(dbg, fmt("IR Defer drain: %d extracted, %d already cached, "
+            .. "%d not in queue (will use HTTP fallback)",
+            drained, alreadyDone, notQueued))
+    end
+end
+
 function rec:_downloadAssets(logSink)
     if not self.cfg.DOWNLOAD_ASSETS then return end
     -- Concurrency guard: prevent the dual-download bug where a re-loaded
@@ -4214,6 +4369,15 @@ function rec:SaveReplay(seconds)
         -- only players seen within the buffered window
         local rigData = self.tracker:rigData("",
             os.clock() - (self.cfg.IR_BUFFER_SEC + 2))
+        -- Defer mode: the queue worker has been paused since IR started,
+        -- so the assets this clip references aren't on disk yet. Drain
+        -- ONLY the IDs this saved window references, synchronously,
+        -- before writing the rig.json (so importer-side lookups land).
+        -- Quiet/Live had the worker running and may have finished most;
+        -- they fall through to the existing post-save _downloadAssets.
+        if (self.cfg.EXTRACT_MODE or "Quiet") == "Defer" then
+            self:_drainQueueForRigData(rigData)
+        end
         return self.replay:save(FOLDER, self.cfg, rigData, seconds)
     end)
     _G.ROCORDER_SAVE_IN_PROGRESS = false
