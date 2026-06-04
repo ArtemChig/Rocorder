@@ -9,6 +9,42 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.24.1-alpha — 2026-06-02
+
+Polish pass on the 1.24.0 Files tab + a long-standing FPS-game pain point:
+
+- **Mouse cursor force-unlocks when the panel is open.** First-person and
+  third-person games lock the cursor to screen-center; with the panel
+  open you couldn't click anything until you alt-tabbed. Now setting
+  `closeBtn.Modal = true` while visible tells Roblox the panel is
+  modal-foreground and releases the cursor to the OS. Toggled in step
+  with `setVisible` so the game's lock resumes the instant we close.
+- **Recording row redesigned.** Was 3 buttons stacked vertically on the
+  right (`Folder / Clear / Delete`), with no bottom padding and an
+  unhelpful `ROCORDER/recordings/<name>` path label below the size line.
+  Now: rows auto-size, the path label is gone (correct — of course it's
+  in ROCORDER's folder), and the actions live in a horizontal toolbar
+  along the bottom of the card with breathing room above and below.
+- **Folder button is now an icon (📂) + copies the GLOBAL shell path.**
+  `workspaceShellPath` composes
+  `%LOCALAPPDATA%\<Executor>\workspace\ROCORDER\recordings\<base>`
+  (the executor name comes from `identifyexecutor` / `getexecutorname`
+  with global-table heuristics as a fallback for Xeno / Synapse / Krnl /
+  Fluxus / Potassium). Paste straight into Explorer's address bar and
+  it opens. Falls back to the relative path with a heads-up notify
+  when the executor is unknown.
+- **Clear button is now "Clear N unique" and only deletes assets unique
+  to that one recording.** Previously per-row Clear deleted every
+  asset the recording referenced, including ones other recordings also
+  needed — silently corrupting their next import. We now build a
+  per-`ROCORDER/assets/` reference count across the whole listing
+  (`rec:_buildAssetRefCount`) and only target ids where this recording
+  is the sole owner. The button label tells you the exact unique-asset
+  count so you know what you're freeing; when 0, the button greys out
+  ("No unique assets") and ignores clicks. `rec:ClearAssets` was
+  refactored to take an explicit id set rather than a recording info
+  object — caller decides what's safe to delete.
+
 ## 1.24.0-alpha — 2026-06-02
 
 Files-tab P2 cluster, fully shipped — the BACKLOG item that had been

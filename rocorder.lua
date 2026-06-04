@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.24.0-alpha"
+local ROCORDER_VERSION = "1.24.1-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -90,6 +90,47 @@ local _diagPrinted    = false
 -- All of these accept a single string argument.
 local setClipboard = setclipboard or (syn and syn.write_clipboard)
     or toclipboard or set_clipboard
+
+-- Executor-name detection (1.24.1). Used by the Files-tab "Folder" button
+-- to compose a Windows-shell-friendly path the user can paste into Explorer:
+--   %LOCALAPPDATA%\<Executor>\workspace\ROCORDER\recordings\<base>
+-- Tries every API we know of, with global-table heuristics as a last resort.
+-- Returns nil if unknown — caller falls back to copying just the relative
+-- path with a heads-up notification.
+local function detectExecutorName()
+    for _, fn in ipairs({
+        identifyexecutor, getexecutorname, get_executor_name,
+        getidentity, get_identity,
+    }) do
+        if fn then
+            local ok, a, b = pcall(fn)
+            if ok then
+                if type(a) == "string" and a ~= "" then return a end
+                if type(b) == "string" and b ~= "" then return b end
+            end
+        end
+    end
+    if Xeno     then return "Xeno"     end
+    if syn      then return "Synapse"  end
+    if KRNL_LOADED or krnl then return "Krnl" end
+    if Fluxus or fluxus    then return "Fluxus" end
+    if Synapse             then return "Synapse" end
+    if potassium           then return "Potassium" end
+    return nil
+end
+
+-- Compose a path the user can paste into the Windows shell. `relativePath`
+-- is a ROCORDER-rooted relative path like "ROCORDER/recordings/foo".
+-- Returns a `%LOCALAPPDATA%\<exec>\workspace\<rel>` string when we know the
+-- executor, the raw relative path otherwise.
+local function workspaceShellPath(relativePath)
+    local rel = relativePath:gsub("/", "\\")
+    local exec = detectExecutorName()
+    if exec then
+        return fmt("%%LOCALAPPDATA%%\\%s\\workspace\\%s", exec, rel)
+    end
+    return rel
+end
 
 -- Try every in-memory path we know about. The DIAG on first call now ALWAYS
 -- prints — success, error, or wrong type — so we can see what the executor
@@ -4594,42 +4635,75 @@ function rec:DeleteRecording(name)
     return true
 end
 
--- Clear cached assets. Two modes:
---   ClearAssets()           — wipes ROCORDER/assets/ entirely (global cache)
---   ClearAssets(recording)  — wipes only the assets a single recording
---                             references (read from its rig.json)
--- Both modes reset the in-memory EXTRACTED dedup set for the affected ids
--- so they'll be re-fetched on the next recording / import. Returns the
+-- Collect every asset id referenced by a single recording's rig.json.
+-- Returns a set ({[id] = true}). Empty if the rig is unreadable.
+function rec:_recordingAssetIds(rec_info)
+    local ids = {}
+    if not rec_info then return ids end
+    local rigPath = (rec_info.folder or FOLDER) .. "/"
+        .. (rec_info.base or rec_info.name:gsub("%.rec$", "")) .. ".rig.json"
+    local rig = _readJSONFile(rigPath)
+    if not rig or not rig.players then return ids end
+    for _, p in pairs(rig.players) do
+        local revs = p.revisions
+        if revs then
+            for _, rev in ipairs(revs) do collectAssetIds(rev, ids) end
+        else
+            collectAssetIds(p, ids)
+        end
+    end
+    return ids
+end
+
+-- Build a map of [asset id] -> reference count across `allFiles` (typically
+-- the output of rec:GetRecordings). Used by the Files tab to compute, for
+-- each row, the assets that ONLY that recording references — and that are
+-- therefore safe to clear without breaking another recording's import.
+function rec:_buildAssetRefCount(allFiles)
+    local count = {}
+    for _, f in ipairs(allFiles or {}) do
+        for id in pairs(self:_recordingAssetIds(f)) do
+            count[id] = (count[id] or 0) + 1
+        end
+    end
+    return count
+end
+
+-- Asset ids that this recording references AND no other recording does.
+-- Caller passes a precomputed refCount map (from _buildAssetRefCount) so
+-- N rows = 1 disk pass instead of N². Returns {set, count}.
+function rec:UniqueAssetsFor(rec_info, refCount)
+    local mine = self:_recordingAssetIds(rec_info)
+    local unique, n = {}, 0
+    for id in pairs(mine) do
+        if (refCount[id] or 0) <= 1 then
+            unique[id] = true; n = n + 1
+        end
+    end
+    return unique, n
+end
+
+-- Clear cached assets.
+--   ClearAssets()          — wipe ROCORDER/assets/ entirely (global cache)
+--   ClearAssets(id_set)    — wipe only the listed ids (and their .geom.json
+--                            / .png companions). Caller is responsible for
+--                            providing a "safe" set — typically just the
+--                            ids unique to one recording (UniqueAssetsFor).
+-- Both modes reset the in-memory EXTRACTED dedup set for the cleared ids so
+-- they'll be re-extracted on the next recording / import. Returns the
 -- number of files deleted, or 0 on failure.
-function rec:ClearAssets(rec_info)
+function rec:ClearAssets(idSet)
     if not delfile or not listfiles or not isfolder then return 0 end
     if not isfolder(ASSETS_FOLDER) then return 0 end
 
-    if rec_info then
-        -- Per-recording: load its rig.json, collect ids, delete just those.
-        local rigPath = (rec_info.folder or FOLDER) .. "/"
-            .. (rec_info.base or rec_info.name:gsub("%.rec$", "")) .. ".rig.json"
-        local rig = _readJSONFile(rigPath)
-        if not rig or not rig.players then return 0 end
-        local ids = {}
-        for _, p in pairs(rig.players) do
-            local revs = p.revisions
-            if revs then
-                for _, rev in ipairs(revs) do collectAssetIds(rev, ids) end
-            else
-                collectAssetIds(p, ids)
-            end
-        end
+    if idSet then
         local n = 0
-        for id in pairs(ids) do
-            local path = ASSETS_FOLDER .. "/" .. id
-            if isfile and isfile(path) then
-                if pcall(delfile, path) then n = n + 1 end
-            end
-            -- Also the alternate .geom.json / .png companions
-            for _, ext in ipairs({ ".geom.json", ".png" }) do
+        for id in pairs(idSet) do
+            for _, ext in ipairs({ "", ".geom.json", ".png" }) do
                 local p = ASSETS_FOLDER .. "/" .. id .. ext
-                if isfile and isfile(p) then pcall(delfile, p) end
+                if isfile and isfile(p) then
+                    if pcall(delfile, p) then n = n + 1 end
+                end
             end
             EXTRACTED[id] = nil
         end
@@ -5699,6 +5773,7 @@ local function buildFilesView(parent)
     vlist(scroll, 6); pad(scroll, 0, 0, 8, 0)
 
     local cachedFiles = {}   -- last `rec:GetRecordings()` result
+    local refCount = {}      -- shared asset reference counts (rebuilt on populate)
 
     local function renderList()
         for _, c in ipairs(scroll:GetChildren()) do
@@ -5719,24 +5794,24 @@ local function buildFilesView(parent)
             return
         end
         for _, f in ipairs(cachedFiles) do
+            -- One card per recording. AutomaticSize.Y lets the bottom
+            -- padding actually breathe under the action toolbar (was
+            -- clipped flat against the last button in the 3-stacked
+            -- design). Metadata sits in the upper area, the action
+            -- toolbar runs along the bottom.
             local row = mk("Frame", { BackgroundColor3 = THEME.panel,
-                BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 88) }, scroll)
-            corner(row, 6); pad(row, 14, 10, 14, 10)
+                BorderSizePixel = 0,
+                Size = UDim2.new(1, 0, 0, 0),
+                AutomaticSize = Enum.AutomaticSize.Y }, scroll)
+            corner(row, 6); pad(row, 14, 12, 14, 12)
 
-            -- Action button column on the right — three small stacked
-            -- buttons: Folder (copy path), Clear (per-rec asset clear),
-            -- Delete (existing). Each is 76px wide; column reserves 88px
-            -- so the file/date/game labels truncate cleanly to their left.
-            local BTN_W = 76
-            local CTRL_RES = BTN_W + 12
-
-            -- top row: filename
+            -- filename
             mk("TextLabel", { Text = f.name, Font = THEME.fontBold, TextSize = 13,
                 TextColor3 = THEME.text, BackgroundTransparency = 1,
-                Size = UDim2.new(1, -CTRL_RES, 0, 18),
+                Position = UDim2.fromOffset(0, 0),
+                Size = UDim2.new(1, -56, 0, 18),
                 TextXAlignment = Enum.TextXAlignment.Left,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
-            -- CLIP pill on instant-replay clips
             if f.isClip then
                 local clipPill = mk("TextLabel", { Text = "CLIP",
                     Font = THEME.fontBold, TextSize = 10,
@@ -5744,7 +5819,7 @@ local function buildFilesView(parent)
                     BorderSizePixel = 0,
                     TextXAlignment = Enum.TextXAlignment.Center,
                     TextYAlignment = Enum.TextYAlignment.Center,
-                    Position = UDim2.new(1, -CTRL_RES - 50, 0, 0),
+                    Position = UDim2.new(1, -46, 0, 0),
                     Size = UDim2.fromOffset(46, 18) }, row)
                 corner(clipPill, 4); stroke(clipPill, THEME.accent, 1)
             end
@@ -5759,7 +5834,7 @@ local function buildFilesView(parent)
                 Font = THEME.fontMono, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
                 Position = UDim2.fromOffset(0, 22),
-                Size = UDim2.new(1, -CTRL_RES, 0, 16),
+                Size = UDim2.new(1, 0, 0, 16),
                 TextXAlignment = Enum.TextXAlignment.Left }, row)
 
             -- game · size
@@ -5771,73 +5846,108 @@ local function buildFilesView(parent)
                 Font = THEME.fontReg, TextSize = 12,
                 TextColor3 = THEME.subtext, BackgroundTransparency = 1,
                 Position = UDim2.fromOffset(0, 42),
-                Size = UDim2.new(1, -CTRL_RES, 0, 16),
+                Size = UDim2.new(1, 0, 0, 16),
                 TextXAlignment = Enum.TextXAlignment.Left,
                 TextTruncate = Enum.TextTruncate.AtEnd }, row)
 
-            -- Folder path label (very small, gray) — shows where it lives on
-            -- disk, makes the new subfolder layout discoverable.
-            mk("TextLabel", { Text = (f.folder or FOLDER),
-                Font = THEME.fontMono, TextSize = 10,
-                TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(0, 62),
-                Size = UDim2.new(1, -CTRL_RES, 0, 14),
-                TextTransparency = 0.35,
-                TextXAlignment = Enum.TextXAlignment.Left,
-                TextTruncate = Enum.TextTruncate.AtEnd }, row)
+            -- ---- Action toolbar (horizontal, bottom) ----
+            -- Was 3 buttons stacked vertically on the right; this lays
+            -- them out left-to-right at the bottom of the card so they
+            -- read like a normal action bar. Folder is a small icon
+            -- button (📂); Clear shows the unique-asset count so the
+            -- user knows exactly what they're freeing; Delete keeps its
+            -- explicit text + danger styling. y=72 leaves a clear
+            -- visual gap between the bottom metadata line and the
+            -- toolbar.
+            local toolbar = mk("Frame", { BackgroundTransparency = 1,
+                Position = UDim2.fromOffset(0, 72),
+                Size = UDim2.new(1, 0, 0, 28) }, row)
+            hlist(toolbar, 8)
 
-            -- Helper for a 76x22 stacked action button.
-            local function actionBtn(text, y, bg)
-                local b = mk("TextButton", { Text = text,
-                    Font = THEME.fontBold, TextSize = 11,
-                    TextColor3 = Color3.new(1, 1, 1),
-                    BackgroundColor3 = bg, BorderSizePixel = 0,
-                    AutoButtonColor = false,
-                    Position = UDim2.new(1, -BTN_W, 0, y),
-                    Size = UDim2.fromOffset(BTN_W, 22) }, row)
-                corner(b, 4); return b
-            end
-
-            -- Folder: copies the recording's containing folder path. If
-            -- setclipboard isn't available, fall back to a notify with the
-            -- path so the user can still read it.
-            local folderBtn = actionBtn("Folder", 0, THEME.tabActive)
+            -- Folder icon button. Copies the global shell-friendly path
+            -- (e.g. `%LOCALAPPDATA%\Xeno\workspace\ROCORDER\recordings\
+            -- <base>`) so the user can paste straight into Explorer's
+            -- address bar. Falls back to the relative path with a
+            -- different notify when the executor is unknown.
+            local folderBtn = mk("TextButton", { Text = "\xF0\x9F\x93\x82",  -- 📂
+                Font = THEME.fontBold, TextSize = 16,
+                TextColor3 = THEME.text,
+                BackgroundColor3 = THEME.tabActive, BorderSizePixel = 0,
+                AutoButtonColor = false, LayoutOrder = 1,
+                Size = UDim2.fromOffset(36, 28) }, toolbar); corner(folderBtn, 4)
+            folderBtn.MouseEnter:Connect(function()
+                TweenService:Create(folderBtn, HOVER_TWEEN,
+                    { BackgroundColor3 = THEME.panelHi }):Play()
+            end)
+            folderBtn.MouseLeave:Connect(function()
+                TweenService:Create(folderBtn, HOVER_TWEEN,
+                    { BackgroundColor3 = THEME.tabActive }):Play()
+            end)
             folderBtn.MouseButton1Click:Connect(function()
-                local p = f.folder or FOLDER
+                local rel = f.folder or FOLDER
+                local full = workspaceShellPath(rel)
                 if setClipboard then
-                    pcall(setClipboard, p)
-                    notify("ROCORDER",
-                        "Path copied. Find it under your executor's workspace folder.", 4)
+                    pcall(setClipboard, full)
+                    if detectExecutorName() then
+                        notify("ROCORDER",
+                            "Path copied. Paste into Explorer's address bar.", 4)
+                    else
+                        notify("ROCORDER",
+                            "Path copied (relative; couldn't detect executor name).", 4)
+                    end
                 else
-                    notify("ROCORDER", "Path: " .. p, 8)
+                    notify("ROCORDER", "Path: " .. full, 8)
                 end
             end)
 
-            -- Clear: drop this recording's referenced asset files. Doesn't
-            -- touch the recording itself — only the cache it pulled into
-            -- ROCORDER/assets/. Two-step confirm.
-            local clearBtn = actionBtn("Clear", 28, THEME.tabActive)
-            confirmableButton(clearBtn, "Clear", "Confirm?",
-                THEME.tabActive, THEME.danger, function()
-                    local n = rec:ClearAssets(f)
-                    notify("ROCORDER",
-                        fmt("Cleared %d cached asset(s) for this recording.", n), 3)
-                    refreshAssetsBanner()
-                end)
+            -- Clear: count is the *unique-to-this-recording* asset id
+            -- count from refCount. We only delete those; assets shared
+            -- with other recordings are left alone so their imports
+            -- don't break.
+            local _, uniqueN = rec:UniqueAssetsFor(f, refCount)
+            local clearText = (uniqueN > 0)
+                and fmt("Clear %d unique", uniqueN)
+                or  "No unique assets"
+            local clearBtn = mk("TextButton", { Text = clearText,
+                Font = THEME.fontBold, TextSize = 12,
+                TextColor3 = (uniqueN > 0) and Color3.new(1,1,1) or THEME.subtext,
+                BackgroundColor3 = (uniqueN > 0) and THEME.tabActive or THEME.bg,
+                BorderSizePixel = 0, AutoButtonColor = false,
+                LayoutOrder = 2,
+                Size = UDim2.fromOffset(128, 28) }, toolbar); corner(clearBtn, 4)
+            if uniqueN > 0 then
+                confirmableButton(clearBtn, clearText, "Confirm?",
+                    THEME.tabActive, THEME.danger, function()
+                        local unique = rec:UniqueAssetsFor(f, refCount)
+                        local n = rec:ClearAssets(unique)
+                        notify("ROCORDER",
+                            fmt("Cleared %d cached file(s).", n), 3)
+                        refreshAssetsBanner()
+                        -- Once cleared, this row's unique count is 0; re-render
+                        -- so the button label/state updates. Cheap.
+                        refCount = rec:_buildAssetRefCount(cachedFiles)
+                        renderList()
+                    end)
+            end
 
-            -- Delete: full recording wipe. Two-step confirm.
-            local del = actionBtn("Delete", 56, THEME.danger)
+            -- Delete: full recording wipe.
+            local del = mk("TextButton", { Text = "Delete",
+                Font = THEME.fontBold, TextSize = 12, TextColor3 = Color3.new(1,1,1),
+                BackgroundColor3 = THEME.danger, BorderSizePixel = 0,
+                AutoButtonColor = false, LayoutOrder = 3,
+                Size = UDim2.fromOffset(88, 28) }, toolbar); corner(del, 4)
             confirmableButton(del, "Delete", "Confirm?",
                 THEME.danger, THEME.dangerHi, function()
                     rec:DeleteRecording(f.name)
                     row:Destroy()
-                    -- Drop the entry from the cached list so a re-sort
-                    -- doesn't bring it back.
                     for i, item in ipairs(cachedFiles) do
                         if item.name == f.name then
                             table.remove(cachedFiles, i); break
                         end
                     end
+                    -- Rebuild refCount so neighbouring rows' "unique"
+                    -- counts update after one recording leaves the set.
+                    refCount = rec:_buildAssetRefCount(cachedFiles)
                     local any = false
                     for _, c in ipairs(scroll:GetChildren()) do
                         if c:IsA("Frame") then any = true; break end
@@ -5850,6 +5960,10 @@ local function buildFilesView(parent)
 
     local function populate()
         cachedFiles = rec:GetRecordings()
+        -- One-pass refCount build across the whole list. Each row's
+        -- unique-asset-count lookup is then O(rig-size) instead of N²
+        -- across the dataset.
+        refCount = rec:_buildAssetRefCount(cachedFiles)
         refreshAssetsBanner()
         renderList()
     end
@@ -6016,6 +6130,10 @@ local function buildUI()
     end)
     closeBtn.MouseButton1Click:Connect(function() UI:setVisible(false) end)
     UI.minBtn = minBtn
+    -- Held by setVisible to flip Modal on/off so the cursor unlocks
+    -- whenever the panel is open. Modal=true on any visible GuiButton
+    -- tells Roblox to release the mouse to the OS.
+    UI.closeBtn = closeBtn
 
     -- drag
     do
@@ -6140,6 +6258,10 @@ local function buildUI()
     UI.gui = gui; UI.window = window
     UI.tabBar = tabBar; UI.content = content; UI.footer = footer
     UI:selectTab("Record")
+    -- Initialize visible state through setVisible so the closeBtn.Modal
+    -- flag (which unlocks the mouse) is set in step with the actual
+    -- window visibility, including on first load.
+    UI:setVisible(true)
     UI:_startStatusLoop()
 end
 
@@ -6163,6 +6285,12 @@ end
 function UI:setVisible(v)
     self.visible = v
     if self.window then self.window.Visible = v end
+    -- Force-unlock the mouse cursor whenever the panel is open. Many games
+    -- (FPS, third-person shooters) lock the cursor to screen-center; Modal
+    -- on any visible GuiButton tells Roblox "this UI is in foreground —
+    -- release the cursor to the OS". Toggling it on/off with the panel
+    -- means the game's lock resumes automatically as soon as we close.
+    if self.closeBtn then self.closeBtn.Modal = v and true or false end
 end
 
 function UI:toggle() self:setVisible(not self.visible) end
