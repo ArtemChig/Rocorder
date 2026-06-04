@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.22.0-alpha"
+local ROCORDER_VERSION = "1.23.0-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -186,8 +186,10 @@ local SETTING_DEFS = {
       desc="Skip players beyond this distance from the camera. 0 = unlimited.",
       group="Capture",
       min=0,   max=100000, int=true },
-    { key="INCLUDE_LOCAL",   type="bool",   default=true, label="Include Local Player",
-      desc="Record yourself too.",                                 group="Capture" },
+    -- INCLUDE_LOCAL is a per-source toggle (whether YOU get recorded at all),
+    -- so it belongs in Sources rather than the Capture knobs. Lives there
+    -- in the UI; the setting key + group string drives both placement and
+    -- the SETTINGS_TAB_OMIT { Sources = true } filter.
     { key="DEBUG",           type="bool",   default=true, label="Write Debug Log",
       desc="Write a verbose .debug.log next to each recording.",   group="Capture" },
     { key="DOWNLOAD_ASSETS", type="bool",   default=true, label="Download Assets",
@@ -250,6 +252,9 @@ local SETTING_DEFS = {
     -- Sources (managed via the Sources tab, not the Settings tab)
     { key="SRC_PLAYER_PARTS", type="bool", default=true,  label="Player parts",
       desc="Per-tick world position + quaternion of every BasePart in each character.",
+      group="Sources" },
+    { key="INCLUDE_LOCAL",   type="bool", default=true,  label="Include yourself",
+      desc="Record the local player (you). Off if you only want to capture other players.",
       group="Sources" },
     { key="SRC_CAMERA",       type="bool", default=false, label="Player camera",
       desc="Per-tick CFrame + FOV of the local camera. Imports as a Blender camera.",
@@ -5083,6 +5088,216 @@ local function buildRecordView(parent)
     }
 end
 
+-- ----------------------------------------------------------------------------
+-- Reusable setting / source row widgets (1.23.0). Replaces the old fixed-
+-- height row that truncated descriptions and the click-to-cycle choice
+-- button. Key improvements:
+--   * Auto-sized rows — description wraps onto as many lines as needed
+--   * Dropdown picker for `choice` settings (replaces click-cycle UX)
+--   * Whole-row hover so the click target matches the visual affordance
+--   * Bool/choice/number/key controls all share one alignment grid
+-- ----------------------------------------------------------------------------
+
+-- A single in-flight dropdown at module scope so opening a new one closes the
+-- old, and so a click outside any picker can dismiss the visible one cleanly.
+local _activeDropdown = nil
+local function _closeActiveDropdown()
+    if not _activeDropdown then return end
+    pcall(function() _activeDropdown.frame:Destroy() end)
+    if _activeDropdown.outsideClick then
+        pcall(function() _activeDropdown.outsideClick:Disconnect() end)
+    end
+    _activeDropdown = nil
+end
+
+-- Spawn a dropdown anchored to `button`. Each option in `choices` becomes a
+-- row; the option matching `current` is highlighted. `onSelect(value)` fires
+-- once when the user picks something, after which the dropdown closes.
+-- Outside-click also closes (no commit).
+local function _showChoiceDropdown(button, choices, current, onSelect)
+    _closeActiveDropdown()
+    local gui = button:FindFirstAncestorOfClass("ScreenGui")
+    if not gui then return end
+
+    local OPT_H = 28
+    local DD_W = math.max(button.AbsoluteSize.X, 140)
+    local btnPos = button.AbsolutePosition
+    local btnSz  = button.AbsoluteSize
+
+    local dd = mk("Frame", {
+        BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+        Position = UDim2.fromOffset(
+            btnPos.X + btnSz.X - DD_W,
+            btnPos.Y + btnSz.Y + 4),
+        Size = UDim2.fromOffset(DD_W, OPT_H * #choices + 8),
+        ZIndex = 50,
+    }, gui)
+    corner(dd, 6); stroke(dd, THEME.border, 1); pad(dd, 4)
+    vlist(dd, 0)
+
+    for _, choice in ipairs(choices) do
+        local isCurrent = (choice == current)
+        local opt = mk("TextButton", {
+            Text = "  " .. tostring(choice),
+            Font = isCurrent and THEME.fontBold or THEME.fontReg,
+            TextSize = 13,
+            TextColor3 = isCurrent and THEME.accent or THEME.text,
+            BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+            AutoButtonColor = false, ZIndex = 51,
+            Size = UDim2.new(1, 0, 0, OPT_H),
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, dd); corner(opt, 4)
+        opt.MouseEnter:Connect(function()
+            opt.BackgroundColor3 = THEME.panelHi
+        end)
+        opt.MouseLeave:Connect(function()
+            opt.BackgroundColor3 = THEME.panel
+        end)
+        opt.MouseButton1Click:Connect(function()
+            _closeActiveDropdown()
+            onSelect(choice)
+        end)
+    end
+
+    local outsideClick
+    outsideClick = UserInputService.InputBegan:Connect(function(i)
+        -- Scroll wheel — close, otherwise the dropdown visually detaches
+        -- from its button when the user scrolls the settings list.
+        if i.UserInputType == Enum.UserInputType.MouseWheel then
+            _closeActiveDropdown(); return
+        end
+        if i.UserInputType ~= Enum.UserInputType.MouseButton1
+           and i.UserInputType ~= Enum.UserInputType.Touch then return end
+        local mp = i.Position
+        local p, s = dd.AbsolutePosition, dd.AbsoluteSize
+        local inside = mp.X >= p.X and mp.X <= p.X + s.X
+                   and mp.Y >= p.Y and mp.Y <= p.Y + s.Y
+        if not inside then _closeActiveDropdown() end
+    end)
+    _activeDropdown = { frame = dd, outsideClick = outsideClick }
+end
+
+-- Build one row in the unified setting/source style. Returns
+-- { row, control, refresh } so the caller can register the control for
+-- cross-tab sync and hide/show the row (used for advanced-row toggling).
+local function buildSettingRow(parent, d, controls)
+    local row = mk("Frame", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+    }, parent)
+    pad(row, 0, 2, 0, 10)
+    -- Reserve a fixed-width column on the right for the control.
+    local CTRL_W, CTRL_GAP = 124, 14
+    -- Title line.
+    mk("TextLabel", { Text = d.label,
+        Font = THEME.fontBold, TextSize = 13,
+        TextColor3 = THEME.text, BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(0, 0),
+        Size = UDim2.new(1, -(CTRL_W + CTRL_GAP), 0, 18),
+        TextXAlignment = Enum.TextXAlignment.Left }, row)
+    -- Description — wraps onto as many lines as it needs; row grows to fit.
+    mk("TextLabel", { Text = d.desc or "",
+        Font = THEME.fontReg, TextSize = 12,
+        TextColor3 = THEME.subtext, BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(0, 22),
+        Size = UDim2.new(1, -(CTRL_W + CTRL_GAP), 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextXAlignment = Enum.TextXAlignment.Left }, row)
+
+    local control, refresh
+    if d.type == "number" then
+        local box = mk("TextBox", {
+            Font = THEME.fontMono, TextSize = 14, TextColor3 = THEME.text,
+            BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
+            Text = tostring(rec.cfg[d.key]), ClearTextOnFocus = false,
+            Position = UDim2.new(1, -CTRL_W, 0, 0),
+            Size = UDim2.fromOffset(CTRL_W, 30),
+        }, row); corner(box, 4); pad(box, 10, 0); stroke(box, THEME.border, 1)
+        box.FocusLost:Connect(function()
+            local n = tonumber(box.Text)
+            if not n then box.Text = tostring(rec.cfg[d.key]); return end
+            if d.int then n = math.floor(n + 0.5) end
+            if d.min and n < d.min then n = d.min end
+            if d.max and n > d.max then n = d.max end
+            rec:SetSetting(d.key, n)
+            box.Text = tostring(rec.cfg[d.key])
+        end)
+        control = box
+
+    elseif d.type == "bool" then
+        local btn = mk("TextButton", { Text = "OFF",
+            Font = THEME.fontBold, TextSize = 13, TextColor3 = Color3.new(1,1,1),
+            BackgroundColor3 = THEME.standby, BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Position = UDim2.new(1, -CTRL_W, 0, 2),
+            Size = UDim2.fromOffset(CTRL_W, 26),
+        }, row); corner(btn, 4)
+        refresh = function()
+            if rec.cfg[d.key] then
+                btn.Text = "ON"; btn.BackgroundColor3 = THEME.accent
+            else
+                btn.Text = "OFF"; btn.BackgroundColor3 = THEME.standby
+            end
+        end
+        btn.MouseButton1Click:Connect(function()
+            rec:SetSetting(d.key, not rec.cfg[d.key]); refresh()
+        end)
+        refresh()
+        control = btn
+
+    elseif d.type == "key" then
+        local btn = mk("TextButton", {
+            Text = rec.cfg[d.key], Font = THEME.fontMono, TextSize = 13,
+            TextColor3 = THEME.text, BackgroundColor3 = THEME.bg,
+            BorderSizePixel = 0, AutoButtonColor = false,
+            Position = UDim2.new(1, -CTRL_W, 0, 2),
+            Size = UDim2.fromOffset(CTRL_W, 26),
+        }, row); corner(btn, 4); stroke(btn, THEME.border, 1)
+        btn.MouseButton1Click:Connect(function()
+            btn.Text = "Press a key…"
+            UI.keyBindBtn = { btn = btn, key = d.key }
+        end)
+        control = btn
+
+    elseif d.type == "choice" then
+        -- Dropdown picker. The button shows the current value with a small
+        -- chevron; clicking it opens a list of options anchored below.
+        local btn = mk("TextButton", {
+            Text = "", AutoButtonColor = false, BorderSizePixel = 0,
+            BackgroundColor3 = THEME.bg,
+            Position = UDim2.new(1, -CTRL_W, 0, 2),
+            Size = UDim2.fromOffset(CTRL_W, 26),
+        }, row); corner(btn, 4); stroke(btn, THEME.border, 1)
+        local lbl = mk("TextLabel", { Text = tostring(rec.cfg[d.key]),
+            Font = THEME.fontMono, TextSize = 13, TextColor3 = THEME.text,
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(10, 0),
+            Size = UDim2.new(1, -28, 1, 0),
+            TextXAlignment = Enum.TextXAlignment.Left }, btn)
+        mk("TextLabel", { Text = "\xE2\x96\xBE",  -- ▾ chevron
+            Font = THEME.fontBold, TextSize = 13, TextColor3 = THEME.subtext,
+            BackgroundTransparency = 1,
+            Position = UDim2.new(1, -22, 0, 0),
+            Size = UDim2.fromOffset(20, 26),
+            TextXAlignment = Enum.TextXAlignment.Center }, btn)
+        refresh = function() lbl.Text = tostring(rec.cfg[d.key]) end
+        btn.MouseButton1Click:Connect(function()
+            _showChoiceDropdown(btn, d.choices or {}, rec.cfg[d.key], function(v)
+                rec:SetSetting(d.key, v); refresh()
+            end)
+        end)
+        control = btn
+    end
+
+    if controls then
+        if refresh then controls[d.key] = { btn = control, refresh = refresh }
+        else controls[d.key] = control end
+    end
+    return { row = row, control = control, refresh = refresh }
+end
+
 local function buildSettingsView(parent)
     local view = mk("ScrollingFrame", { BackgroundTransparency = 1,
         Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(0,0,0,0),
@@ -5094,160 +5309,88 @@ local function buildSettingsView(parent)
     local controls = {}
     -- Track per-group bookkeeping so we can hide a whole group when all of
     -- its items are advanced and advanced is currently hidden.
-    local groupInfo = {}        -- gname -> { box, hasBasic, advancedRows[] }
+    local groupInfo = {}        -- gname -> { box, hasBasic }
     local advancedRows = {}     -- flat list of all advanced item rows
-    local advancedTextBoxes = {} -- TextBox refs we need to NOT overwrite while focused
 
     for gi, gname in ipairs(order) do
         local groupBox = mk("Frame", { BackgroundColor3 = THEME.panel,
             BorderSizePixel = 0, Size = UDim2.new(1, -6, 0, 36),
             AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = gi }, view)
-        corner(groupBox, 8); pad(groupBox, 14, 12, 14, 14); vlist(groupBox, 10)
+        corner(groupBox, 8); pad(groupBox, 16, 14, 16, 8); vlist(groupBox, 4)
 
         mk("TextLabel", { Text = gname, Font = THEME.fontBold, TextSize = 14,
             TextColor3 = THEME.accent, BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 0, 18),
+            Size = UDim2.new(1, 0, 0, 20),
             TextXAlignment = Enum.TextXAlignment.Left }, groupBox)
 
         local hasBasic = false
         for _, d in ipairs(groups[gname]) do
-            local row = mk("Frame", { BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 44) }, groupBox)
-
-            mk("TextLabel", { Text = d.label, Font = THEME.fontBold, TextSize = 13,
-                TextColor3 = THEME.text, BackgroundTransparency = 1,
-                Size = UDim2.new(0.5, 0, 0, 18),
-                TextXAlignment = Enum.TextXAlignment.Left }, row)
-            mk("TextLabel", { Text = d.desc, Font = THEME.fontReg, TextSize = 11,
-                TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-                Position = UDim2.fromOffset(0, 20),
-                Size = UDim2.new(0.6, 0, 0, 22),
-                TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
-                TextXAlignment = Enum.TextXAlignment.Left }, row)
-
-            if d.type == "number" then
-                local box = mk("TextBox", {
-                    Font = THEME.fontMono, TextSize = 14, TextColor3 = THEME.text,
-                    BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
-                    Text = tostring(rec.cfg[d.key]), ClearTextOnFocus = false,
-                    Position = UDim2.new(1, -118, 0, 0),
-                    Size = UDim2.fromOffset(112, 30),
-                }, row); corner(box, 4); pad(box, 8, 0)
-                stroke(box, THEME.border, 1)
-                box.FocusLost:Connect(function()
-                    local n = tonumber(box.Text)
-                    if not n then box.Text = tostring(rec.cfg[d.key]); return end
-                    if d.int then n = math.floor(n + 0.5) end
-                    if d.min and n < d.min then n = d.min end
-                    if d.max and n > d.max then n = d.max end
-                    rec:SetSetting(d.key, n)
-                    box.Text = tostring(rec.cfg[d.key])
-                end)
-                controls[d.key] = box
-
-            elseif d.type == "bool" then
-                local btn = mk("TextButton", { Text = "OFF",
-                    Font = THEME.fontBold, TextSize = 13, TextColor3 = Color3.new(1,1,1),
-                    BackgroundColor3 = THEME.standby, BorderSizePixel = 0,
-                    AutoButtonColor = false,
-                    Position = UDim2.new(1, -66, 0, 4),
-                    Size = UDim2.fromOffset(58, 26),
-                }, row); corner(btn, 4)
-                local function refresh()
-                    if rec.cfg[d.key] then
-                        btn.Text = "ON"; btn.BackgroundColor3 = THEME.accent
-                    else
-                        btn.Text = "OFF"; btn.BackgroundColor3 = THEME.standby
-                    end
-                end
-                btn.MouseButton1Click:Connect(function()
-                    rec:SetSetting(d.key, not rec.cfg[d.key]); refresh()
-                end)
-                refresh()
-                controls[d.key] = { btn = btn, refresh = refresh }
-
-            elseif d.type == "key" then
-                local btn = mk("TextButton", {
-                    Text = rec.cfg[d.key], Font = THEME.fontMono, TextSize = 13,
-                    TextColor3 = THEME.text, BackgroundColor3 = THEME.bg,
-                    BorderSizePixel = 0, AutoButtonColor = false,
-                    Position = UDim2.new(1, -118, 0, 4),
-                    Size = UDim2.fromOffset(112, 26),
-                }, row); corner(btn, 4); stroke(btn, THEME.border, 1)
-                btn.MouseButton1Click:Connect(function()
-                    btn.Text = "Press a key…"
-                    UI.keyBindBtn = { btn = btn, key = d.key }
-                end)
-                controls[d.key] = btn
-
-            elseif d.type == "choice" then
-                -- click cycles through d.choices
-                local btn = mk("TextButton", {
-                    Text = tostring(rec.cfg[d.key]),
-                    Font = THEME.fontMono, TextSize = 13,
-                    TextColor3 = THEME.text, BackgroundColor3 = THEME.bg,
-                    BorderSizePixel = 0, AutoButtonColor = false,
-                    Position = UDim2.new(1, -118, 0, 4),
-                    Size = UDim2.fromOffset(112, 26),
-                }, row); corner(btn, 4); stroke(btn, THEME.border, 1)
-                local function refresh()
-                    btn.Text = tostring(rec.cfg[d.key])
-                end
-                btn.MouseButton1Click:Connect(function()
-                    local cur = rec.cfg[d.key]
-                    local nextIdx = 1
-                    for i, c in ipairs(d.choices or {}) do
-                        if c == cur then nextIdx = (i % #d.choices) + 1; break end
-                    end
-                    rec:SetSetting(d.key, d.choices[nextIdx])
-                    refresh()
-                end)
-                controls[d.key] = { btn = btn, refresh = refresh }
-            end
-
+            local r = buildSettingRow(groupBox, d, controls)
             if d.advanced then
-                advancedRows[#advancedRows + 1] = row
-                row.Visible = false  -- hidden by default
+                advancedRows[#advancedRows + 1] = r.row
+                r.row.Visible = false  -- hidden until the toggle flips on
             else
                 hasBasic = true
             end
         end
 
         groupInfo[gname] = { box = groupBox, hasBasic = hasBasic }
-        groupBox.Visible = hasBasic  -- if a group has ONLY advanced items, hide it
+        groupBox.Visible = hasBasic  -- hide groups with only advanced items
     end
 
-    -- "Show advanced settings" toggle button (always last in the list)
-    local advBtn = mk("TextButton", {
-        Text = "\xE2\x96\xBC  Show advanced settings",   -- ▼
-        Font = THEME.fontBold, TextSize = 13,
-        TextColor3 = THEME.subtext, BackgroundColor3 = THEME.panel,
-        BorderSizePixel = 0, AutoButtonColor = false,
-        Size = UDim2.new(1, -6, 0, 36),
+    -- Advanced toggle — a checkbox row instead of an arrow.
+    -- The arrow read as "expand for hidden content"; the actual behavior is
+    -- "filter mode" (decimal precision, flush interval, etc. get revealed
+    -- inline). A checkbox communicates that more honestly.
+    local advRow = mk("TextButton", { Text = "",
+        BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Size = UDim2.new(1, -6, 0, 38),
         LayoutOrder = 9999,
-    }, view); corner(advBtn, 6); stroke(advBtn, THEME.border, 1)
-    advBtn.MouseEnter:Connect(function()
-        TweenService:Create(advBtn, HOVER_TWEEN,
-            { TextColor3 = THEME.text }):Play()
-    end)
-    advBtn.MouseLeave:Connect(function()
-        TweenService:Create(advBtn, HOVER_TWEEN,
-            { TextColor3 = THEME.subtext }):Play()
-    end)
+    }, view); corner(advRow, 6); stroke(advRow, THEME.border, 1)
+    pad(advRow, 14, 0, 14, 0)
+
+    local box = mk("Frame", {
+        BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
+        Position = UDim2.new(0, 0, 0.5, -9),
+        Size = UDim2.fromOffset(18, 18),
+    }, advRow); corner(box, 4); stroke(box, THEME.border, 1)
+    local check = mk("Frame", {
+        BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
+        Position = UDim2.new(0.5, -5, 0.5, -5),
+        Size = UDim2.fromOffset(10, 10), Visible = false,
+    }, box); corner(check, 2)
+
+    local advLabel = mk("TextLabel", { Text = "Show advanced settings",
+        Font = THEME.fontBold, TextSize = 13, TextColor3 = THEME.subtext,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(30, 0),
+        Size = UDim2.new(1, -30, 1, 0),
+        TextXAlignment = Enum.TextXAlignment.Left }, advRow)
 
     local showAdvanced = false
     local function refreshAdvanced()
-        for _, row in ipairs(advancedRows) do row.Visible = showAdvanced end
+        check.Visible = showAdvanced
+        advLabel.TextColor3 = showAdvanced and THEME.text or THEME.subtext
+        for _, r in ipairs(advancedRows) do r.Visible = showAdvanced end
         for _, info in pairs(groupInfo) do
             info.box.Visible = info.hasBasic or showAdvanced
         end
-        advBtn.Text = showAdvanced
-            and "\xE2\x96\xB2  Hide advanced settings"   -- ▲
-            or  "\xE2\x96\xBC  Show advanced settings"   -- ▼
     end
-    advBtn.MouseButton1Click:Connect(function()
-        showAdvanced = not showAdvanced
-        refreshAdvanced()
+    advRow.MouseEnter:Connect(function()
+        if not showAdvanced then
+            TweenService:Create(advLabel, HOVER_TWEEN,
+                { TextColor3 = THEME.text }):Play()
+        end
+    end)
+    advRow.MouseLeave:Connect(function()
+        if not showAdvanced then
+            TweenService:Create(advLabel, HOVER_TWEEN,
+                { TextColor3 = THEME.subtext }):Play()
+        end
+    end)
+    advRow.MouseButton1Click:Connect(function()
+        showAdvanced = not showAdvanced; refreshAdvanced()
     end)
     refreshAdvanced()
 
@@ -5381,94 +5524,76 @@ local function buildFilesView(parent)
 end
 
 local function buildSourcesView(parent)
-    local view = mk("Frame", { BackgroundTransparency = 1,
-        Size = UDim2.fromScale(1, 1) }, parent)
-    pad(view, 16); vlist(view, 10)
+    -- Was a plain Frame; switched to a ScrollingFrame so the page handles
+    -- long descriptions and the extra "Audio events" planned card without
+    -- clipping at narrow window sizes.
+    local view = mk("ScrollingFrame", { BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(0,0,0,0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 6,
+        ScrollBarImageColor3 = THEME.border, BorderSizePixel = 0 }, parent)
+    pad(view, 16); vlist(view, 12)
 
     mk("TextLabel", { Text = "Capture Sources", Font = THEME.fontBold,
         TextSize = 16, TextColor3 = THEME.text, BackgroundTransparency = 1,
         Size = UDim2.new(1, 0, 0, 22), LayoutOrder = 1,
         TextXAlignment = Enum.TextXAlignment.Left }, view)
-    mk("TextLabel", {
+    -- Intro paragraph auto-grows; the row layout below already handles wrap
+    -- but the intro needs AutomaticSize too so longer copy doesn't clip.
+    local intro = mk("TextLabel", {
         Text = "Toggle what each tick captures. Changes save instantly and "
             .. "apply to both full recordings and the Instant Replay buffer.",
         Font = THEME.fontReg, TextSize = 12, TextColor3 = THEME.subtext,
-        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 32),
-        TextWrapped = true,
-        LayoutOrder = 2,
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        TextWrapped = true, LayoutOrder = 2,
         TextYAlignment = Enum.TextYAlignment.Top,
         TextXAlignment = Enum.TextXAlignment.Left }, view)
 
     local controls = {}  -- key -> { btn, refresh }   (for cross-tab sync)
 
-    local function plannedRow(name, desc, order)
-        local row = mk("Frame", { BackgroundColor3 = THEME.panel,
-            BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 60),
-            LayoutOrder = order }, view)
-        corner(row, 6); pad(row, 14, 12, 14, 12)
-        mk("TextLabel", { Text = name, Font = THEME.fontBold, TextSize = 14,
+    -- A source card wraps the unified row helper in a panel background so
+    -- it reads as a discrete toggle (one source = one card) instead of a
+    -- list of settings.
+    local function sourceCard(d, order)
+        local card = mk("Frame", { BackgroundColor3 = THEME.panel,
+            BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order }, view)
+        corner(card, 6); pad(card, 14, 10, 14, 4)
+        local r = buildSettingRow(card, d, controls)
+        return card, r
+    end
+
+    local function plannedCard(name, desc, order)
+        local card = mk("Frame", { BackgroundColor3 = THEME.panel,
+            BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order }, view)
+        corner(card, 6); pad(card, 14, 10, 14, 10)
+        local CTRL_W, CTRL_GAP = 92, 14
+        mk("TextLabel", { Text = name, Font = THEME.fontBold, TextSize = 13,
             TextColor3 = THEME.text, BackgroundTransparency = 1,
-            Size = UDim2.new(1, -110, 0, 18),
-            TextXAlignment = Enum.TextXAlignment.Left }, row)
+            Size = UDim2.new(1, -(CTRL_W + CTRL_GAP), 0, 18),
+            TextXAlignment = Enum.TextXAlignment.Left }, card)
         mk("TextLabel", { Text = desc, Font = THEME.fontReg, TextSize = 12,
             TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-            Position = UDim2.fromOffset(0, 20),
-            Size = UDim2.new(1, -110, 0, 18),
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextTruncate = Enum.TextTruncate.AtEnd }, row)
+            Position = UDim2.fromOffset(0, 22),
+            Size = UDim2.new(1, -(CTRL_W + CTRL_GAP), 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextXAlignment = Enum.TextXAlignment.Left }, card)
         local pill = mk("TextLabel", { Text = "PLANNED",
             Font = THEME.fontBold, TextSize = 11,
             TextColor3 = Color3.new(1, 1, 1),
             BackgroundColor3 = THEME.standby, BorderSizePixel = 0,
-            Position = UDim2.new(1, -98, 0.5, -11),
-            Size = UDim2.fromOffset(90, 22),
-        }, row); corner(pill, 4)
-    end
-
-    local function sourceRow(d, order)
-        local row = mk("Frame", { BackgroundColor3 = THEME.panel,
-            BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 60),
-            LayoutOrder = order }, view)
-        corner(row, 6); pad(row, 14, 12, 14, 12)
-        mk("TextLabel", { Text = d.label, Font = THEME.fontBold, TextSize = 14,
-            TextColor3 = THEME.text, BackgroundTransparency = 1,
-            Size = UDim2.new(1, -110, 0, 18),
-            TextXAlignment = Enum.TextXAlignment.Left }, row)
-        mk("TextLabel", { Text = d.desc, Font = THEME.fontReg, TextSize = 12,
-            TextColor3 = THEME.subtext, BackgroundTransparency = 1,
-            Position = UDim2.fromOffset(0, 20),
-            Size = UDim2.new(1, -110, 0, 18),
-            TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
-            TextXAlignment = Enum.TextXAlignment.Left }, row)
-
-        local btn = mk("TextButton", { Text = "OFF",
-            Font = THEME.fontBold, TextSize = 12, TextColor3 = Color3.new(1,1,1),
-            BackgroundColor3 = THEME.standby, BorderSizePixel = 0,
-            AutoButtonColor = false,
-            Position = UDim2.new(1, -98, 0.5, -13),
-            Size = UDim2.fromOffset(90, 26) }, row); corner(btn, 4)
-        local function refresh()
-            if rec.cfg[d.key] then
-                btn.Text = "ON"
-                btn.BackgroundColor3 = THEME.accent
-            else
-                btn.Text = "OFF"
-                btn.BackgroundColor3 = THEME.standby
-            end
-        end
-        btn.MouseButton1Click:Connect(function()
-            rec:SetSetting(d.key, not rec.cfg[d.key])
-            refresh()
-        end)
-        refresh()
-        controls[d.key] = { btn = btn, refresh = refresh }
+            Position = UDim2.new(1, -CTRL_W, 0, 2),
+            Size = UDim2.fromOffset(CTRL_W, 22),
+        }, card); corner(pill, 4)
     end
 
     local order = 3
     for _, d in ipairs(settingsForGroup("Sources")) do
-        sourceRow(d, order); order = order + 1
+        sourceCard(d, order); order = order + 1
     end
-    plannedRow("Audio events",
+    plannedCard("Audio events",
         "SoundService cues with timestamps for post-sync.", order)
 
     return { view = view, controls = controls }
@@ -5578,10 +5703,13 @@ local function buildUI()
     end
 
     -- ---- tab bar with accent indicators ----
+    -- Tabs now fill the full bar width (each takes 1/N of the available
+    -- space after padding) instead of sitting at a fixed 94px width on the
+    -- left. Easier to click + the window doesn't feel half-used.
     local tabBar = mk("Frame", { BackgroundColor3 = THEME.titleBar,
         BorderSizePixel = 0, Position = UDim2.new(0, 0, 0, TITLE_H),
         Size = UDim2.new(1, 0, 0, TAB_H) }, window)
-    hlist(tabBar, 4); pad(tabBar, 10, 4, 10, 0)
+    pad(tabBar, 12, 4, 12, 0)
     -- 1px divider line UNDER the tab bar — parented to window so the tab bar's
     -- UIListLayout doesn't try to lay it out (and consume the whole row width).
     mk("Frame", { BackgroundColor3 = THEME.border, BorderSizePixel = 0,
@@ -5610,22 +5738,32 @@ local function buildUI()
         TextXAlignment = Enum.TextXAlignment.Left }, footer)
     UI.footerLabel = footerLabel
 
-    local tabs = { "Record", "Settings", "Files", "Sources" }
+    -- Reorder so Sources (capture toggles) sits next to Record, where it
+    -- conceptually belongs — Settings and Files are admin/library tabs and
+    -- get pushed right.
+    local tabs = { "Record", "Sources", "Settings", "Files" }
     UI.tabBtns = {}
     UI.tabIndicators = {}
     UI.tabViews = {}
+    local TAB_GAP = 6
+    -- Each tab takes 1/N of the bar minus a gap. Tab i sits at i/N from the
+    -- left; the trailing -TAB_GAP on the size leaves the gap to its right.
+    -- Simpler than computing cumulative offsets and stays pixel-clean as
+    -- the window resizes.
     for i, name in ipairs(tabs) do
         local b = mk("TextButton", { Text = name, Font = THEME.fontBold,
             TextSize = 13, TextColor3 = THEME.subtext,
             BackgroundColor3 = THEME.tabInact,
             BorderSizePixel = 0, AutoButtonColor = false,
-            Size = UDim2.fromOffset(94, 30), LayoutOrder = i }, tabBar)
+            Position = UDim2.new((i - 1) / #tabs, 0, 0, 0),
+            Size = UDim2.new(1 / #tabs, -TAB_GAP, 0, 30),
+            LayoutOrder = i }, tabBar)
         corner(b, 6)
-        -- accent underline shown when active
+        -- accent underline shown when active — full-width along the tab
         local indicator = mk("Frame", {
             BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
-            Position = UDim2.new(0.5, -16, 1, -2),
-            Size = UDim2.fromOffset(32, 2), Visible = false,
+            Position = UDim2.new(0.5, -22, 1, -2),
+            Size = UDim2.fromOffset(44, 2), Visible = false,
         }, b)
         corner(indicator, 1)
         b.MouseEnter:Connect(function()

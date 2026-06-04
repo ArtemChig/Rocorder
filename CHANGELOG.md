@@ -9,6 +9,54 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.23.0-alpha — 2026-06-02
+
+UI / UX overhaul of the in-game panel. Addresses the trimming, layout,
+and interaction-pattern complaints from the first long-session use of
+1.22 in Potassium:
+
+- **Setting rows auto-size to fit their description.** The old rows
+  capped at 44 px tall and the description's `TextWrapped` had no
+  vertical room to wrap, so anything longer than one short sentence
+  truncated mid-word. New rows have `AutomaticSize.Y` on the
+  description label and the row container, so a four-line description
+  shows all four lines and the row grows. Same change applied to the
+  Sources cards (which had the same trimming).
+
+- **Dropdown picker for choice settings.** Click-to-cycle (so to read
+  all three modes for `Asset Extract Timing` you had to click through)
+  is replaced with a proper dropdown anchored under the button. Each
+  option is a labelled row; the current value is highlighted in accent.
+  Outside-click dismisses; scroll-wheel dismisses (otherwise the popup
+  detaches visually from its button when the user scrolls the panel).
+
+- **Tabs now span the full bar width.** Old tabs were 94 px fixed-width
+  on the left, leaving ~60% of the bar empty. New tabs share the bar
+  width evenly (currently 4 tabs × ~150 px each) — easier click target,
+  the window doesn't read half-used. Tab order rearranged: Record →
+  **Sources** → Settings → Files, so the capture-source toggles sit next
+  to the record button they affect, with the admin/library tabs pushed
+  right.
+
+- **"Include yourself" (formerly "Include Local Player") moved from
+  Settings → Capture to Sources.** It's conceptually a per-source toggle
+  (whether YOU get recorded at all), so it belongs alongside the other
+  source flags rather than mixed in with tick-rate / max-distance knobs.
+
+- **Advanced toggle is now a checkbox instead of a ▼/▲ arrow.** The arrow
+  read as "expand to reveal hidden content below" but the actual
+  behaviour is "filter mode — reveal advanced rows inline within their
+  groups." A checkbox communicates that more honestly: when checked,
+  rows like `Position Decimals` and `Flush Interval` appear in their
+  group's existing list.
+
+Behind the scenes: factored a shared `buildSettingRow(parent, def,
+controls)` helper used by both Settings groups and Sources cards, so
+description trimming / control-alignment fixes apply to both surfaces
+in one place. Dropdown state is module-scoped (`_activeDropdown`) so
+opening a new picker auto-closes any prior one and there's never more
+than one popup on screen at a time.
+
 ## 1.22.0-alpha — 2026-06-02
 
 Instant Replay alignment with everything we built since IR shipped, plus
