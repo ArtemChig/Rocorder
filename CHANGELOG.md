@@ -9,6 +9,45 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.23.1-alpha — 2026-06-02
+
+Second pass on the UI from the live session in 1.23.0.
+
+- **Dropdown options now have breathing room** between them. Was 0 px,
+  now 4 px gap with 6 px padding inside the popup. Fixes the cramped
+  list visible in the Corner-setting screenshot.
+- **Hotkeys reordered: Open UI on top.** It's the entry point most users
+  reach for first; Record Toggle and Save Instant Replay follow.
+  Footer hotkey hint reordered to match.
+- **Setting descriptions support RichText.** Lets long ones break into
+  paragraphs and emphasise option names with `<b>`. `Asset Extract
+  Timing`, `Download Assets`, and `POV viewmodel` descriptions rewritten
+  to be shorter and use line breaks + bold tags for the mode names.
+- **"Of which N missed: player left" gone.** Stats line is now
+  `<N> extracted · <N> failed · <N> in queue`, with the failed count
+  red-tinted via a `<font color>` callout, and a subtle italic
+  `(N gone before fetch)` only when missed > 0. Doesn't appear at all
+  when nothing's queued.
+- **No more "extractor ready · waiting for players"** when the recorder
+  isn't doing anything. The headline is now state-aware:
+  - Idle (no session, no IR): "Idle. Start a recording or enable
+    Instant Replay."
+  - Recording but no assets yet: "Recording — no assets seen yet."
+  - IR buffering but no assets yet: "Buffering — no assets seen yet."
+  - In progress: "Extracting <kind> <id>"
+  - All done clean: **green** "All N assets extracted."
+  - All done with failures: **red** "Done. N extracted, M failed."
+  - Worker stalled: red callout on the queue headline.
+- **Per-player chip text vertical-centred.** Bumped chip height (20→22)
+  and font size (10→11) and added explicit
+  `TextYAlignment.Center`. Visible-edge alignment of `EXCLUDED` /
+  `paused` / `INCLUDED` pills should now look right.
+- **Disabled state for the Assets panel.** When both `Player parts` AND
+  `POV viewmodel` are off in Sources, and nothing's already in flight,
+  the Assets panel dims (40% transparency) and shows a hint pointing
+  the user to the toggles they need to enable. Doesn't fire mid-
+  extraction so existing progress stays visible.
+
 ## 1.23.0-alpha — 2026-06-02
 
 UI / UX overhaul of the in-game panel. Addresses the trimming, layout,
