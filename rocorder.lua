@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.23.0-alpha"
+local ROCORDER_VERSION = "1.23.1-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -193,20 +193,15 @@ local SETTING_DEFS = {
     { key="DEBUG",           type="bool",   default=true, label="Write Debug Log",
       desc="Write a verbose .debug.log next to each recording.",   group="Capture" },
     { key="DOWNLOAD_ASSETS", type="bool",   default=true, label="Download Assets",
-      desc="At Stop, download every mesh/texture the characters use into "
-        .. "ROCORDER/assets so Blender can build real models offline. Uses "
-        .. "the executor's authenticated session (works where Blender's "
-        .. "anonymous downloads get 401'd).",
+      desc="At Stop, fetch any remaining meshes/textures into ROCORDER/assets "
+        .. "so Blender imports offline. Uses the executor's auth (succeeds "
+        .. "where Blender's anonymous downloads 401).",
       group="Capture" },
     { key="EXTRACT_MODE",    type="choice", default="Quiet", label="Asset Extract Timing",
-      desc="When to extract meshes/textures from the engine. "
-        .. "Quiet: during recording but only when the frame has budget "
-        .. "(default — minimises stutter, fully reliable). "
-        .. "Live: during recording, no throttle (faster completion, may "
-        .. "stutter in competitive games). "
-        .. "Defer: queue refs during recording, extract everything at Stop "
-        .. "(zero in-game stutter, but assets evicted from the client cache "
-        .. "between draw and Stop may fail — usually fine for short clips).",
+      desc="When to extract meshes/textures from the engine.\n"
+        .. "<b>Quiet</b> (default) — only during idle frames. Minimises stutter.\n"
+        .. "<b>Live</b> — no throttle. Faster but may stutter in competitive games.\n"
+        .. "<b>Defer</b> — hold queue until Stop. Zero in-game stutter.",
       group="Capture",
       choices={ "Quiet", "Live", "Defer" } },
     { key="POS_PRECISION",   type="number", default=3,    label="Position Decimals",
@@ -241,11 +236,13 @@ local SETTING_DEFS = {
       group="Indicator",
       choices={ "TopLeft", "TopRight", "BottomLeft", "BottomRight" } },
 
-    -- Hotkeys
-    { key="HOTKEY_RECORD",       type="key", default="F8",        label="Record Toggle",
-      desc="Starts / stops a full recording.",                    group="Hotkeys" },
+    -- Hotkeys — Open UI first because it's the entry point the user reaches
+    -- for most often (especially on first use). Record Toggle and Save
+    -- Instant Replay follow.
     { key="HOTKEY_UI",           type="key", default="RightShift",label="Open UI",
       desc="Shows / hides this window.",                          group="Hotkeys" },
+    { key="HOTKEY_RECORD",       type="key", default="F8",        label="Record Toggle",
+      desc="Starts / stops a full recording.",                    group="Hotkeys" },
     { key="HOTKEY_SAVE_REPLAY",  type="key", default="F7",        label="Save Instant Replay",
       desc="Dumps the rolling buffer (when Instant Replay is on).",group="Hotkeys" },
 
@@ -260,9 +257,8 @@ local SETTING_DEFS = {
       desc="Per-tick CFrame + FOV of the local camera. Imports as a Blender camera.",
       group="Sources" },
     { key="CAPTURE_VIEWMODEL", type="bool", default=true,  label="POV viewmodel",
-      desc="First-person viewmodel (hands + gun) for FPS games. Auto-detected "
-        .. "under workspace.Camera or ReplicatedFirst. Imports as a "
-        .. "separate Viewmodel collection.",
+      desc="First-person hands + gun rig for FPS games. Auto-detected; "
+        .. "imports as a separate Viewmodel collection.",
       group="Sources" },
 }
 
@@ -5120,7 +5116,9 @@ local function _showChoiceDropdown(button, choices, current, onSelect)
     if not gui then return end
 
     local OPT_H = 28
+    local OPT_GAP = 4   -- vertical breathing room between options
     local DD_W = math.max(button.AbsoluteSize.X, 140)
+    local DD_PAD = 6
     local btnPos = button.AbsolutePosition
     local btnSz  = button.AbsoluteSize
 
@@ -5129,11 +5127,12 @@ local function _showChoiceDropdown(button, choices, current, onSelect)
         Position = UDim2.fromOffset(
             btnPos.X + btnSz.X - DD_W,
             btnPos.Y + btnSz.Y + 4),
-        Size = UDim2.fromOffset(DD_W, OPT_H * #choices + 8),
+        Size = UDim2.fromOffset(DD_W,
+            OPT_H * #choices + OPT_GAP * math.max(0, #choices - 1) + DD_PAD * 2),
         ZIndex = 50,
     }, gui)
-    corner(dd, 6); stroke(dd, THEME.border, 1); pad(dd, 4)
-    vlist(dd, 0)
+    corner(dd, 6); stroke(dd, THEME.border, 1); pad(dd, DD_PAD)
+    vlist(dd, OPT_GAP)
 
     for _, choice in ipairs(choices) do
         local isCurrent = (choice == current)
@@ -5197,12 +5196,15 @@ local function buildSettingRow(parent, d, controls)
         Size = UDim2.new(1, -(CTRL_W + CTRL_GAP), 0, 18),
         TextXAlignment = Enum.TextXAlignment.Left }, row)
     -- Description — wraps onto as many lines as it needs; row grows to fit.
+    -- RichText is on so descriptions can use <b>, <font color="…"> etc. for
+    -- emphasis. Plain text still renders normally (no tags = no parsing).
     mk("TextLabel", { Text = d.desc or "",
         Font = THEME.fontReg, TextSize = 12,
         TextColor3 = THEME.subtext, BackgroundTransparency = 1,
         Position = UDim2.fromOffset(0, 22),
         Size = UDim2.new(1, -(CTRL_W + CTRL_GAP), 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+        RichText = true, LineHeight = 1.15,
         TextYAlignment = Enum.TextYAlignment.Top,
         TextXAlignment = Enum.TextXAlignment.Left }, row)
 
@@ -5870,15 +5872,16 @@ function UI:_refreshPlayerFilter()
         corner(av, 12)
         local name = mk("TextLabel", { Font = THEME.fontReg, TextSize = 12,
             TextColor3 = THEME.text, BackgroundTransparency = 1,
-            Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -132, 1, 0),
+            Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -140, 1, 0),
             TextXAlignment = Enum.TextXAlignment.Left,
             TextTruncate = Enum.TextTruncate.AtEnd }, frame)
-        local chip = mk("TextLabel", { Font = THEME.fontBold, TextSize = 10,
+        local chip = mk("TextLabel", { Font = THEME.fontBold, TextSize = 11,
             BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
             TextColor3 = Color3.new(1, 1, 1),
             AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -6, 0.5, 0),
-            Size = UDim2.fromOffset(86, 20),
-            TextXAlignment = Enum.TextXAlignment.Center }, frame)
+            Size = UDim2.fromOffset(92, 22),
+            TextXAlignment = Enum.TextXAlignment.Center,
+            TextYAlignment = Enum.TextYAlignment.Center }, frame)
         corner(chip, 4)
         frame.MouseButton1Click:Connect(function()
             _cyclePlayerFilter(uid)
@@ -6009,11 +6012,11 @@ function UI:_refreshStatus()
         end
     end
 
-    -- footer hotkey hints
+    -- footer hotkey hints — same order as the Hotkeys group in Settings
     if self.footerLabel then
         self.footerLabel.Text = fmt(
-            "%s record  ·  %s save replay  ·  %s toggle window",
-            rec.cfg.HOTKEY_RECORD, rec.cfg.HOTKEY_SAVE_REPLAY, rec.cfg.HOTKEY_UI)
+            "%s toggle window  ·  %s record  ·  %s save replay",
+            rec.cfg.HOTKEY_UI, rec.cfg.HOTKEY_RECORD, rec.cfg.HOTKEY_SAVE_REPLAY)
     end
 
     -- Players panel: live roster + record include/exclude toggles
@@ -6024,41 +6027,118 @@ function UI:_refreshStatus()
         local snap = queueSnapshot()
         local total = snap.totalSeen
         -- Progress bar = (done + failed) / total. Both done and failed are
-        -- "finished" states — we're not waiting on them. Splitting them
-        -- prevents the "stuck at 31/39" misread when 8 actually failed.
+        -- "finished" states — we're not waiting on them.
         local finished = snap.done + snap.failed
         local pct = total > 0 and (finished / total) or 0
         ctl.assetBarFill.Size = UDim2.new(pct, 0, 1, 0)
 
-        local workerHealth = ""
-        if snap.workerAgeSec > 5 and snap.queued > 0 then
-            workerHealth = fmt(" — WORKER SILENT %.0fs", snap.workerAgeSec)
+        -- Sources that drive asset extraction: capturing player parts
+        -- enqueues their meshes/textures; capturing the viewmodel enqueues
+        -- its parts. With both off AND nothing already in flight, show the
+        -- panel disabled with a hint. If items are still being processed
+        -- (e.g. user just flipped sources off mid-extraction), fall through
+        -- to the normal status display so progress stays visible.
+        local sourcesOff = (not rec.cfg.SRC_PLAYER_PARTS)
+                       and (not rec.cfg.CAPTURE_VIEWMODEL)
+        local assetsDisabled = sourcesOff and total == 0
+            and snap.queued == 0 and not snap.activeId
+
+        -- Color helpers: turn the headline accent / red / green to match
+        -- state at a glance.
+        local headlineColor = THEME.text
+        local barColor = THEME.accent
+
+        if assetsDisabled then
+            ctl.assetHeadline.Text = "Disabled — turn on <b>Player parts</b> "
+                .. "or <b>POV viewmodel</b> in the Sources tab."
+            ctl.assetHeadline.RichText = true
+            headlineColor = THEME.subtext
+            barColor = THEME.standby
+            ctl.assetBarFill.Size = UDim2.new(0, 0, 1, 0)
+            ctl.assetStats.Text = ""
+        elseif total == 0 then
+            ctl.assetHeadline.RichText = false
+            if rec.session then
+                ctl.assetHeadline.Text = "Recording — no assets seen yet."
+            elseif rec.cfg.IR_ENABLED and rec.replay then
+                ctl.assetHeadline.Text = "Buffering — no assets seen yet."
+            else
+                ctl.assetHeadline.Text =
+                    "Idle. Start a recording or enable Instant Replay."
+            end
+            ctl.assetStats.Text = ""
+        elseif snap.activeId then
+            ctl.assetHeadline.RichText = false
+            ctl.assetHeadline.Text = fmt("Extracting %s %s%s",
+                snap.activeKind or "?", snap.activeId,
+                snap.activePlayer and ("  (" .. snap.activePlayer .. ")") or "")
+        elseif snap.queued > 0 then
+            ctl.assetHeadline.RichText = false
+            local tail = ""
+            if snap.workerAgeSec > 5 then
+                tail = fmt("  (worker silent %.0fs)", snap.workerAgeSec)
+                headlineColor = THEME.danger
+            end
+            ctl.assetHeadline.Text = fmt("%d in queue.%s", snap.queued, tail)
+        elseif snap.failed > 0 then
+            ctl.assetHeadline.RichText = false
+            ctl.assetHeadline.Text = fmt(
+                "Done. %d extracted, %d failed.",
+                snap.done, snap.failed)
+            headlineColor = THEME.danger
+            barColor = THEME.danger
+        else
+            -- All-clear: every asset extracted, nothing failed, nothing
+            -- pending. Greens the headline + bar so the user sees at a
+            -- glance that the next import won't be missing anything.
+            ctl.assetHeadline.RichText = false
+            ctl.assetHeadline.Text = fmt("All %d assets extracted.", snap.done)
+            headlineColor = THEME.success
+            barColor = THEME.success
+        end
+        ctl.assetHeadline.TextColor3 = headlineColor
+        ctl.assetBarFill.BackgroundColor3 = barColor
+
+        -- Stats line (only shown when something's happening). RichText so
+        -- the failed count gets a red callout, missed gets a subtle hint
+        -- in parentheses without the "of which … player left" phrasing
+        -- the user found ugly.
+        if not assetsDisabled and total > 0 then
+            ctl.assetStats.RichText = true
+            local function clrTag(c)
+                return fmt('<font color="rgb(%d,%d,%d)">',
+                    math.floor(c.R * 255 + 0.5),
+                    math.floor(c.G * 255 + 0.5),
+                    math.floor(c.B * 255 + 0.5))
+            end
+            local parts = {
+                fmt("%d extracted", snap.done),
+            }
+            if snap.failed > 0 then
+                local missedFrag = ""
+                if snap.missed > 0 then
+                    missedFrag = fmt("<i> (%d gone before fetch)</i>",
+                        snap.missed)
+                end
+                parts[#parts + 1] = fmt("%s%d failed</font>%s",
+                    clrTag(THEME.danger), snap.failed, missedFrag)
+            end
+            if snap.queued > 0 then
+                parts[#parts + 1] = fmt("%d in queue", snap.queued)
+            end
+            ctl.assetStats.Text = table.concat(parts, "  ·  ")
         end
 
-        if total == 0 then
-            ctl.assetHeadline.Text = "extractor ready · waiting for players"
-        elseif snap.activeId then
-            ctl.assetHeadline.Text = fmt(
-                "extracting %s %s%s   (%d done · %d failed · %d queued)",
-                snap.activeKind or "?", snap.activeId,
-                snap.activePlayer and ("  (" .. snap.activePlayer .. ")") or "",
-                snap.done, snap.failed, snap.queued)
-        elseif snap.queued > 0 then
-            ctl.assetHeadline.Text = fmt(
-                "%d in queue (%d done · %d failed)%s",
-                snap.queued, snap.done, snap.failed, workerHealth)
-        elseif snap.failed > 0 then
-            ctl.assetHeadline.Text = fmt(
-                "complete: %d extracted · %d couldn't be fetched (player left "
-                .. "or asset permission-locked)", snap.done, snap.failed)
-        else
-            ctl.assetHeadline.Text = fmt("complete: all %d extracted", snap.done)
+        -- Disabled-state visual: dim the panel and clear the per-player
+        -- section so it doesn't look like we're "tracking" anything when
+        -- there's nothing to track.
+        if ctl.assetPanel then
+            ctl.assetPanel.BackgroundTransparency = assetsDisabled and 0.4 or 0
         end
-        ctl.assetStats.Text = fmt(
-            "done %d · failed %d (of which %d missed: player left) · queued %d · "
-            .. "worker tick %d (%.1fs ago)",
-            snap.done, snap.failed, snap.missed, snap.queued,
-            snap.iterations, snap.workerAgeSec)
+        if assetsDisabled then
+            ctl.assetPlayerList:ClearAllChildren()
+            return  -- skip per-player rendering entirely
+        end
 
         -- per-player rows: rebuild from sorted snapshot
         local list = ctl.assetPlayerList
