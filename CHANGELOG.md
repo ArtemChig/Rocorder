@@ -9,6 +9,39 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.24.3-alpha — 2026-06-02
+
+Files-tab fix pass + new Reset-to-Defaults action.
+
+- **The "Clear N unique" bug, fixed for real.** Root cause: `ClearAssets`
+  tried extensions `""`, `".geom.json"`, `".png"` — but the on-disk image
+  format is `.rgba`, not `.png` (the extractor writes raw RGBA buffers,
+  not PNG). So image cache files survived every Clear, `_isCached` kept
+  finding them, and `UniqueAssetsFor(mustBeCached=true)` kept counting
+  them as cached. Now uses `.rgba`. Verified end-to-end with a temporary
+  diagnostic log (`print("[ROCORDER clear] …")` lines in both
+  `ClearAssets` and `UniqueAssetsFor` — kept for one release so the user
+  can confirm the fix from the executor's console; will be removed after
+  that confirmation).
+- **Refresh button uses 🔄 emoji.** The 1.24.2 `↻` (U+21BB) and the
+  1.24.0 `▾` (U+25BE) both rendered as blank boxes / tofu in Gotham —
+  the curved-arrow and small-triangle glyph ranges aren't covered.
+  Emoji code points route through Roblox's system emoji fallback, which
+  works on Windows desktop where the user is running. Spin animation
+  unchanged (Rotation tween on click).
+- **Direction toggle widened.** Was 28×28 with TextSize 16 — the bold
+  arrow sat tight against the rounded edge. Now 32×28 with TextSize 18,
+  explicit center alignment.
+- **Game icon is inline, not a left column.** Was a 48×48 thumbnail
+  taking the entire left side of the card. Now a 18×18 thumbnail to the
+  immediate left of the place name on the bottom-metadata line — same
+  information, doesn't dominate the card. Action toolbar restored to
+  start at x=0.
+- **Reset to defaults.** New danger-styled button at the bottom of
+  Settings (below the Advanced toggle). Two-step confirm; commits all
+  `SETTING_DEFS[i].default` via `SetSetting`; sweeps every visible
+  control on Settings AND Sources to push the new values into the UI.
+
 ## 1.24.2-alpha — 2026-06-02
 
 Files-tab polish round from the live UI test:
