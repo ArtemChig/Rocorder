@@ -12,7 +12,7 @@
 --   .rig.json  ROCORDER-RIG/2  — per-player rig (parts ordered + Motor6D C0/C1)
 --   .debug.log diagnostic events (toggle via Settings > Capture > Debug)
 
-local ROCORDER_VERSION = "1.24.3-alpha"
+local ROCORDER_VERSION = "1.31.1-alpha"
 
 if _G.ROCORDER then
     print("[ROCORDER] reload guard: tearing down previous instance v"
@@ -1260,6 +1260,89 @@ local function extractImageFromContent(ref)
 end
 
 -- ===========================================================================
+-- Stage 3a — record-time body-clothing composite.
+--
+-- Builds ONE per-avatar body texture in the R6 585x559 clothing-template
+-- space: a skin base (from BodyColors) with the classic Shirt then Pants
+-- alpha-composited on top, written as comp_<uid>.rgba. Block bodies (via the
+-- importer's box->template UV map) and template-conformant CharacterMesh
+-- bodies (via their authored UVs) sample it correctly, so we get
+-- skin-through-transparent-clothing and proper shirt/pants layering (the
+-- torso shows the pants waistband over the shirt) in a single texture.
+--
+-- Custom-UV / R15 bodies need the geometry reprojection (Stage 3b) and are
+-- intentionally NOT pointed at this composite (see _applyBodyComposite's
+-- rigType / R6-name gating). Fully pcall-defensive: any failure returns false
+-- and the importer falls back to the per-part Stage 0 clothing path (which
+-- also triggers when the comp_<uid>.rgba file is simply absent).
+--
+-- API call shapes confirmed by probe_composite.lua (composite/1):
+--   AssetService:CreateEditableImage({ Size = Vector2 })
+--   img:DrawRectangle(pos, size, Color3, transparency, ImageCombineType)
+--   img:DrawImage(pos, srcImage, ImageCombineType)
+-- ===========================================================================
+local function _compositeBodyTexture(char, clothing, uid, dbg)
+    if not EXTRACT_OK then return false end
+    if not (clothing and (clothing.shirt or clothing.pants)) then return false end
+
+    -- Canvas creation is pcall'd, so a build lacking CreateEditableImage just
+    -- returns false here (no unguarded member access that could throw).
+    local W, H = 585, 559
+    local okCanvas, canvas = pcall(function()
+        return AssetService:CreateEditableImage({ Size = Vector2.new(W, H) })
+    end)
+    if not okCanvas or not canvas then return false end
+
+    -- Skin base from BodyColors (torso tone), default to a neutral skin.
+    local skin = Color3.fromRGB(234, 184, 146)
+    local bc = char and char:FindFirstChildOfClass("BodyColors")
+    if bc then
+        local okc, c = pcall(function() return bc.TorsoColor3 end)
+        if okc and typeof(c) == "Color3" then skin = c end
+    end
+    local CT = Enum.ImageCombineType
+    pcall(function()
+        canvas:DrawRectangle(Vector2.new(0, 0), Vector2.new(W, H), skin, 0, CT.Overwrite)
+    end)
+
+    -- Shirt then Pants, both 585x559 in the same template layout. Pants drawn
+    -- last so the waistband layers over the shirt on the torso overlap.
+    local function drawGarment(ref)
+        if not ref or ref == "" then return end
+        local content = _toContent(ref)
+        if not content then return end
+        local okImg, img = pcall(function()
+            return AssetService:CreateEditableImageAsync(content)
+        end)
+        if okImg and img then
+            pcall(function() canvas:DrawImage(Vector2.new(0, 0), img, CT.AlphaBlend) end)
+        end
+        paceExtractor()
+    end
+    drawGarment(clothing.shirt)
+    drawGarment(clothing.pants)
+
+    local okBuf, buf = pcall(function()
+        return canvas:ReadPixelsBuffer(Vector2.new(0, 0), Vector2.new(W, H))
+    end)
+    if not okBuf or not buf then return false end
+    local data
+    if not pcall(function() data = buffer.tostring(buf) end) or not data then return false end
+
+    local body = fmt("ROCORDER-RGBA8\n%d\n%d\n", W, H) .. data
+    local path = ASSETS_FOLDER .. "/comp_" .. tostring(uid) .. ".rgba"
+    local okW = pcall(writefile, path, body)
+    if okW and dbg then
+        dbg(fmt("  COMPOSITE body texture comp_%s OK (%d bytes, skin %d,%d,%d)",
+            tostring(uid), #body,
+            math.floor(skin.R * 255), math.floor(skin.G * 255), math.floor(skin.B * 255)))
+    elseif (not okW) and dbg then
+        dbg(fmt("  COMPOSITE body texture comp_%s write FAILED", tostring(uid)))
+    end
+    return okW
+end
+
+-- ===========================================================================
 -- Experimental "Decal route" for clothing templates and other assets whose
 -- content-type causes CreateEditableImageAsync to reject the URL directly.
 --
@@ -1692,6 +1775,32 @@ local function _processOne(entry, dbg)
         else
             local imgRef = _imgRefFromPartInfo(ref.info, entry.id)
             body, err = extractImageFromContent(imgRef)
+        end
+    end
+
+    -- *** No-live-part MESH path (Stage 1) ***
+    --
+    -- extractMeshFromPart above needs a live BasePart. When the owning part is
+    -- already gone — player left, tool unequipped, accessory removed — a mesh
+    -- entry used to fall straight to HTTP, which 401s on off-sale UGC (this is
+    -- how departed players' heads/accessories were lost). But
+    -- CreateEditableMeshAsync reads the engine's loaded copy BY ASSET ID, so as
+    -- long as the mesh is still in the client's content cache we can extract it
+    -- with no live instance. Mirrors the clothing/no-part image path below.
+    if not body and entry.kind == "mesh" then
+        local meshRef
+        for _, r in ipairs(entry.partRefs) do
+            if r.info and r.info.meshId then meshRef = r.info.meshId; break end
+        end
+        meshRef = meshRef or ("rbxassetid://" .. entry.id)
+        local geom
+        geom, err = extractMeshFromPart(nil, { meshId = meshRef })
+        if geom then
+            body, err = _encodeGeomChunked(geom)
+            if body and dbg then
+                dbg(fmt("  EXTRACT mesh %s via EditableMesh (no-live-part path)",
+                    entry.id))
+            end
         end
     end
 
@@ -2174,6 +2283,45 @@ local function enqueueClothing(clothing, uid, displayName)
     end
 end
 
+-- Stage 3a: point an avatar's body parts at the composited body texture and
+-- generate that texture once. Gated to R6-style template-space bodies (R6 +
+-- Custom rigs with classic R6 body-part names); R15 and custom-UV meshes need
+-- the geometry reprojection (Stage 3b) and keep the per-part Stage 0 path.
+-- bakedTextureId is set synchronously (so it's always in the rig.json when
+-- clothing is present); the comp_<uid>.rgba file is generated async so ENSURE
+-- never stalls. If generation fails or hasn't finished by save, the importer
+-- finds no comp_<uid>.rgba and falls back to the Stage 0 clothing path.
+local _R6_BODY_NAMES = {
+    ["Torso"] = true, ["Left Arm"] = true, ["Right Arm"] = true,
+    ["Left Leg"] = true, ["Right Leg"] = true,
+}
+_G.ROCORDER_COMPOSITE_DONE = _G.ROCORDER_COMPOSITE_DONE or {}
+local COMPOSITE_DONE = _G.ROCORDER_COMPOSITE_DONE
+local function _applyBodyComposite(char, rig, uid, dbg)
+    -- DISABLED (1.27.1): the single-canvas composite is fundamentally wrong for
+    -- R6 classic clothing — the template reuses the same limb cells for arms
+    -- (shirt) and legs (pants), so merging both onto one texture made the pants
+    -- overwrite the arm cells (arms rendered with the leg texture). The
+    -- per-part path (shirt->arms, pants->legs) is correct. Kept for reference in
+    -- case a PER-PART composite is revisited later.
+    do return end
+    if not (rig and rig.clothing and (rig.clothing.shirt or rig.clothing.pants)) then return end
+    if rig.rigType == "R15" then return end   -- template-space composite is R6-only
+    local compId = "comp_" .. tostring(uid)
+    local applied = false
+    for _, p in ipairs(rig.parts) do
+        if _R6_BODY_NAMES[p.name] then p.bakedTextureId = compId; applied = true end
+    end
+    if not applied then return end
+    if not COMPOSITE_DONE[uid] then
+        COMPOSITE_DONE[uid] = true
+        task.spawn(function()
+            local ok = _compositeBodyTexture(char, rig.clothing, uid, dbg)
+            if not ok then COMPOSITE_DONE[uid] = nil end   -- allow retry on respawn
+        end)
+    end
+end
+
 -- Public read-only snapshot for the UI status loop.
 local function queueSnapshot()
     return {
@@ -2262,6 +2410,29 @@ local function partInfo(part, boneName)
         end
     end
     if #decals > 0 then info.decals = decals end
+
+    -- Visibility / cull classification (Stage 2). `rendered` = the part
+    -- actually contributes pixels in-game. Effective transparency combines
+    -- Transparency with LocalTransparencyModifier the SCREEN way
+    -- (1-(1-a)(1-b)): games routinely hide a part from the LOCAL view via
+    -- LocalTransparencyModifier while leaving Transparency=0, and those used
+    -- to import as solid boxes that override the real mesh. A part that is
+    -- effectively invisible AND has no drawable surface (no mesh / decal /
+    -- texture / colorMap) is a collision/hitbox volume — the importer culls
+    -- it (keeping its bone so joints don't break).
+    local baseT = info.transparency or 0
+    local okLTM, ltm = pcall(function() return part.LocalTransparencyModifier end)
+    if not (okLTM and type(ltm) == "number") then ltm = 0 end
+    local effT = 1 - (1 - baseT) * (1 - ltm)
+    local hasDrawable = (info.meshId ~= nil) or (info.textureId ~= nil)
+        or (info.colorMap ~= nil) or (info.decals ~= nil)
+    if effT >= 0.99 and not hasDrawable then
+        info.rendered = false
+        info.cullReason = fmt("invisible (effTransparency %.2f) + no drawable "
+            .. "— collision/hitbox volume", effT)
+    else
+        info.rendered = true
+    end
 
     return info
 end
@@ -3146,6 +3317,7 @@ function Tracker:_rebuildRefs(entry, player, encode, debugLog)
             if r.inst then enqueuePartAssets(r.inst, newRig.parts[i], entry.uid, dn) end
         end
         enqueueClothing(newRig.clothing, entry.uid, dn)
+        _applyBodyComposite(player.Character, newRig, entry.uid, _G.ROCORDER_CURRENT_DBG)
     end
 
     if debugLog then
@@ -3212,6 +3384,7 @@ function Tracker:ensure(player, encode, debugLog)
             end
         end
         enqueueClothing(rig.clothing, uid, displayName)
+        _applyBodyComposite(player.Character, rig, uid, _G.ROCORDER_CURRENT_DBG)
     end
 
     if debugLog then
@@ -4183,19 +4356,27 @@ end
 
 -- Gather every unique Roblox asset id referenced by a rig (meshes, textures,
 -- color maps, decals, clothing) into `set`.
-local function collectAssetIds(rig, set)
-    local function add(ref)
+-- Collect every asset id a rig references into `set`. The optional `kinds`
+-- table records id -> "mesh"|"image" so a downstream extractor knows which
+-- Editable* API to call when going by-id (Stage 1 CDN-bypass in
+-- _downloadAssets). meshId fields are meshes; everything else is an image.
+local function collectAssetIds(rig, set, kinds)
+    local function add(ref, kind)
         if type(ref) == "string" then
             local id = ref:match("(%d%d%d%d+)")
-            if id then set[id] = true end
+            if id then
+                set[id] = true
+                if kinds and not kinds[id] then kinds[id] = kind end
+            end
         end
     end
     for _, p in ipairs(rig.parts) do
-        add(p.meshId); add(p.textureId); add(p.colorMap)
-        if p.decals then for _, d in ipairs(p.decals) do add(d.texture) end end
+        add(p.meshId, "mesh"); add(p.textureId, "image"); add(p.colorMap, "image")
+        if p.decals then for _, d in ipairs(p.decals) do add(d.texture, "image") end end
     end
     if rig.clothing then
-        add(rig.clothing.shirt); add(rig.clothing.pants); add(rig.clothing.tshirt)
+        add(rig.clothing.shirt, "image"); add(rig.clothing.pants, "image")
+        add(rig.clothing.tshirt, "image")
     end
 end
 
@@ -4285,7 +4466,8 @@ function rec:_downloadAssets(logSink)
     _G.ROCORDER_ASSETS_RUNNING = true
 
     local ids = {}
-    for _, e in pairs(self.tracker.tracked) do collectAssetIds(e.rig, ids) end
+    local kinds = {}   -- id -> "mesh"|"image" for the by-id Editable* step
+    for _, e in pairs(self.tracker.tracked) do collectAssetIds(e.rig, ids, kinds) end
     local list = {}
     for id in pairs(ids) do list[#list + 1] = id end
     if #list == 0 then return end
@@ -4349,7 +4531,39 @@ function rec:_downloadAssets(logSink)
                 skipc += 1
             else
                 local body, source
+                local handled = false
 
+                -- 0) Editable* BY ASSET ID (Stage 1) — read the engine's loaded
+                --    copy directly, bypassing CDN auth. Same method the
+                --    in-recording worker uses; the post-Stop phase used to skip
+                --    it and jump straight to getcustomasset + HTTP, which 401 on
+                --    off-sale UGC (that's how departed players' heads/accessories
+                --    were lost). CreateEditable*Async reads by id, so as long as
+                --    the asset is still in the client's content cache this
+                --    succeeds with no live instance needed.
+                if EXTRACT_OK and not EXTRACTED[id] then
+                    local ebody, epath
+                    if kinds[id] == "mesh" then
+                        local geom = extractMeshFromPart(nil,
+                            { meshId = "rbxassetid://" .. id })
+                        if geom then
+                            local enc = _encodeGeomChunked(geom)
+                            if enc then ebody, epath = enc, _geomPath(id) end
+                        end
+                    else
+                        ebody = extractImageFromContent("rbxassetid://" .. id)
+                        if ebody then epath = _imgPath(id) end
+                    end
+                    if ebody and epath and pcall(writefile, epath, ebody) then
+                        EXTRACTED[id] = true
+                        okc += 1
+                        dbg(fmt("  asset %s via EditableMesh/Image by-id "
+                            .. "(CDN bypass) OK (%d bytes)", id, #ebody))
+                        handled = true
+                    end
+                end
+
+                if not handled then
                 -- 1) ContentProvider/getcustomasset: the client already has this
                 --    asset loaded — pull bytes straight from the in-memory copy.
                 --    Works for any asset the player can currently see in-game,
@@ -4417,6 +4631,7 @@ function rec:_downloadAssets(logSink)
                     failc += 1
                     missing[#missing + 1] = id
                 end
+                end   -- if not handled
             end
             task.wait()  -- yield between downloads so we never hitch the client
         end
@@ -5585,6 +5800,36 @@ local function buildSettingRow(parent, d, controls)
     return { row = row, control = control, refresh = refresh }
 end
 
+-- A small two-step "Click → Confirm?" pattern shared by destructive buttons
+-- (Delete, Clear assets). First click flips the button to a Confirm? state
+-- in red; a second click within 3 s executes the action. Clicking elsewhere
+-- or letting the timeout elapse resets. Avoids the modal-dialog overhead
+-- for actions we want to be reversible-by-mistake-proof but not annoying.
+-- NOTE: defined here (above buildSettingsView) because that view's "Reset to
+-- defaults" button calls it. A local declared further down would resolve to a
+-- nil global at call time and abort the entire script load.
+local function confirmableButton(btn, idleText, confirmText, idleBg, confirmBg, onConfirm)
+    local armed, armedAt = false, 0
+    local function reset()
+        armed = false
+        btn.Text = idleText
+        btn.BackgroundColor3 = idleBg
+    end
+    btn.MouseButton1Click:Connect(function()
+        if armed and (os.clock() - armedAt) <= 3.0 then
+            reset()
+            onConfirm()
+        else
+            armed = true; armedAt = os.clock()
+            btn.Text = confirmText
+            btn.BackgroundColor3 = confirmBg
+            task.delay(3.0, function()
+                if armed and (os.clock() - armedAt) >= 3.0 then reset() end
+            end)
+        end
+    end)
+end
+
 local function buildSettingsView(parent)
     local view = mk("ScrollingFrame", { BackgroundTransparency = 1,
         Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(0,0,0,0),
@@ -5743,33 +5988,6 @@ local FILES_SORT_GETTERS = {
 local FILES_SORT_DEFAULT_ASC = {
     Date = false, Game = true, Duration = false, Size = false,
 }
-
--- A small two-step "Click → Confirm?" pattern shared by destructive buttons
--- (Delete, Clear assets). First click flips the button to a Confirm? state
--- in red; a second click within 3 s executes the action. Clicking elsewhere
--- or letting the timeout elapse resets. Avoids the modal-dialog overhead
--- for actions we want to be reversible-by-mistake-proof but not annoying.
-local function confirmableButton(btn, idleText, confirmText, idleBg, confirmBg, onConfirm)
-    local armed, armedAt = false, 0
-    local function reset()
-        armed = false
-        btn.Text = idleText
-        btn.BackgroundColor3 = idleBg
-    end
-    btn.MouseButton1Click:Connect(function()
-        if armed and (os.clock() - armedAt) <= 3.0 then
-            reset()
-            onConfirm()
-        else
-            armed = true; armedAt = os.clock()
-            btn.Text = confirmText
-            btn.BackgroundColor3 = confirmBg
-            task.delay(3.0, function()
-                if armed and (os.clock() - armedAt) >= 3.0 then reset() end
-            end)
-        end
-    end)
-end
 
 local function buildFilesView(parent)
     local view = mk("Frame", { BackgroundTransparency = 1,

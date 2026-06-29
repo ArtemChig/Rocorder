@@ -25,3 +25,10 @@ Desktop.ini
 
 # Windows shortcuts (user-specific)
 *.lnk
+
+# Local Roblox install (only used to extract bundled meshes; not part of the repo)
+player/
+
+# Scratch / temp image dumps
+scratch_*.png
+*.rgba

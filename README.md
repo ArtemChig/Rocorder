@@ -67,7 +67,11 @@ player's `parts` array in the `.rig.json`. Every frame lists **all** of a
 player's parts in that fixed order (briefly-missing parts hold their last value),
 so no bone ever has a hole in its keyframe stream.
 
-### `.rig.json` (`ROCORDER-RIG/2`)
+### `.rig.json` (`ROCORDER-RIG/3`)
+
+The current format keys each player to a list of `revisions[]` (one entry per
+life/respawn, so outfit or rig changes mid-session are preserved). The importer
+still reads the legacy flat `ROCORDER-RIG/2` shown below as a single-life record.
 
 ```
 {
@@ -108,6 +112,25 @@ so no bone ever has a hole in its keyframe stream.
 The importer only reads `ROCORDER/3` recordings — re-record with the current
 `rocorder.lua` if you have older files. Open **Window → Toggle System Console**
 before importing to see the rig-file lookup log.
+
+### Assets (meshes, textures, clothing)
+
+When the recorder can read them, asset meshes and textures are dumped alongside
+the recording and reconstructed on import:
+
+- **MeshParts** — accessories, custom heads/limbs, UGC — imported with their real
+  geometry and textures.
+- **Classic blocky bodies & heads** — Roblox's stock body/head meshes are
+  **bundled inside the add-on** (no external files needed), so a blocky avatar
+  imports with its true beveled geometry, not plain boxes.
+- **Classic Shirt/Pants** — reconstructed by remapping each body part's
+  composite-atlas UVs back to the flat Shirt/Pants template using Roblox's own
+  compositor meshes, so clothing lands in the right place for R6 **and** R15
+  without hand-tuned offsets.
+- **Face decals** — projected onto the head.
+
+Clothing is applied when the textures were captured; toggle it in the import
+dialog if you'd rather keep plain skin-colored parts.
 
 ### How the rig stays accurate
 

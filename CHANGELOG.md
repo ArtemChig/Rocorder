@@ -9,6 +9,195 @@ The current version is the same string across `rocorder.lua`
 (`ROCORDER_VERSION`), `xeno_loader.lua` (`ROCORDER_LOADER_VERSION`), and the
 Blender add-on's `bl_info["version"]` / `ROCORDER_VERSION`.
 
+## 1.31.1-alpha — 2026-06-27
+
+- **Fix: classic clothing was bleeding onto R15 hands/feet.** Roblox doesn't
+  cover hands/feet with classic Shirt/Pants (the sleeve ends at the wrist,
+  pants at the ankle), but the remap was painting the sleeve/cuff region onto
+  them. Hands and feet are now excluded — they keep their own skin/texture.
+- **Fix: classic (bundled) head rendered too small.** Roblox sizes a SpecialMesh
+  head by `part.Size × SpecialMesh.Scale`, but the importer ignored the Scale
+  (meshScale), so the head came out undersized. It now applies meshScale.
+
+## 1.31.0-alpha — 2026-06-27
+
+- **Classic clothing now works on R15 (modern) avatars too.** Same compositor-
+  remap mechanism as R6: each R15 body MeshPart's UVs are remapped through
+  Roblox's `R15Composit*Base` meshes into Shirt/Pants template space. R15 uses
+  per-part textures (atlas size = the base mesh's own bbox) rather than R6's
+  shared 1024×512 atlas. Validated offline against real extracted R15 meshes
+  (100% coverage; chest→front cell). Notably, R15 ships no leg composite — the
+  legs reuse the arm base mesh reading the pants template (verified 100%
+  coverage). Unlocks clothing on the whole modern-avatar world (Rivals,
+  Brookhaven, etc.).
+
+## 1.30.0-alpha — 2026-06-27
+
+- **Clothing on CharacterMesh bodies via the real compositor mapping (no bake,
+  no projection).** Instead of baking an atlas, the importer now remaps each
+  body vertex's UV directly through Roblox's compositor base mesh
+  (`CompositTorsoBase`/`ArmBase`/`LegBase`) into Shirt/Pants template space — the
+  exact in-engine mapping. Validated offline against a real extracted torso:
+  the chest face lands on the template front cell (the tie), the back on the
+  back cell. The key fix was that the bundled blocky `torso.mesh` has a
+  different UV layout than extracted CharacterMesh bodies — so blocky bodies
+  keep the classic box→template cube projection, while CharacterMesh bodies use
+  the compositor remap. The 1.29.x atlas-bake path is removed.
+
+## 1.29.1-alpha — 2026-06-26
+
+- **Composite now bakes one texture per body part (fixes the offset/overlap).**
+  The 1.29.0 bake put all parts into one shared atlas, but Roblox composites
+  each body part into its *own* texture — their atlas UVs overlap in [0,1], so a
+  single shared atlas made overlapping regions (torso vs arm) fight and come out
+  offset. Each R6 body part now bakes its own composite texture from its own
+  `CompositXBase` mesh, eliminating the collisions.
+
+## 1.29.0-alpha — 2026-06-26
+
+- **Real, in-game-accurate clothing — the actual Roblox compositor, reconstructed.**
+  A body mesh's UVs are coordinates in Roblox's 1024×512 composite *atlas*, not
+  the raw 585×559 Shirt/Pants template — which is why painting the template
+  through them came out scrambled. Roblox ships the mapping between the two (the
+  `CompositXBase` meshes: vertices at atlas pixels, UVs pointing at the
+  template). The importer now bundles those base meshes and **bakes Roblox's
+  real composite texture** (skin + Shirt + Pants) by rasterizing them against
+  the template, then paints it onto every body part through the part's own UVs.
+  Result: exact clothing on every standard body — blocky, sculpted packages
+  (Woman/Man/Superhero), Violence-District-style CharacterMesh — with **no
+  projection and no per-mesh special cases**. Falls back to the old
+  template+projection path only if numpy is unavailable or the bake fails.
+  (Requires numpy, which Blender ships.)
+
+## 1.28.1-alpha — 2026-06-26
+
+- **Fixed clothing on the bundled blocky bodies.** The bundled body meshes have
+  the right geometry but their authored UVs index Roblox's *composite atlas*,
+  not the raw 585×559 Shirt/Pants template — so painting the template through
+  them showed the bare template (guide text and all) on the body. Classic
+  blocky bodies now map clothing by **geometry** (the cube projection into the
+  template cells, like the old clothed-box) onto the bundled beveled mesh — so
+  bevels stay and the clothing lands correctly.
+
+## 1.28.0-alpha — 2026-06-26
+
+- **Bundled Roblox's exact primitive meshes — classic bodies and heads now use
+  real geometry, not approximations.** Roblox draws primitive parts (the blocky
+  body, the round head) procedurally, so they have no asset id to extract. The
+  add-on now bundles Roblox's own shipped meshes (the classic blocky
+  Torso/arms/legs + the classic head):
+  - **Classic blocky R6 bodies** use the real beveled body meshes — correct
+    rounded/beveled edges (no more sharp cubes) **and** the real R6 clothing
+    UVs, so Shirt/Pants map exactly like in-game with no box projection.
+  - **Classic heads** use Roblox's actual head mesh instead of a sphere
+    approximation, with the face decal projected on the front.
+  - Anything with a real mesh id (CharacterMesh body packages like Woman/Man/
+    Superhero, custom heads, accessories, R15 MeshPart bodies) is still
+    extracted as-is, keeping its true shape — the bundle only fills in the
+    no-asset-id primitives.
+  - Generic blocks/wedges of arbitrary size keep the procedural box + a small
+    fixed-width Bevel modifier (Roblox's bevel doesn't scale with part size).
+
+## 1.27.1-alpha — 2026-06-26
+
+- **Reverted the record-time clothing composite (1.26.0) — it broke arms.**
+  The R6 clothing template reuses the *same* limb cells for arms (shirt) and
+  legs (pants), so merging shirt+pants into one texture made the pants
+  overwrite the arm cells — arms rendered with the leg texture. Clothing now
+  goes back to the correct per-part path (shirt on arms/torso, pants on
+  legs/torso, each its own image). The `bakedTextureId` field is ignored by
+  the importer and no longer generated by the recorder.
+- **Block body parts now have beveled edges, like in-game.** Roblox primitive
+  parts have slightly chamfered edges, not sharp cube corners. Box-shaped parts
+  get a small angle-limited Bevel modifier so they read like real blocks
+  (non-destructive — doesn't disturb clothing UVs; meshes are unaffected).
+
+## 1.27.0-alpha — 2026-06-26
+
+- **Experimental clothing reprojection for sculpted bodies** (new import
+  checkbox, off by default). Some CharacterMesh bodies are authored with UVs
+  that don't follow the R6 clothing template, so painting Shirt/Pants on them
+  comes out scrambled (e.g. ArtemChig228's torso). The new **"Reproject
+  clothing (custom/sculpted bodies)"** option wraps the template around the
+  part **cylindrically** instead of using its authored UVs — a smooth wrap that
+  avoids the old cube projection's hard-edged splatter. It's an approximation
+  (the seam location / cell orientation may need tuning per body), so it's
+  opt-in and only touches CharacterMesh bodies; leave it off for normal
+  avatars. Stage 3b of the redesign in `REDESIGN.md`.
+
+## 1.26.0-alpha — 2026-06-25
+
+- **Body clothing is now composited (skin + shirt + pants) at record time.**
+  For R6 / CharacterMesh avatars wearing classic clothing, the recorder builds
+  one body texture in the engine — a skin base (from BodyColors) with the Shirt
+  then Pants alpha-composited on top — and saves it as `comp_<uid>.rgba`. The
+  importer paints Block and template-conformant CharacterMesh bodies with that
+  single texture, so skin shows through transparent clothing areas and the
+  pants waistband layers over the shirt on the torso (the per-part path only
+  ever showed one garment per part). New additive `bakedTextureId` rig field;
+  if the composite is missing (R15, custom-UV bodies, or generation failed) the
+  importer falls back to the previous per-part clothing path. R15 and custom-UV
+  CharacterMesh bodies are intentionally not composited yet — that needs the
+  geometry reprojection (Stage 3b). First half of Stage 3 in `REDESIGN.md`.
+
+## 1.25.0-alpha — 2026-06-25
+
+- **Invisible hitbox / collision boxes no longer override the real meshes.**
+  The recorder now tags each part with a `rendered` flag computed from its
+  *effective* transparency — combining `Transparency` with
+  `LocalTransparencyModifier`, so a part a game hides only from the local view
+  (Transparency 0 but locally invisible) is recognized as invisible instead of
+  importing as a solid box on top of the avatar. Parts that are effectively
+  invisible and carry no drawable surface (no mesh/decal/texture) are culled
+  on import as collision/hitbox volumes (their bone is kept so joints don't
+  break). Generalizes the old per-game `HumanoidRootPart`/`Hurtbox` handling
+  and the importer's transparency-only skip. New `rendered` / `cullReason`
+  rig fields are additive (still `ROCORDER-RIG/3`); older recordings fall back
+  to the previous heuristic. (Stage 2 of the redesign in `REDESIGN.md`.)
+
+## 1.24.6-alpha — 2026-06-25
+
+- **Far fewer "couldn't be fetched (401)" assets.** Off-sale / private UGC
+  (custom heads, accessories, restricted clothing) used to be lost when its
+  owner left mid-recording: the post-Stop download phase only tried
+  `getcustomasset` + the anonymous CDN, both of which 401 on restricted UGC.
+  It now first tries the in-engine `CreateEditableMesh/ImageAsync` **by asset
+  id** — which reads the client's already-loaded copy and bypasses CDN auth —
+  before falling back to the network. The same by-id mesh path was added to
+  the live extractor for parts whose instance is already gone (player left,
+  tool unequipped). Recovers most of the assets that previously failed.
+  (Stage 1 of the asset-pipeline redesign in `REDESIGN.md`.)
+
+## 1.24.5-alpha — 2026-06-25
+
+- **Importer now finds the engine-extracted assets again.** Recordings made
+  with the 1.24.0 per-recording layout live in
+  `ROCORDER/recordings/<name>/`, but the engine-extracted `.geom.json`/`.rgba`
+  files are written to the global `ROCORDER/assets/` — two levels up. The
+  importer only searched one level up, so it found none of them and fell back
+  to the network (mass 401s). It now walks a few ancestor folders to locate
+  the global `assets` store regardless of nesting depth.
+- **Fixed an import crash on Blender 4.4+/5.x** (`'Action' object has no
+  attribute 'fcurves'`). Blender's new "slotted actions" removed
+  `Action.fcurves`; the importer now walks F-Curves through the
+  layers/strips/channelbags API with a fallback to the legacy attribute, so
+  setting keyframe interpolation works on both old and new Blender.
+- **Clothing on sculpted (CharacterMesh) bodies now maps correctly.** Games
+  that replace blocky R6 limbs with sculpted CharacterMesh bodies (e.g.
+  Violence District) were getting their Shirt/Pants splattered across the
+  body — the importer overwrote the mesh's real UVs with a box-style cube
+  projection. An in-engine probe confirmed these sculpted bodies are already
+  authored with UVs that follow the standard R6 585×559 clothing template,
+  so the importer now paints the Shirt/Pants using the mesh's own UVs. Plain
+  R6 box bodies (no mesh) are unchanged. **Re-import** an existing recording
+  to see the fix — no re-record needed. (First step of the asset-pipeline
+  redesign tracked in `REDESIGN.md`.)
+
+- Fixed a crash on load introduced in 1.24.3: the Settings tab's "Reset to
+  defaults" button referenced the confirm-button helper before it was defined,
+  which aborted the whole script mid-load. The symptom was a half-built UI
+  (overlapping panels) and dead hotkeys. Both work again.
+
 ## 1.24.3-alpha — 2026-06-02
 
 Files-tab fix pass + new Reset-to-Defaults action.
